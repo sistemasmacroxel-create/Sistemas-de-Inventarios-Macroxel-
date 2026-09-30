@@ -1,0 +1,6 @@
+MACROXEL HOSPITALES - AJUSTES 30/09/2026
+1. Proveedor de Entradas: visible únicamente en modo Financiero.
+2. Salidas rápidas: nombre visible cambiado a Salidas internas.
+3. Persistencia web reforzada: los cambios confirmados se conservan localmente en IndexedDB/localStorage aunque Firebase no responda.
+4. Se solicita almacenamiento persistente del navegador cuando está disponible y se fuerzan cierres de colas locales en acciones de guardado/cambio.
+5. IDs internos de Salidas internas se conservan para no romper compatibilidad.
