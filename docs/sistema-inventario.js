@@ -5202,6 +5202,7 @@ function mxCanEditInventario(perms){
   perms = Array.isArray(perms) ? perms : (window.__mxUserPerms||[]);
   return mxIsAdminUser() || (perms.includes('inventario') && perms.includes('inventario_editar'));
 }
+window.mxCanEditInventario = mxCanEditInventario;
 
 function applyButtonPerms(perms){
   try{
@@ -5302,10 +5303,12 @@ function applyButtonPerms(perms){
       if(!b) return;
       if(canInvEdit){
         b.style.display='';
-        if(b.id==='btnInvTransferSel' || b.id==='btnActualizarInventario') b.disabled=false;
+        b.disabled=false;
+        b.removeAttribute('aria-disabled');
       }else{
         b.style.display='none';
         b.disabled=true;
+        b.setAttribute('aria-disabled','true');
       }
     });
     try{ if(typeof window.mxInvUpdateActionButtons==='function') window.mxInvUpdateActionButtons(); }catch(_e){}
@@ -16121,6 +16124,13 @@ function mxInvEditFillModal(item){
 
   const modal = document.getElementById('invEditModal');
   if(modal){ modal.classList.add('show'); modal.style.display = 'flex'; }
+  const deleteBtn = document.getElementById('invDeleteFromEdit');
+  if(deleteBtn){
+    const canEdit = typeof window.mxCanEditInventario==='function' ? window.mxCanEditInventario(window.__mxUserPerms||[]) : true;
+    deleteBtn.style.display = canEdit ? '' : 'none';
+    deleteBtn.disabled = !canEdit;
+    if(canEdit) deleteBtn.removeAttribute('aria-disabled'); else deleteBtn.setAttribute('aria-disabled','true');
+  }
   requestAnimationFrame(()=>{
     try{
       const el = document.getElementById('invAlmacen');
