@@ -1,4 +1,4 @@
-name: Macroxel sync web v241\n# trigger sync
+name: Macroxel sync web v241\n# trigger sync fixed payload
 
 on:
   push:
