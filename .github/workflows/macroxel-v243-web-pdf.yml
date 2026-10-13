@@ -1,0 +1,50 @@
+name: Macroxel web PDF v243
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/macroxel-v243-web-pdf.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-web-pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decode v243 patch
+        shell: bash
+        run: |
+          cat tools/v243_patch_00.txt | base64 -d | gzip -d > /tmp/macroxel_patch_v243_web_pdf.py
+
+      - name: Apply v243 web PDF fix
+        run: python /tmp/macroxel_patch_v243_web_pdf.py
+
+      - name: Verify web PDF changes
+        shell: bash
+        run: |
+          grep -q 'MACROXEL V243 · PDF SERVICIO QUIRURGICO SIN DEPENDENCIA EXTERNA' docs/sistema-inventario.js
+          grep -q 'qServicePdfFallbackDownload(data)' docs/sistema-inventario.js
+          grep -q 'g.items.length||g.faltantes>0' docs/sistema-inventario.js
+          grep -q 'sistema-inventario.js?v=v243-web-pdf' docs/index.html
+          node --check docs/sistema-inventario.js
+
+      - name: Commit v243 web PDF fix
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/sistema-inventario.js docs/index.html; then
+            echo "Web already patched."
+            exit 0
+          fi
+          git config user.name "Macroxel Web Sync"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/sistema-inventario.js docs/index.html
+          git commit -m "Fix web surgical PDF and add history PDF button v243"
+          git push origin HEAD:main
