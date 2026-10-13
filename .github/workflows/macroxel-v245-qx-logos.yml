@@ -1,0 +1,62 @@
+name: Macroxel QX logos v245
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/macroxel-v245-qx-logos.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-web-qx-logos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decode v245 patch
+        shell: bash
+        run: |
+          cat tools/v245_payload_00.txt tools/v245_payload_01.txt | base64 -d | gzip -d > /tmp/macroxel_patch_v245.py
+
+      - name: Apply v245 QX logo correction
+        run: python /tmp/macroxel_patch_v245.py docs/sistema-inventario.js
+
+      - name: Force web cache refresh
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          p=Path("docs/index.html")
+          s=p.read_text(encoding="utf-8")
+          s=re.sub(r'sistema-inventario\.js\?v=[^"\']+','sistema-inventario.js?v=v245-qx-logos-config-filas',s,count=1)
+          p.write_text(s,encoding="utf-8")
+
+      - name: Verify v245 web
+        shell: bash
+        run: |
+          grep -q 'mx-collective-pdf-assets-principal-v2' docs/sistema-inventario.js
+          grep -q 'window.mxGetCollectivePdfAssets' docs/sistema-inventario.js
+          grep -q 'pullRemote' docs/sistema-inventario.js
+          grep -q 'Paciente: .*Edad: .*Sexo: .*Ojo: .*Tel:' docs/sistema-inventario.js
+          grep -q 'Medico: .*Cedula: .*Tel: .*Domicilio:' docs/sistema-inventario.js
+          grep -q 'sistema-inventario.js?v=v245-qx-logos-config-filas' docs/index.html
+          node --check docs/sistema-inventario.js
+
+      - name: Commit v245
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/sistema-inventario.js docs/index.html; then
+            echo "Web already updated."
+            exit 0
+          fi
+          git config user.name "Macroxel Web Sync"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/sistema-inventario.js docs/index.html
+          git commit -m "Quirófano toma logos de Configuración y compacta datos v245"
+          git push origin HEAD:main
