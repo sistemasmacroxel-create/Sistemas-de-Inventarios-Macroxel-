@@ -1,0 +1,50 @@
+name: Macroxel QX PDF logos v246
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/macroxel-v246-qx-logos.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-web-qx-logos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decode patch
+        shell: bash
+        run: |
+          cat tools/v246_payload_00.txt | base64 -d | gzip -d > /tmp/macroxel_patch_v246.py
+
+      - name: Apply patch
+        run: python /tmp/macroxel_patch_v246.py
+
+      - name: Verify
+        shell: bash
+        run: |
+          grep -q 'MACROXEL V246 · LOGOS PDF QUIROFANO TOMADOS DIRECTAMENTE DE CONFIGURACION' docs/sistema-inventario.js
+          grep -q 'window.mxQxPdfConfiguredLogos=resolveLogos' docs/sistema-inventario.js
+          grep -q "remote.collective,getter.collective,local.collective" docs/sistema-inventario.js
+          grep -q 'sistema-inventario.js?v=v246-qx-logos-config-direct' docs/index.html
+          node --check docs/sistema-inventario.js
+
+      - name: Commit
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/sistema-inventario.js docs/index.html; then
+            echo "No changes"
+            exit 0
+          fi
+          git config user.name "Macroxel Web Sync"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/sistema-inventario.js docs/index.html
+          git commit -m "Corrige logos web de quirófano desde Configuración v246"
+          git push origin HEAD:main
