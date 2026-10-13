@@ -1,0 +1,54 @@
+name: Macroxel QX PDF v244
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/macroxel-v244-qx-pdf.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-web-qx-pdf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decode v244 patch
+        shell: bash
+        run: |
+          cat tools/v244_payload_00.txt tools/v244_payload_01.txt | base64 -d | gzip -d > /tmp/macroxel_patch_v244_web.py
+
+      - name: Apply v244 QX PDF correction
+        run: python /tmp/macroxel_patch_v244_web.py
+
+      - name: Verify v244 web PDF
+        shell: bash
+        run: |
+          grep -q 'MACROXEL V244 · PDF QUIROFANO FORMATO CJ + PRECIOS' docs/sistema-inventario.js
+          grep -q 'qServicePdfHydrateData' docs/sistema-inventario.js
+          grep -q 'qServicePdfFallbackJpeg' docs/sistema-inventario.js
+          grep -q 'PRECIO VENTA' docs/sistema-inventario.js
+          grep -q 'precio_venta:unitPrice' docs/sistema-inventario.js
+          grep -q 'sistema-inventario.js?v=v244-qx-pdf-cj-precios' docs/index.html
+          test -s docs/vendor/jspdf.umd.min.js
+          test -s docs/vendor/jspdf.plugin.autotable.min.js
+          node --check docs/sistema-inventario.js
+
+      - name: Commit v244 QX PDF
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/sistema-inventario.js docs/index.html; then
+            echo "Web already updated."
+            exit 0
+          fi
+          git config user.name "Macroxel Web Sync"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/sistema-inventario.js docs/index.html
+          git commit -m "Quirófano PDF formato CJ con precios v244"
+          git push origin HEAD:main
