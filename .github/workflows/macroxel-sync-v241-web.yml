@@ -1,0 +1,44 @@
+name: Macroxel sync web v241
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/macroxel-sync-v241-web.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v241 web synchronization
+        run: python tools/macroxel_sync_v241_web.py
+
+      - name: Verify surgical web changes
+        shell: bash
+        run: |
+          grep -q 'id="mxQxSrvEye"' docs/sistema-inventario.js
+          grep -q 'ojo_operacion:paciente.ojo' docs/sistema-inventario.js
+          grep -q 'serviceShortageTotal(shortages=\[\])' docs/sistema-inventario.js
+          grep -q 'sistema-inventario.js?v=v241-web-sync' docs/index.html
+
+      - name: Commit synchronized web
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/sistema-inventario.js docs/index.html; then
+            echo "Web already synchronized."
+            exit 0
+          fi
+          git config user.name "Macroxel Web Sync"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/sistema-inventario.js docs/index.html
+          git commit -m "Sync web surgical service to v241"
+          git push origin HEAD:main
