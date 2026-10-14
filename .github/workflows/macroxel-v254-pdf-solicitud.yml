@@ -55,7 +55,13 @@ jobs:
           replacement = "    if count==0 and old.startswith((\"pair(2,\", \"pair(5,\", \"doc.setFontSize(8.6);\")):\n        print('Etiqueta opcional no presente en esta rama:', old[:55]); return\n" + needle
           if s.count(needle) != 1:
               raise SystemExit('Validación de compatibilidad v254 no coincide')
-          p.write_text(s.replace(needle, replacement), encoding='utf-8')
+          s = s.replace(needle, replacement)
+          old_index_check = "if h.count(old)!=1:\\n    raise SystemExit('No se publicó: versión anterior inesperada del index.html')\\nh=h.replace(old,version)"
+          new_index_check = "start=h.find('sistema-inventario.js?v=')\\nif start<0: raise SystemExit('No se encontró enlace JS en index')\\nend=h.find(chr(34),start)\\nif end<0: raise SystemExit('No se encontró cierre de enlace JS')\\nh=h[:start]+version+h[end:]"
+          if old_index_check not in s:
+              raise SystemExit('Estructura del script PDF v254 inesperada')
+          s = s.replace(old_index_check, new_index_check)
+          p.write_text(s, encoding='utf-8')
           PY
 
       - name: Aplicar solamente correccion del PDF
