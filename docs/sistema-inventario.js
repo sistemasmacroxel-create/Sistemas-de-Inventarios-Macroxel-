@@ -11092,10 +11092,53 @@ document.getElementById('salQuickMedSave')?.addEventListener('click', async()=>{
 });
 
 let cpmEditId=null;
+
+/* ===== MACROXEL V255 IMPORTACIONES FINANCIERAS · ENCABEZADOS EXCEL ===== */
+function mxImportCanonicalKey(value){
+  return String(value??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
+  .replace(/%/g,' pct ').replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').replace(/_+/g,'_');
+}
+function mxImportPrepareKeys(row){
+  const obj=lowerKeys(row||{});
+  for(const [key,value] of Object.entries(row||{})){
+    const name=mxImportCanonicalKey(key);
+    if(name && !Object.prototype.hasOwnProperty.call(obj,name))obj[name]=value;
+  }
+  return obj;
+}
+function mxImportField(row,aliases,fallback=''){
+  for(const alias of aliases){
+    for(const key of [String(alias).trim().toLowerCase(),mxImportCanonicalKey(alias)]){
+      if(Object.prototype.hasOwnProperty.call(row,key) && row[key]!==undefined && row[key]!==null && String(row[key]).trim()!=='')return row[key];
+    }
+  }
+  return fallback;
+}
+function mxImportFinanceFields(o){
+  const t=a=>mxImportNormText(mxImportField(o,a,''));
+  const n=a=>mxImportNormNum(mxImportField(o,a,0));
+  return {
+    costo:n(['COSTO_UNITARIO','COSTO','COSTO_COMPRA','PRECIO_COMPRA','COSTO SIN IVA','COSTO UNITARIO']),
+    precio_venta:n(['PRECIO_VENTA','PRECIO VENTA','PRECIO DE VENTA','PRECIO','P VENTA']),
+    iva_pct:n(['IVA_%','IVA_PCT','IVA %','TASA_IVA','TASA IVA','IVA']),
+    ieps_pct:n(['IEPS_%','IEPS_PCT','IEPS %','TASA_IEPS','TASA IEPS','IEPS']),
+    iva:n(['IVA_UNITARIO','IVA IMPORTE','IMPORTE IVA']),
+    ieps:n(['IEPS_UNITARIO','IEPS IMPORTE','IMPORTE IEPS']),
+    costo_final:n(['COSTO_FINAL_UNITARIO','COSTO_FINAL','COSTO FINAL']),
+    margen_ganancia:n(['MARGEN_%','MARGEN_PCT','MARGEN','MARGEN_GANANCIA']),
+    valor_costo:n(['VALOR_COSTO','TOTAL_COSTO']),
+    valor_venta:n(['VALOR_VENTA','TOTAL_VENTA']),
+    proveedor:t(['PROVEEDOR','NOMBRE_PROVEEDOR','DISTRIBUIDOR','SUPPLIER']),
+    proveedor_rfc:t(['PROVEEDOR_RFC','RFC_PROVEEDOR','RFC PROVEEDOR']),
+    proveedor_id:t(['PROVEEDOR_ID','ID_PROVEEDOR','ID PROVEEDOR'])
+  };
+}
+
 function mapCPM(r){
-  const o=lowerKeys(r);
+  const o = mxImportPrepareKeys(r);
   return {
     csg: o['doce digitos (csg)']||o['doce dígitos (csg)']||o['csg']||o['clave']||'',
+    clave: mxImportNormText(mxImportField(o,['CSG','CLAVE','CODIGO'],'')),
     grupo: o['grupo terapéutico']||o['grupo terapeutico']||o['grupo']||'',
     descripcion: o['descripción']||o['descripcion']||o['descrip']||'',
     unidad: o['unidad de medida']||o['unidad']||'',
@@ -11106,7 +11149,8 @@ function mapCPM(r){
     costo: Number(o['costo']||o['costo unitario']||o['costo_unitario']||0),
     precio_venta: Number(o['precio de venta']||o['precio venta']||o['precio_venta']||0),
     iva_pct: Number(o['iva %']||o['iva']||o['iva_pct']||0),
-    ieps_pct: Number(o['ieps %']||o['ieps']||o['ieps_pct']||0)
+    ieps_pct: Number(o['ieps %']||o['ieps']||o['ieps_pct']||0),
+    ...mxImportFinanceFields(o)
   };
 }
 async function drawCpm(opts){
@@ -11857,13 +11901,26 @@ function readFileToRows(file, storeHint){
       try{
         let wb;
         const ext=file.name.split('.').pop().toLowerCase();
-        if(ext==='xlsm'){ wb=XLSX.read(e.target.result,{type:'binary'}); }
-        else { wb=XLSX.read(new Uint8Array(e.target.result),{type:'array'}); }
+        if(ext==='xlsm'){ wb=XLSX.read(e.target.result,{type:'binary',cellNF:true}); }
+        else { wb=XLSX.read(new Uint8Array(e.target.result),{type:'array',cellNF:true}); }
 
         const sheetName = mxPickSheetName(wb, storeHint);
         const ws = wb.Sheets[sheetName || wb.SheetNames[0]];
 
         const json=XLSX.utils.sheet_to_json(ws,{defval:''});
+        // Una celda de Excel formateada 16% se almacena como 0.16.
+        if(ws && ws['!ref']){
+          const range=XLSX.utils.decode_range(ws['!ref']);
+          const hdr=[];
+          for(let c=range.s.c;c<=range.e.c;c++){
+            const name=String(ws[XLSX.utils.encode_cell({r:range.s.r,c})]?.v??'');
+            if(['iva_pct','ieps_pct','margen_pct','margen_ganancia'].includes(mxImportCanonicalKey(name)))hdr.push({c,name});
+          }
+          for(let ri=0;ri<json.length;ri++)for(const h of hdr){
+            const cell=ws[XLSX.utils.encode_cell({r:range.s.r+1+ri,c:h.c})];
+            if(cell && typeof cell.v==='number' && typeof cell.z==='string' && cell.z.includes('%'))json[ri][h.name]=cell.v*100;
+          }
+        }
         resolve(json);
       }catch(err){ reject(err); }
     };
@@ -12000,8 +12057,12 @@ async function importReplace(files,store,onMap){
       if(!mapped.length) throw new Error('El archivo '+f.name+' no contiene filas válidas.');
       allMapped.push(...mapped);
     }
+    if(store==='inventory'||store==='cpm'){
+      const missing=allMapped.some(r=>!String(store==='cpm'?(r.csg||r.clave||''):(r.clave||'')).trim());
+      if(missing)throw new Error('Hay filas sin CLAVE/CSG. No se modificó ningún registro; corrige la plantilla.');
+    }
     if(store==='inventory') allMapped=mxConsolidarInventarioImportado(allMapped);
-    if(['inventory','entradas','salidas'].includes(store) && typeof window.mxFinancialNormalizeRecord==='function'){
+    if(['inventory','entradas','salidas','cpm'].includes(store) && typeof window.mxFinancialNormalizeRecord==='function'){
       allMapped=allMapped.map(row=>{
         const y={...row};
         try{
@@ -12145,7 +12206,7 @@ async function mxRepairColumnConnectionsOnce(force=false){
 }
 
 function mapInventario(r){
-  const o = lowerKeys(r);
+  const o = mxImportPrepareKeys(r);
 
   function normalizarFecha(fecha) {
     if (!fecha) return "";
@@ -12193,7 +12254,7 @@ function mapInventario(r){
     descripcion: o['descripcion']||o['descripción']||o['nombre']||'',
     unidad: o['unidad']||'',
     lote: o['lote']||'',
-    caducidad: normalizarFecha(o['caducidad']),
+    caducidad: mxImportNormFecha(mxImportField(o,['CADUCIDAD','CADUCIDAD/LOTE','CAD'],'')),
     entradas: Number(o['entradas']||0),
     salidas: Number(o['salidas']||0),
 
@@ -12218,7 +12279,8 @@ function mapInventario(r){
     iva: mxImportNormNum(mxReadAlias(o,['iva unitario','iva_unitario','iva importe'],0)),
     ieps: mxImportNormNum(mxReadAlias(o,['ieps unitario','ieps_unitario','ieps importe'],0)),
     costo_final: mxImportNormNum(mxReadAlias(o,['costo final unitario','costo_final_unitario','costo final','costo_final'],0)),
-    margen_ganancia: mxImportNormNum(mxReadAlias(o,['margen %','margen_%','margen','margen ganancia','margen_ganancia'],0))
+    margen_ganancia: mxImportNormNum(mxReadAlias(o,['margen %','margen_%','margen','margen ganancia','margen_ganancia'],0)),
+    ...mxImportFinanceFields(o)
   };
 }
 
@@ -12254,7 +12316,7 @@ function mxImportNormFecha(v){
   return s;
 }
 function mapEntradaImport(r){
-  const o = lowerKeys(r);
+  const o = mxImportPrepareKeys(r);
   return {
     fecha: mxImportNormText(o['fecha'] || o['f. movimiento'] || o['fecha movimiento']),
     usuario: mxImportNormText(o['usuario'] || o['responsable']),
@@ -12291,11 +12353,12 @@ function mapEntradaImport(r){
     precio_venta: mxImportNormNum(o['precio de venta'] ?? o['precio venta'] ?? o['precio_venta'] ?? o['p venta']),
     margen_ganancia: mxImportNormNum(o['margen %'] ?? o['margen_%'] ?? o['margen'] ?? o['margen ganancia'] ?? o['margen_ganancia']),
     valor_costo: mxImportNormNum(o['valor costo'] ?? o['valor_costo'] ?? o['total costo'] ?? o['total_costo']),
-    valor_venta: mxImportNormNum(o['valor venta'] ?? o['valor_venta'] ?? o['total venta'] ?? o['total_venta'])
+    valor_venta: mxImportNormNum(o['valor venta'] ?? o['valor_venta'] ?? o['total venta'] ?? o['total_venta']),
+    ...mxImportFinanceFields(o)
   };
 }
 function mapSalidaImport(r){
-  const o = lowerKeys(r);
+  const o = mxImportPrepareKeys(r);
   return {
     fecha: mxImportNormText(o['fecha'] || o['f. movimiento'] || o['fecha movimiento']),
     usuario: mxImportNormText(o['usuario'] || o['responsable']),
@@ -12349,7 +12412,8 @@ function mapSalidaImport(r){
     precio_venta: mxImportNormNum(o['precio de venta'] ?? o['precio venta'] ?? o['precio_venta'] ?? o['p venta']),
     margen_ganancia: mxImportNormNum(o['margen %'] ?? o['margen_%'] ?? o['margen'] ?? o['margen ganancia'] ?? o['margen_ganancia']),
     valor_costo: mxImportNormNum(o['valor costo'] ?? o['valor_costo'] ?? o['total costo'] ?? o['total_costo']),
-    valor_venta: mxImportNormNum(o['valor venta'] ?? o['valor_venta'] ?? o['total venta'] ?? o['total_venta'])
+    valor_venta: mxImportNormNum(o['valor venta'] ?? o['valor_venta'] ?? o['total venta'] ?? o['total_venta']),
+    ...mxImportFinanceFields(o)
   };
 }
 function mapAntibioticoImport(r){
@@ -12490,25 +12554,48 @@ Registros eliminados: ${borrados}`);
   }
 };
 
-document.getElementById('btnTplInv')?.addEventListener('click', ()=>{
-  try{
-    const headers = [
-      'CODIGO_BARRAS','CLAVE','DESCRIPCION','UNIDAD','LOTE','CADUCIDAD',
-      'ALMACEN','ESTANTES','EXISTENCIA_BASE',
-      'CLASIFICACION','RESTRICCION','UBICACIÓN'
-    ];
-    const ws = XLSX.utils.aoa_to_sheet([headers]);
-    ws['!cols'] = [
-      {wch:22},{wch:16},{wch:55},{wch:14},{wch:14},{wch:12},{wch:10},{wch:10},{wch:16},{wch:18},{wch:14},{wch:18}
-    ];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'INVENTARIO');
-    XLSX.writeFile(wb, 'PLANTILLA_INVENTARIO_MACROXEL.xlsx');
-  }catch(e){
-    mxAlert('No se pudo generar la plantilla. Revisa que XLSX esté cargado.');
-  }
-});
 
+/* MACROXEL V255 · PLANTILLAS EXCEL POR MÓDULO Y MODALIDAD */
+function mxImportBuildTemplate(kind){
+  if(typeof XLSX==='undefined')throw new Error('La biblioteca Excel no está cargada.');
+  const financial=typeof window.mxFinancialEnabled==='function' && !!window.mxFinancialEnabled();
+  const base={
+    inventory:['CODIGO_BARRAS','CLAVE','DESCRIPCION','UNIDAD','LOTE','CADUCIDAD','ALMACEN','ESTANTES','EXISTENCIA_BASE','CLASIFICACION','RESTRICCION','UBICACION'],
+    entradas:['FECHA','USUARIO','CLAVE','CODIGO_BARRAS','DESCRIPCION','UNIDAD','LOTE','CADUCIDAD','ANTES','PZS','SALDO_FINAL','TIPO_DOC','FOLIO','PROVEEDOR'],
+    salidas:['FECHA','USUARIO','CLAVE','CODIGO_BARRAS','DESCRIPCION','UNIDAD','LOTE','CADUCIDAD','ANTES','PZS','SALDO_FINAL','TIPO_DOC','FOLIO','MEDICO','CEDULA','PACIENTE','EXPEDIENTE'],
+    cpm:['CSG','GRUPO_TERAPEUTICO','DESCRIPCION','UNIDAD','CLASIFICACION','RESTRICCION','UBICACION','PZS_ASIGNADAS']
+  };
+  const extra={
+    inventory:['COSTO_UNITARIO','IVA_%','IEPS_%','IVA_UNITARIO','IEPS_UNITARIO','COSTO_FINAL_UNITARIO','PRECIO_VENTA','MARGEN_%','PROVEEDOR','PROVEEDOR_RFC','PROVEEDOR_ID','DEPARTAMENTO','PRESENTACION','REGISTRO_SANITARIO','DENOMINACION_GENERICA','TITULAR','GRUPO_TERAPEUTICO'],
+    entradas:['COSTO_UNITARIO','IVA_%','IEPS_%','IVA_UNITARIO','IEPS_UNITARIO','COSTO_FINAL_UNITARIO','PRECIO_VENTA','MARGEN_%','PROVEEDOR_RFC','PROVEEDOR_ID','DEPARTAMENTO','PRESENTACION','REGISTRO_SANITARIO','DENOMINACION_GENERICA'],
+    salidas:['COSTO_UNITARIO','IVA_%','IEPS_%','IVA_UNITARIO','IEPS_UNITARIO','COSTO_FINAL_UNITARIO','PRECIO_VENTA','MARGEN_%','PROVEEDOR','PROVEEDOR_RFC','PROVEEDOR_ID'],
+    cpm:['COSTO_UNITARIO','IVA_%','IEPS_%','COSTO_FINAL_UNITARIO','PRECIO_VENTA','MARGEN_%','PROVEEDOR','PROVEEDOR_RFC','PROVEEDOR_ID']
+  };
+  if(!base[kind])throw new Error('Módulo desconocido.');
+  const labels={inventory:'INVENTARIO',entradas:'ENTRADAS',salidas:'SALIDAS',cpm:'CPM'};
+  const name=labels[kind],headers=[...base[kind],...(financial?extra[kind]:[])];
+  const wb=XLSX.utils.book_new();
+  const ws=XLSX.utils.aoa_to_sheet([headers]);
+  ws['!cols']=headers.map(h=>({wch:h.includes('DESCRIPCION')?52:h.includes('PROVEEDOR')?26:h.includes('CLAVE')||h.includes('COSTO')||h.includes('PRECIO')?20:17}));
+  XLSX.utils.book_append_sheet(wb,ws,name);
+  const info=[
+    ['MACROXEL HPS - PLANTILLA '+name+(financial?' (FINANCIERO)':' (NORMAL)')],
+    ['Captura los datos en la primera hoja sin cambiar los encabezados.'],
+    ['CLAVE es obligatoria en Inventario y CSG en Catálogo. Conserva LOTE para distinguir productos.'],
+    ['En IVA_% e IEPS_% escribe 16 para 16% o escribe el porcentaje en formato Excel.'],
+    ['COSTO_UNITARIO es el costo sin impuestos; PRECIO_VENTA es el precio unitario de venta.'],
+    ['PROVEEDOR y sus identificadores se conservan en la importación; no crean un proveedor nuevo en el catálogo.'],
+    ['ATENCIÓN: Importar Inventario/Entradas/Salidas/Catálogo reemplaza el contenido del módulo; haz respaldo antes.']
+  ];
+  const help=XLSX.utils.aoa_to_sheet(info);help['!cols']=[{wch:130}];
+  XLSX.utils.book_append_sheet(wb,help,'INSTRUCCIONES');
+  XLSX.writeFile(wb,'PLANTILLA_'+name+'_MACROXEL'+(financial?'_FINANCIERO':'')+'.xlsx');
+}
+for(const [id,kind] of [['btnTplInv','inventory'],['btnTplEnt','entradas'],['btnTplSal','salidas'],['btnTplCPM','cpm'],['btnEntPedidoPlantilla','entradas']]){
+  document.getElementById(id)?.addEventListener('click',()=>{
+    try{mxImportBuildTemplate(kind);}catch(e){mxAlert('No se pudo generar la plantilla Excel: '+(e?.message||e));}
+  });
+}
 
 async function mxResetFirebaseEcosystem(reason='RESET_TOTAL'){
   const base = String(typeof mxRemoteDbUrl==='function' ? mxRemoteDbUrl() : '').trim();
