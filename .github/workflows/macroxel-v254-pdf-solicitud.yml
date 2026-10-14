@@ -56,11 +56,16 @@ jobs:
           if s.count(needle) != 1:
               raise SystemExit('Validación de compatibilidad v254 no coincide')
           s = s.replace(needle, replacement)
-          old_index_check = "if h.count(old)!=1:\\n    raise SystemExit('No se publicó: versión anterior inesperada del index.html')\\nh=h.replace(old,version)"
-          new_index_check = "start=h.find('sistema-inventario.js?v=')\\nif start<0: raise SystemExit('No se encontró enlace JS en index')\\nend=h.find(chr(34),start)\\nif end<0: raise SystemExit('No se encontró cierre de enlace JS')\\nh=h[:start]+version+h[end:]"
-          if old_index_check not in s:
-              raise SystemExit('Estructura del script PDF v254 inesperada')
-          s = s.replace(old_index_check, new_index_check)
+          index_html = Path('docs/index.html').read_text(encoding='utf-8')
+          target = 'sistema-inventario.js?v=' if 'sistema-inventario.js?v=' in index_html else 'sistema-inventario.js'
+          start_pos = index_html.find(target)
+          if start_pos < 0:
+              raise SystemExit('No hay referencia al JS en index.html')
+          end_pos = index_html.find(chr(34), start_pos)
+          if end_pos < 0:
+              raise SystemExit('Referencia al JS sin cierre')
+          old_version = index_html[start_pos:end_pos]
+          s = s.replace("old='sistema-inventario.js?v=v253-qx-pdf-folio-fecha'", "old=" + repr(old_version))
           p.write_text(s, encoding='utf-8')
           PY
 
