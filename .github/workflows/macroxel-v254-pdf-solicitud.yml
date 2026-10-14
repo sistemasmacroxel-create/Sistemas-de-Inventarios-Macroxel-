@@ -44,6 +44,20 @@ jobs:
               raise SystemExit('Parche v254 corrupto, no se modifica la web.')
           PY
 
+      - name: Adaptar etiquetas opcionales a la versión web de GitHub
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('/tmp/macroxel_v254_pdf_web.py')
+          s = p.read_text()
+          needle = '    if count!=1:\n'
+          replacement = "    if count==0 and old.startswith((\"pair(2,\", \"pair(5,\")):\n        print('Etiqueta opcional no presente en esta rama:', old[:55]); return\n" + needle
+          if s.count(needle) != 1:
+              raise SystemExit('Validación de compatibilidad v254 no coincide')
+          p.write_text(s.replace(needle, replacement), encoding='utf-8')
+          PY
+
       - name: Aplicar solamente correccion del PDF
         run: python /tmp/macroxel_v254_pdf_web.py
 
