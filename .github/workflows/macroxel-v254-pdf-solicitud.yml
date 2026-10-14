@@ -35,10 +35,10 @@ jobs:
                       continue
                   compile(decoded, '/tmp/macroxel_v254_pdf_web.py', 'exec')
                   Path('/tmp/macroxel_v254_pdf_web.py').write_bytes(decoded)
-                  path.write_text(candidate + '\\n')
+                  path.write_text(candidate + chr(10))
                   print('Parche PDF v254 recuperado, validado y normalizado.')
                   break
-              except (ValueError, OSError, EOFError, SyntaxError):
+              except Exception:
                   continue
           else:
               raise SystemExit('Parche v254 corrupto, no se modifica la web.')
