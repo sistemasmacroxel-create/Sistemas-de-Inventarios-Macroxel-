@@ -19,10 +19,30 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Decodificar parche v254
+      - name: Restaurar y validar parche v254
         shell: bash
         run: |
-          base64 -d tools/v254_pdf_patch_00.txt | gzip -d > /tmp/macroxel_v254_pdf_web.py
+          python - <<'PY'
+          import base64, gzip
+          from pathlib import Path
+          path = Path('tools/v254_pdf_patch_00.txt')
+          encoded = path.read_text().strip()
+          for pos in range(-1, len(encoded)):
+              candidate = encoded if pos < 0 else encoded[:pos] + encoded[pos+1:]
+              try:
+                  decoded = gzip.decompress(base64.b64decode(candidate, validate=True))
+                  if not decoded.startswith(b'#!/usr/bin/env python3'):
+                      continue
+                  compile(decoded, '/tmp/macroxel_v254_pdf_web.py', 'exec')
+                  Path('/tmp/macroxel_v254_pdf_web.py').write_bytes(decoded)
+                  path.write_text(candidate + '\\n')
+                  print('Parche PDF v254 recuperado, validado y normalizado.')
+                  break
+              except (ValueError, OSError, EOFError, SyntaxError):
+                  continue
+          else:
+              raise SystemExit('Parche v254 corrupto, no se modifica la web.')
+          PY
 
       - name: Aplicar solamente correccion del PDF
         run: python /tmp/macroxel_v254_pdf_web.py
@@ -43,6 +63,6 @@ jobs:
           fi
           git config user.name "Macroxel Web Sync"
           git config user.email "sistemasmacroxel@gmail.com"
-          git add docs/sistema-inventario.js docs/index.html
+          git add docs/sistema-inventario.js docs/index.html tools/v254_pdf_patch_00.txt
           git commit -m "Actualiza web: solicitud PDF y nombre del servicio dinamico v254"
           git push origin HEAD:main
