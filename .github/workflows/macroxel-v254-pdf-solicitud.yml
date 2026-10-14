@@ -1,0 +1,48 @@
+name: Macroxel web PDF solicitud dinamica v254
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/macroxel-v254-pdf-solicitud.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-web-v254:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decodificar parche v254
+        shell: bash
+        run: |
+          base64 -d tools/v254_pdf_patch_00.txt | gzip -d > /tmp/macroxel_v254_pdf_web.py
+
+      - name: Aplicar solamente correccion del PDF
+        run: python /tmp/macroxel_v254_pdf_web.py
+
+      - name: Verificar PDF y sintaxis
+        shell: bash
+        run: |
+          grep -q 'function qServicePdfDocumentTitle(data={})' docs/sistema-inventario.js
+          grep -q 'v254-pdf-solicitud-servicio-dinamico' docs/index.html
+          node --check docs/sistema-inventario.js
+
+      - name: Publicar web v254
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/sistema-inventario.js docs/index.html; then
+            echo "v254 ya estaba publicado."
+            exit 0
+          fi
+          git config user.name "Macroxel Web Sync"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/sistema-inventario.js docs/index.html
+          git commit -m "Actualiza web: solicitud PDF y nombre del servicio dinamico v254"
+          git push origin HEAD:main
