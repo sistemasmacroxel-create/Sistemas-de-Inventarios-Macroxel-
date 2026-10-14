@@ -1,0 +1,54 @@
+name: Macroxel v255 validar importaciones y plantillas web
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/index.html"
+      - "docs/sistema-inventario.js"
+      - ".github/workflows/macroxel-v255-validacion-importaciones.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test-web-importaciones:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verificar sintaxis y botones
+        shell: bash
+        run: |
+          node --check docs/sistema-inventario.js
+          python - <<'PY'
+          from pathlib import Path
+          h=Path('docs/index.html').read_text('utf-8')
+          s=Path('docs/sistema-inventario.js').read_text('utf-8')
+          for id in ('btnTplInv','btnTplEnt','btnTplSal','btnTplCPM','btnEntPedidoPlantilla'):
+              assert h.count('id="'+id+'"')==1, 'Falta botón '+id
+              assert "'"+id+"'" in s, 'Falta evento '+id
+          for name in ('COSTO_UNITARIO','IVA_%','IEPS_%','PRECIO_VENTA','PROVEEDOR','PROVEEDOR_RFC','PROVEEDOR_ID'):
+              assert name in s, 'Falta columna '+name
+          assert 'mxImportFinanceFields(o)' in s
+          assert 'mxImportBuildTemplate(kind)' in s
+          assert 'cell.z.includes' in s
+          assert 'v255-import-fin-plantillas' in h
+          print('Los 5 botones, campos financieros y referencias web están presentes.')
+          PY
+      - name: Probar extracción de los campos financieros
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),vm=require('vm'),s=fs.readFileSync('docs/sistema-inventario.js','utf8');
+          const p=s.indexOf('/* ===== MACROXEL V255 IMPORTACIONES FINANCIERAS');
+          const q=s.indexOf('function mapCPM(r)',p);
+          if(p<0||q<=p)throw Error('No se encontró el código financiero');
+          const ctx={};
+          vm.runInNewContext(`
+          function lowerKeys(obj){const r={};for(const k in obj)r[k.trim().toLowerCase()]=obj[k];return r;}
+          function mxImportNormText(v){return String(v??'').trim();}
+          function mxImportNormNum(v){const n=Number(v);return Number.isFinite(n)?n:0;}
+          `+s.slice(p,q)+`
+          const r=mxImportFinanceFields(mxImportPrepareKeys({'COSTO_UNITARIO':'125.5','IVA_%':'16','IEPS_%':'8','PRECIO_VENTA':'220','PROVEEDOR':'Proveedor Demo','PROVEEDOR_RFC':'RFC DEMO'}));
+          if(r.costo!==125.5||r.iva_pct!==16||r.ieps_pct!==8||r.precio_venta!==220||r.proveedor!=='Proveedor Demo'||r.proveedor_rfc!=='RFC DEMO')throw Error(JSON.stringify(r));
+          `,ctx);
+          console.log('Costo, precio, IVA, IEPS y proveedor: OK');
+          NODE
