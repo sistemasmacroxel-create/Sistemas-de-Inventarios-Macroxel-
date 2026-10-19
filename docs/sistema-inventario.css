@@ -99,3 +99,6 @@ body.logged:not(.mx-module-open) #navTabs>.mx-nav-group>.mx-nav-group-body>.tab 
   min-width:0!important;max-width:100%!important;font-size:13px!important;font-weight:850!important;line-height:1.2!important;
   white-space:normal!important;overflow:hidden!important;text-overflow:ellipsis!important;
 }
+
+/* mx-inventory-lote-width-v230: evita que los lotes cortos se partan en varias líneas. */
+#tblInv th:nth-child(6),#tblInv td:nth-child(6){min-width:130px!important;width:130px!important;white-space:nowrap!important;word-break:normal!important;overflow-wrap:normal!important;}
