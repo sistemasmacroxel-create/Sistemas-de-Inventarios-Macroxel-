@@ -1,4 +1,5 @@
-// pdf patch direct published v253: QX folio fecha + quitar leyendas redundantes, ambos generadores
+/* MACROXEL v253: FOLIO FECHA BAJO LOGOS, SIN DIRECCION GENERAL, WEB Y APP */
+// v237 · Salidas: folio silencioso + avance no bloqueante + reutilización rápida del mismo folio.
 
 /* ===== MACROXEL CANONICAL SOURCE: electron-sql-adapter.js ===== */
 (() => {
@@ -1335,7 +1336,12 @@ async function mxImportClasifCatalogFromFile(file){
   }
 }
 
-document.addEventListener('input', function(e){
+// Salidas v238: no transformar el valor en CADA pulsación.
+// La vista ya usa text-transform:uppercase por CSS y las rutinas de guardado/búsqueda
+// normalizan sus datos. Convertir el value en cada evento input obligaba al navegador a
+// reescribir valor + selección y se sentía como una tecla perdida al cambiar de campo.
+// Se normaliza una sola vez cuando el usuario confirma/abandona el campo.
+document.addEventListener('change', function(e){
   try{
     const t = e.target;
     if(!t || !t.closest || !t.closest('#view-salidas')) return;
@@ -1343,17 +1349,19 @@ document.addEventListener('input', function(e){
     const type = String(t.type || '').toLowerCase();
     const isTextualInput = (tag === 'TEXTAREA') || (tag === 'INPUT' && (!type || ['text','search','email','tel','password'].includes(type)));
     if(!isTextualInput) return;
-    const start = typeof t.selectionStart === 'number' ? t.selectionStart : null;
-    const end = typeof t.selectionEnd === 'number' ? t.selectionEnd : null;
     const next = String(t.value || '').toUpperCase();
-    if(t.value !== next){
-      t.value = next;
-      if(start !== null && end !== null){
-        try{ t.setSelectionRange(start, end); }catch(_e){}
-      }
-    }
+    if(t.value !== next) t.value = next;
   }catch(_err){}
-});
+}, true);
+
+// Marca actividad del teclado/captura con costo mínimo. Los trabajos administrativos
+// de Salidas consultan esta marca para esperar a que el usuario deje de teclear.
+window.__mxSalLastInteractionAt = Number(window.__mxSalLastInteractionAt||0);
+const __mxMarkSalInteraction = (e)=>{
+  try{ if(e?.target?.closest?.('#view-salidas')) window.__mxSalLastInteractionAt=Date.now(); }catch(_e){}
+};
+document.addEventListener('keydown', __mxMarkSalInteraction, true);
+document.addEventListener('input', __mxMarkSalInteraction, true);
 
 function mxInitClasifCatalogUI(){
   const sec = document.getElementById('view-configuracion');
@@ -3711,7 +3719,7 @@ function __mxSalidaExFin(r){
 }
 function rowHtmlAntib(r){
   return `<tr>
-    <td>${_fmtDateOnly(r.fecha)}</td><td>${r.clave||''}</td><td>${r.nombre||r.descripcion||''}</td>
+    <td>${_fmtDateOnly(r.fecha||r.fechaIso||r.createdAt)||`<button class="btn" type="button" data-mx-ent-set-fecha="${Number(r._id)||0}" title="Indicar fecha real del movimiento">✎ SIN FECHA</button>`}</td><td>${r.clave||''}</td><td>${r.nombre||r.descripcion||''}</td>
     <td>${r.doctor||r.medico||''}</td><td>${r.cedula||''}</td><td>${r.paciente||''}</td>
     <td>${r.folio_doc||r.folio||''}</td><td>${r.tipo_doc||r.tipoDocumento||''}</td>
     <td>${r.ex_ini??r.existencia_inicial??''}</td><td>${r.pzs||''}</td><td>${r.ex_fin??r.existencia_final??''}</td><td></td>
@@ -3954,12 +3962,9 @@ if (typeof saveSalida === 'function') {
     const result = await __origSaveSalida(row);
 
     // Persistencia en segundo plano. Ya no bloquea el historial ni el siguiente escaneo.
+    // El control visual de folios se actualiza desde folios-control al confirmar;
+    // evitar aquí una segunda lectura del control elimina trabajo duplicado por salida.
     try{ __mxScheduleFlushAll(0); }catch(_){}
-    try{
-      if(typeof mxRefreshUltimoYSiguienteFolioSalida === 'function'){
-        setTimeout(()=>{ try{ mxRefreshUltimoYSiguienteFolioSalida(); }catch(e){} }, 180);
-      }
-    }catch(_){ }
 
     return result || row;
   }
@@ -7539,11 +7544,18 @@ let cacheInv=[];
           if(!b){ b=[]; barcodeMap.set(barcode,b); }
           b.push(row);
         }
+        const claveSearch = normalizeSearch(clave);
+        const loteSearch = normalizeSearch(row.lote ?? '');
+        const descripcionSearch = normalizeSearch(row.descripcion ?? row.nombre ?? '');
+        const unidadSearch = normalizeSearch(row.unidad ?? '');
         searchRows.push({
           row,
-          clave: normalizeSearch(clave),
+          clave: claveSearch,
           barcode,
-          text: normalizeSearch([clave,barcode,row.descripcion ?? row.nombre ?? '',row.lote ?? '',row.unidad ?? ''].join(' '))
+          lote: loteSearch,
+          descripcion: descripcionSearch,
+          unidad: unidadSearch,
+          text: normalizeSearch([claveSearch,barcode,descripcionSearch,loteSearch,unidadSearch].join(' '))
         });
       }
     }
@@ -7833,7 +7845,7 @@ async function mxSyncCpmMetaFromInventario(){
     }
 
     if(changed){
-      try{ if(typeof drawCpm==='function') drawCpm(); }catch(_){}
+      try{ window.__mxClearSqlCache?.('cpm'); }catch(_){}
     }
     return changed;
   }catch(e){ return 0; }
@@ -7858,49 +7870,110 @@ function mxSalidasBuscarProductoRapido(q, maxResultados=40){
     if(!row || out.length>=limit) return;
     const id=(row._id!==undefined&&row._id!==null&&row._id!=='')?`id:${row._id}`:`${row.clave||''}|${row.lote||''}|${row.caducidad||''}`;
     if(seen.has(id)) return;
-    seen.add(id); out.push(row);
+    seen.add(id);
+    out.push(row);
   };
+  const full=()=>out.length>=limit;
 
-  // Código de barras exacto: respuesta O(1), ideal para escáner.
+  // Código de barras exacto: O(1), ideal para escáner.
   if(compact && window.__mxInventoryBarcodeMap instanceof Map){
     const exactBarcode=window.__mxInventoryBarcodeMap.get(compact)||[];
     for(const row of exactBarcode) add(row);
     if(out.length) return out;
   }
 
-  // Clave exacta normalizada: respuesta O(1).
+  // Clave exacta: O(1). En captura manual la clave tiene la prioridad más alta.
   if(query && window.__mxInventoryByClaveNorm instanceof Map){
     const exactClave=window.__mxInventoryByClaveNorm.get(query)||[];
     for(const row of exactClave) add(row);
     if(out.length) return out;
   }
 
-  // Índice precalculado en memoria. Primero prefijos y después texto libre.
   if(indexOk){
+    // PRIORIDAD 1 · CLAVE. Primero inicio de clave y después coincidencia interna.
     for(const item of rows){
-      if(item.clave.startsWith(query) || (compact && item.barcode.startsWith(compact))) add(item.row);
-      if(out.length>=limit) return out;
+      if(item.clave && item.clave.startsWith(query)) add(item.row);
+      if(full()) return out;
     }
     for(const item of rows){
-      if(item.text.includes(query)) add(item.row);
-      if(out.length>=limit) break;
+      if(item.clave && item.clave.includes(query)) add(item.row);
+      if(full()) return out;
+    }
+
+    // Código de barras parcial queda muy arriba para captura manual/escáner incompleto.
+    if(compact){
+      for(const item of rows){
+        if(item.barcode && item.barcode.startsWith(compact)) add(item.row);
+        if(full()) return out;
+      }
+    }
+
+    // PRIORIDAD 2 · LOTE. Exacto > prefijo > coincidencia interna.
+    for(const item of rows){
+      if(item.lote && item.lote===query) add(item.row);
+      if(full()) return out;
+    }
+    for(const item of rows){
+      if(item.lote && item.lote.startsWith(query)) add(item.row);
+      if(full()) return out;
+    }
+    for(const item of rows){
+      if(item.lote && item.lote.includes(query)) add(item.row);
+      if(full()) return out;
+    }
+
+    // PRIORIDAD 3 · DESCRIPCIÓN. Inicio de palabra antes de texto libre.
+    for(const item of rows){
+      const d=item.descripcion||'';
+      if(d && (d.startsWith(query) || d.includes(' '+query))) add(item.row);
+      if(full()) return out;
+    }
+    for(const item of rows){
+      const d=item.descripcion||'';
+      if(d && d.includes(query)) add(item.row);
+      if(full()) return out;
+    }
+
+    // Respaldo final para unidad/u otros campos ya indexados.
+    for(const item of rows){
+      if(item.text && item.text.includes(query)) add(item.row);
+      if(full()) break;
     }
     return out;
   }
 
-  // Respaldo sólo durante una reconstrucción del índice. Evita que Salidas deje
-  // de buscar aunque la memoria cambie entre dos escrituras consecutivas.
-  for(const row of inv){
-    const clave=normaliza(row?.clave);
-    const barcode=String(row?.codigo_barras??row?.codigoBarras??row?.barcode??'').replace(/\s+/g,'').toLowerCase();
-    const text=normaliza([row?.clave,row?.codigo_barras,row?.codigoBarras,row?.barcode,row?.descripcion,row?.nombre,row?.lote,row?.unidad].join(' '));
-    if((compact&&barcode===compact)||clave===query||clave.startsWith(query)||text.includes(query)) add(row);
-    if(out.length>=limit) break;
+  // Respaldo temporal si el índice está reconstruyéndose. Trabaja con la memoria
+  // que ya existe en vez de detener el teclado esperando otra lectura de la BD.
+  const tmp=inv.map(row=>({
+    row,
+    clave:normaliza(row?.clave),
+    barcode:String(row?.codigo_barras??row?.codigoBarras??row?.barcode??'').replace(/\s+/g,'').toLowerCase(),
+    lote:normaliza(row?.lote),
+    descripcion:normaliza(row?.descripcion??row?.nombre??''),
+    text:normaliza([row?.clave,row?.codigo_barras,row?.codigoBarras,row?.barcode,row?.descripcion,row?.nombre,row?.lote,row?.unidad].join(' '))
+  }));
+  const passes=[
+    x=>x.clave===query,
+    x=>x.clave.startsWith(query),
+    x=>x.clave.includes(query),
+    x=>compact&&x.barcode.startsWith(compact),
+    x=>x.lote===query,
+    x=>x.lote.startsWith(query),
+    x=>x.lote.includes(query),
+    x=>x.descripcion.startsWith(query)||x.descripcion.includes(' '+query),
+    x=>x.descripcion.includes(query),
+    x=>x.text.includes(query)
+  ];
+  for(const test of passes){
+    for(const item of tmp){
+      if(test(item)) add(item.row);
+      if(full()) return out;
+    }
   }
   return out;
 }
 window.mxSalidasBuscarProductoRapido=mxSalidasBuscarProductoRapido;
-window.__mxSalidasEngineVersion='1.0.203-FAST-20260924';
+window.__mxSalidasEngineVersion='1.0.203-FAST-20261006-v239';
 
 function pickExistencia(o){ if(!o) return 0; const hasLoc = ['almacen','ALMACEN','existenciaAlmacen','existencia almacen','existencia_almacen','alm','estantes','ESTANTES','existenciaEstante','existencia estante','existencia_estante','est'].some(k => Object.prototype.hasOwnProperty.call(o,k)); if(hasLoc){ const alm = mxNumSan(o.almacen ?? o.ALMACEN ?? o.existenciaAlmacen ?? o['existencia almacen'] ?? o['existencia_almacen'] ?? o.alm ?? 0, 0); const est = mxNumSan(o.estantes ?? o.ESTANTES ?? o.existenciaEstante ?? o['existencia estante'] ?? o['existencia_estante'] ?? o.est ?? 0, 0); return alm + est; } if(o.existencia!=null && o.existencia!=='') return mxNumSan(o.existencia,0); if(o.existencias!=null && o.existencias!=='') return mxNumSan(o.existencias,0); if(o['existencias por lote']!=null && o['existencias por lote']!=='') return mxNumSan(o['existencias por lote'],0); if(o.existencia_por_lote!=null) return mxNumSan(o.existencia_por_lote,0); return mxNumSan(o.pzs||o.exis||0,0); }
 
@@ -9801,7 +9874,7 @@ function attachSmartSearchSalidas(){
     if(!term){ close(); return; }
     try{
       const indexOk = (typeof window.__mxInventorySearchIndexHealthy==='function') ? window.__mxInventorySearchIndexHealthy() : true;
-      if(!Array.isArray(cacheInv) || !cacheInv.length || !indexOk){
+      if(!Array.isArray(cacheInv) || !cacheInv.length){
         if(typeof window.__mxEnsureSalidasInventoryReady === 'function') cacheInv = await window.__mxEnsureSalidasInventoryReady({force:false});
         else if(typeof window.__mxLoadInventory === 'function') cacheInv = await window.__mxLoadInventory({force:true, requireRows:true});
         else {
@@ -9809,6 +9882,10 @@ function attachSmartSearchSalidas(){
           if(typeof window.__mxSetInventoryMemory==='function') window.__mxSetInventoryMemory(rows, true);
           else cacheInv = rows;
         }
+      }else if(!indexOk){
+        // Buscar YA con cacheInv; reconstruir índice en segundo plano. Antes se esperaba
+        // otra lectura completa de BD y esa espera se sentía como retraso al teclear.
+        try{ Promise.resolve(window.__mxEnsureSalidasInventoryReady?.({force:false})).catch(()=>{}); }catch(_e){}
       }
     }catch(e){
       if(!Array.isArray(cacheInv)){
@@ -9853,14 +9930,26 @@ function __mxCadToNum(v){
   return Number.POSITIVE_INFINITY;
 }
 try{
-  list = (list||[]).slice().sort((a,b)=>{
+  // Mantener la relevancia de búsqueda (CLAVE > LOTE > DESCRIPCIÓN). Agrupar por
+  // clave respetando el primer lugar en que apareció cada producto y aplicar FEFO
+  // sólo dentro de sus lotes. Así la caducidad nunca destruye la prioridad de búsqueda.
+  const groups=[];
+  const groupMap=new Map();
+  for(const row of (list||[])){
+    const key=String(row?.clave||'').trim().toLowerCase() || `__ROW_${groups.length}`;
+    let g=groupMap.get(key);
+    if(!g){g=[];groupMap.set(key,g);groups.push(g);}
+    g.push(row);
+  }
+  const sortLots=(arr)=>arr.sort((a,b)=>{
     const ca = __mxCadToNum(a.caducidad || a.cad || '');
     const cb = __mxCadToNum(b.caducidad || b.cad || '');
     if(ca !== cb) return ca - cb;
     const ea = ([a.almacen,a.existenciaAlmacen,a.alm,a.estantes,a.existenciaEstante,a.est].some(v => v !== undefined && v !== null && v !== '') ? ((Number(a.almacen ?? a.existenciaAlmacen ?? a.alm ?? 0) || 0) + (Number(a.estantes ?? a.existenciaEstante ?? a.est ?? 0) || 0)) : (Number(a.existencias !== undefined ? a.existencias : (a.existencia||0)) || 0));
     const eb = ([b.almacen,b.existenciaAlmacen,b.alm,b.estantes,b.existenciaEstante,b.est].some(v => v !== undefined && v !== null && v !== '') ? ((Number(b.almacen ?? b.existenciaAlmacen ?? b.alm ?? 0) || 0) + (Number(b.estantes ?? b.existenciaEstante ?? b.est ?? 0) || 0)) : (Number(b.existencias !== undefined ? b.existencias : (b.existencia||0)) || 0));
-    return eb - ea;
+    return eb-ea;
   });
+  list=groups.flatMap(sortLots);
 }catch(e){}
 
 let __mxMinCad = Number.POSITIVE_INFINITY;
@@ -10596,18 +10685,23 @@ function attachSmartPacienteCJ(){
     }
   };
 
+  let patientSearchTimer=null;
+  const scheduleSuggestions=(mode)=>{
+    pendingEnter=false;pendingMove=0;requestSeq++;
+    clearTimeout(patientSearchTimer);
+    patientSearchTimer=setTimeout(()=>{Promise.resolve(showSuggestions(mode)).catch(()=>{});},130);
+  };
   if(inpPaciente){
-    inpPaciente.addEventListener('input',()=>{ pendingEnter=false; pendingMove=0; showSuggestions('paciente'); });
+    inpPaciente.addEventListener('input',()=>scheduleSuggestions('paciente'));
     inpPaciente.addEventListener('keydown',keyHandler('paciente'));
-    inpPaciente.addEventListener('change',()=>{
-      if(!box && String(inpPaciente.value||'').trim()) mxFocusSalidaColectivoJustificadoNext('paciente');
-    });
-    inpPaciente.addEventListener('blur',()=>setTimeout(close,180));
+    // No saltar automáticamente al buscador al abandonar el nombre; el usuario puede
+    // seguir corrigiendo expediente/datos clínicos sin que un callback tardío robe foco.
+    inpPaciente.addEventListener('blur',()=>{clearTimeout(patientSearchTimer);setTimeout(close,180);});
   }
   if(inpExpediente){
-    inpExpediente.addEventListener('input',()=>{ pendingEnter=false; pendingMove=0; showSuggestions('expediente'); });
+    inpExpediente.addEventListener('input',()=>scheduleSuggestions('expediente'));
     inpExpediente.addEventListener('keydown',keyHandler('expediente'));
-    inpExpediente.addEventListener('blur',()=>setTimeout(close,180));
+    inpExpediente.addEventListener('blur',()=>{clearTimeout(patientSearchTimer);setTimeout(close,180);});
   }
   document.addEventListener('click',(e)=>{
     if(box && !box.contains(e.target) && !inpPaciente?.contains(e.target) && !inpExpediente?.contains(e.target)) close();
@@ -10807,7 +10901,7 @@ function attachSearchFolioHistorial(){
 
   const searchNow=async()=>{
     const raw=String(inp.value||'').trim();const query=norm(raw);const seq=++requestSeq;
-    if(!query||query.replace(/[^A-Z0-9]/g,'').length<3){close();return 0;}
+    if(!query||query.replace(/[^A-Z0-9]/g,'').length<4){close();return 0;}
     const tipoSel=mxNormalizeTipoSalida(document.getElementById('salTipo')?.value||'');
     const rows=await searchFolioRows(raw,tipoSel);
     if(seq!==requestSeq||query!==norm(inp.value))return 0;
@@ -10815,8 +10909,9 @@ function attachSearchFolioHistorial(){
     if(rows.length){render(rows,raw);return rows.length;}close();return 0;
   };
 
-  const onInput=()=>{try{const c=window.__mxSalidaPedidoFisicoContext;if(c&&norm(c.folio)!==norm(inp.value))window.__mxSalidaPedidoFisicoContext=null;}catch(_e){}clearTimeout(debounceTimer);debounceTimer=setTimeout(searchNow,12);};
-  const onFocus=()=>{if(String(inp.value||'').trim())searchNow();};
+  const onInput=()=>{try{const c=window.__mxSalidaPedidoFisicoContext;if(c&&norm(c.folio)!==norm(inp.value))window.__mxSalidaPedidoFisicoContext=null;}catch(_e){}clearTimeout(debounceTimer);debounceTimer=setTimeout(searchNow,180);};
+  // No consultar historial solo por recibir foco: el teclado queda libre desde la primera tecla.
+  const onFocus=()=>{};
   const onKeyDown=(e)=>{
     if(e.key==='Escape'){if(box){e.preventDefault();e.stopPropagation();close();}return;}
     if(e.key==='ArrowDown'||e.key==='ArrowUp'){e.preventDefault();e.stopPropagation();const d=e.key==='ArrowDown'?1:-1;if(box&&items().length)setActive(activeIndex<0?(d>0?0:items().length-1):activeIndex+d);else Promise.resolve(searchNow()).then(()=>{if(box&&items().length)setActive(d>0?0:items().length-1);});return;}
@@ -11092,238 +11187,256 @@ document.getElementById('salQuickMedSave')?.addEventListener('click', async()=>{
 });
 
 let cpmEditId=null;
+let cpmEditOriginalKey='';
+let cpmSaveBusy=false;
+const cpmDeleteBusy=new Set();
+let cpmRepairDone=false;
 
-/* ===== MACROXEL V255 IMPORTACIONES FINANCIERAS · ENCABEZADOS EXCEL ===== */
+function mxCpmNormKey(v){
+  return String(v??'').trim().normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/[^A-Z0-9.\-]/g,'');
+}
+function mxCpmText(v){ return String(v??'').trim(); }
+async function mxCpmFreshRows(){
+  try{ window.__mxClearSqlCache?.('cpm'); }catch(_e){}
+  const rows=await idbAll('cpm').catch(()=>[]);
+  return Array.isArray(rows)?rows:[];
+}
+async function mxCpmPersistNow(){
+  try{ await window.__mxFlushSqlWrites?.(); }catch(_e){}
+  try{ await window.__mxPersistAllNow?.(); }catch(_e){}
+  try{ window.__mxClearSqlCache?.('cpm'); }catch(_e){}
+}
+async function mxCpmDeleteIds(ids){
+  const clean=[...new Set((ids||[]).map(Number).filter(n=>Number.isFinite(n)&&n>0))];
+  if(!clean.length)return 0;
+  if(window.electronSql?.isElectron&&typeof window.electronSql.transactionDurable==='function'){
+    await window.electronSql.transactionDurable(clean.map(key=>({type:'delete',store:'cpm',key})));
+  }else{
+    for(const id of clean) await idbDelete('cpm',id);
+  }
+  await mxCpmPersistNow();
+  return clean.length;
+}
+function mxCpmMergeKeeper(rows){
+  const sorted=(rows||[]).slice().sort((a,b)=>(Number(b?._id)||0)-(Number(a?._id)||0));
+  const keeper={...(sorted[0]||{})};
+  const fields=['csg','clave','grupo','descripcion','unidad','clasificacion','restriccion','ubicacion','codigo_barras','costo','costo_unitario','precio_venta','precioVenta','iva_pct','ivaPct','ieps_pct','iepsPct'];
+  for(const src of sorted.slice(1)) for(const f of fields) if((keeper[f]===undefined||keeper[f]===null||String(keeper[f]).trim()==='') && src?.[f]!==undefined && src?.[f]!==null && String(src[f]).trim()!=='') keeper[f]=src[f];
+  keeper.pzsAsignadas=Math.max(0,...sorted.map(r=>Number(r?.pzsAsignadas||0)||0));
+  return keeper;
+}
+async function mxCpmRepairDuplicates(){
+  if(cpmRepairDone)return 0;cpmRepairDone=true;
+  try{
+    const rows=await mxCpmFreshRows(),groups=new Map();
+    for(const r of rows){const k=mxCpmNormKey(r?.csg??r?.clave);if(!k)continue;if(!groups.has(k))groups.set(k,[]);groups.get(k).push(r);}
+    let removed=0;
+    for(const list of groups.values()){
+      if(list.length<2)continue;
+      const keeper=mxCpmMergeKeeper(list),keepId=Number(keeper?._id)||0;
+      if(!keepId)continue;
+      keeper._id=keepId;keeper.csg=mxCpmText(keeper.csg||keeper.clave);keeper.clave=keeper.csg;keeper.updatedAt=new Date().toISOString();
+      await idbPut('cpm',keeper);
+      const extras=list.filter(r=>Number(r?._id)!==keepId).map(r=>Number(r?._id));
+      removed+=await mxCpmDeleteIds(extras);
+    }
+    if(removed)await mxCpmPersistNow();
+    return removed;
+  }catch(e){console.warn('[CATALOGO] No se pudieron reparar duplicados previos',e);return 0;}
+}
+
+/* v250: encabezados Excel financieros equivalentes (con/sin guiones bajos,
+   tildes o símbolos: IVA_%, IVA %, IVA_PCT, etc.). No cambia los encabezados
+   existentes ni las reglas de licencias / modo de operación. */
 function mxImportCanonicalKey(value){
-  return String(value??'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase()
-  .replace(/%/g,' pct ').replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').replace(/_+/g,'_');
+  return String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .toLowerCase().replace(/%/g,' pct ').replace(/[^a-z0-9]+/g,'_')
+    .replace(/^_+|_+$/g,'').replace(/_+/g,'_');
 }
 function mxImportPrepareKeys(row){
   const obj=lowerKeys(row||{});
   for(const [key,value] of Object.entries(row||{})){
     const name=mxImportCanonicalKey(key);
-    if(name && !Object.prototype.hasOwnProperty.call(obj,name))obj[name]=value;
+    if(name && !Object.prototype.hasOwnProperty.call(obj,name)) obj[name]=value;
   }
   return obj;
 }
-function mxImportField(row,aliases,fallback=''){
+function mxImportField(row, aliases, fallback=''){
   for(const alias of aliases){
-    for(const key of [String(alias).trim().toLowerCase(),mxImportCanonicalKey(alias)]){
+    const lower=String(alias).trim().toLowerCase();
+    const canon=mxImportCanonicalKey(alias);
+    for(const key of [lower,canon]){
       if(Object.prototype.hasOwnProperty.call(row,key) && row[key]!==undefined && row[key]!==null && String(row[key]).trim()!=='')return row[key];
     }
   }
   return fallback;
 }
 function mxImportFinanceFields(o){
-  const t=a=>mxImportNormText(mxImportField(o,a,''));
-  const n=a=>mxImportNormNum(mxImportField(o,a,0));
+  const txt=(names)=>mxImportNormText(mxImportField(o,names,''));
+  const num=(names)=>mxImportNormNum(mxImportField(o,names,0));
   return {
-    costo:n(['COSTO_UNITARIO','COSTO','COSTO_COMPRA','PRECIO_COMPRA','COSTO SIN IVA','COSTO UNITARIO']),
-    precio_venta:n(['PRECIO_VENTA','PRECIO VENTA','PRECIO DE VENTA','PRECIO','P VENTA']),
-    iva_pct:n(['IVA_%','IVA_PCT','IVA %','TASA_IVA','TASA IVA','IVA']),
-    ieps_pct:n(['IEPS_%','IEPS_PCT','IEPS %','TASA_IEPS','TASA IEPS','IEPS']),
-    iva:n(['IVA_UNITARIO','IVA IMPORTE','IMPORTE IVA']),
-    ieps:n(['IEPS_UNITARIO','IEPS IMPORTE','IMPORTE IEPS']),
-    costo_final:n(['COSTO_FINAL_UNITARIO','COSTO_FINAL','COSTO FINAL']),
-    margen_ganancia:n(['MARGEN_%','MARGEN_PCT','MARGEN','MARGEN_GANANCIA']),
-    valor_costo:n(['VALOR_COSTO','TOTAL_COSTO']),
-    valor_venta:n(['VALOR_VENTA','TOTAL_VENTA']),
-    proveedor:t(['PROVEEDOR','NOMBRE_PROVEEDOR','DISTRIBUIDOR','SUPPLIER']),
-    proveedor_rfc:t(['PROVEEDOR_RFC','RFC_PROVEEDOR','RFC PROVEEDOR']),
-    proveedor_id:t(['PROVEEDOR_ID','ID_PROVEEDOR','ID PROVEEDOR'])
+    costo:num(['COSTO_UNITARIO','COSTO','COSTO_COMPRA','PRECIO_COMPRA','COSTO UNITARIO','COSTO DE COMPRA','COSTO SIN IVA','precio de compra']),
+    precio_venta:num(['PRECIO_VENTA','PRECIO DE VENTA','PRECIO VENTA','PRECIOVENTA','PRECIO VENTA UNITARIO','P VENTA','PRECIO','PRECIO PUBLICO','VENTA']),
+    iva_pct:num(['IVA_%','IVA_PCT','IVA %','IVA PORCENTAJE','TASA IVA','TASA_IVA','IVA']),
+    ieps_pct:num(['IEPS_%','IEPS_PCT','IEPS %','IEPS PORCENTAJE','TASA IEPS','TASA_IEPS','IEPS']),
+    iva:num(['IVA_UNITARIO','IVA IMPORTE','IMPORTE IVA']),
+    ieps:num(['IEPS_UNITARIO','IEPS IMPORTE','IMPORTE IEPS']),
+    costo_final:num(['COSTO_FINAL_UNITARIO','COSTO FINAL','COSTO_FINAL']),
+    margen_ganancia:num(['MARGEN_%','MARGEN_PCT','MARGEN GANANCIA','MARGEN','MARGEN_GANANCIA']),
+    valor_costo:num(['VALOR_COSTO','TOTAL_COSTO']),
+    valor_venta:num(['VALOR_VENTA','TOTAL_VENTA']),
+    proveedor:txt(['PROVEEDOR','NOMBRE_PROVEEDOR','DISTRIBUIDOR','SUPPLIER']),
+    proveedor_rfc:txt(['PROVEEDOR_RFC','RFC_PROVEEDOR','RFC PROVEEDOR']),
+    proveedor_id:txt(['PROVEEDOR_ID','ID_PROVEEDOR','ID PROVEEDOR'])
   };
 }
 
 function mapCPM(r){
-  const o = mxImportPrepareKeys(r);
+  const o=mxImportPrepareKeys(r);
+  const txt=(a)=>mxImportNormText(mxImportField(o,a,''));
   return {
-    csg: o['doce digitos (csg)']||o['doce dígitos (csg)']||o['csg']||o['clave']||'',
-    clave: mxImportNormText(mxImportField(o,['CSG','CLAVE','CODIGO'],'')),
-    grupo: o['grupo terapéutico']||o['grupo terapeutico']||o['grupo']||'',
-    descripcion: o['descripción']||o['descripcion']||o['descrip']||'',
-    unidad: o['unidad de medida']||o['unidad']||'',
-    clasificacion: o['clasificación']||o['clasificacion']||o['clasif']||o['tipo']||'',
-    restriccion: o['restricción']||o['restriccion']||o['restric']||'',
-    ubicacion: o['ubicación']||o['ubicacion']||o['ubicacion (pasillo/estante)']||o['ubicación (pasillo/estante)']||'',
-    pzsAsignadas: Number(o['pzs asignadas']||o['pzs']||0),
-    costo: Number(o['costo']||o['costo unitario']||o['costo_unitario']||0),
-    precio_venta: Number(o['precio de venta']||o['precio venta']||o['precio_venta']||0),
-    iva_pct: Number(o['iva %']||o['iva']||o['iva_pct']||0),
-    ieps_pct: Number(o['ieps %']||o['ieps']||o['ieps_pct']||0),
+    csg: txt(['DOCE DIGITOS (CSG)','CSG','CLAVE','CODIGO']),
+    clave: txt(['DOCE DIGITOS (CSG)','CSG','CLAVE','CODIGO']),
+    grupo: txt(['GRUPO TERAPEUTICO','GRUPO']),
+    descripcion: txt(['DESCRIPCION','DESCRIP','NOMBRE']),
+    unidad: txt(['UNIDAD DE MEDIDA','UNIDAD']),
+    clasificacion: txt(['CLASIFICACION','CLASIF','TIPO']),
+    restriccion: txt(['RESTRICCION','RESTRIC']),
+    ubicacion: txt(['UBICACION','UBICACION (PASILLO/ESTANTE)','ANAQUEL']),
+    codigo_barras: txt(['CODIGO_BARRAS','CODIGO DE BARRAS','BARCODE','EAN']),
+    pzsAsignadas: mxImportNormNum(mxImportField(o,['PZS_ASIGNADAS','PZS','PIEZAS'],0)),
     ...mxImportFinanceFields(o)
   };
 }
-async function drawCpm(opts){
-  opts = opts || {};
-  try{ if(typeof mxSyncCpmMetaFromInventario==='function') await mxSyncCpmMetaFromInventario(); }catch(e){}
-  const q=($('#cpmBusca')?.value||'').toLowerCase();
-  const prioritizeId = Number(opts.prioritizeId||0) || null;
-  const data=(await idbAll('cpm')).sort((a,b)=>toStr(a.descripcion).localeCompare(toStr(b.descripcion),'es',{sensitivity:'base'}));
-  let rows=data.filter(x=>(toStr(x.csg)+' '+toStr(x.descripcion)).toLowerCase().includes(q));
 
-  if(prioritizeId){
-    const idx = rows.findIndex(x => Number(x && x._id) === prioritizeId);
-    if(idx > 0){
-      const item = rows.splice(idx,1)[0];
-      rows.unshift(item);
+async function mxSyncInventoryFromCpmEdit(previous,next){
+  try{
+    const oldKey=mxCpmNormKey(previous?.csg??previous?.clave),newKey=mxCpmNormKey(next?.csg??next?.clave);
+    const matchKey=oldKey||newKey;if(!matchKey)return 0;
+    try{window.__mxClearSqlCache?.('inventory');}catch(_e){}
+    const inv=await idbAll('inventory').catch(()=>[]),updates=[];
+    for(const row of (inv||[])){
+      if(mxCpmNormKey(row?.clave)!==matchKey)continue;
+      const u={...row};
+      if(mxCpmText(next.csg))u.clave=mxCpmText(next.csg);
+      u.descripcion=mxCpmText(next.descripcion);
+      if(mxCpmText(next.unidad))u.unidad=mxCpmText(next.unidad);
+      u.clasificacion=mxCpmText(next.clasificacion);
+      u.restriccion=mxCpmText(next.restriccion);
+      u.ubicacion=mxCpmText(next.ubicacion);
+      u.costo=Number(next.costo||0)||0;u.costo_unitario=u.costo;
+      u.precio_venta=Number(next.precio_venta||0)||0;u.precioVenta=u.precio_venta;
+      u.iva_pct=Number(next.iva_pct||0)||0;u.ivaPct=u.iva_pct;
+      u.ieps_pct=Number(next.ieps_pct||0)||0;u.iepsPct=u.ieps_pct;
+      u.updatedAt=new Date().toISOString();updates.push(u);
     }
-  }
-
-  const st = _mxPagerState('cpm');
-  st.pageSize = 500;
-  _mxEnsurePager('cpm', '#tblCpm', ()=>drawCpm());
-  _mxPagerUpdate('cpm', rows.length);
-  const start = (st.page-1) * st.pageSize;
-  const end = start + st.pageSize;
-  const pageRows = rows.slice(start, end);
-
-  const tb=document.querySelector('#tblCpm tbody');
-  tb.innerHTML=pageRows.map(m=>`<tr>
-    <td>${toStr(m.csg)}</td>
-    <td>${toStr(m.grupo)}</td>
-    <td>${toStr(m.descripcion)}</td>
-    <td>${toStr(m.unidad)}</td>
-    <td>${toStr(m.clasificacion||'')}</td>
-    <td>${toStr(m.restriccion||'')}</td>
-    <td>${toStr(m.ubicacion||m['UBICACIÓN']||m['ubicación']||'')}</td>
-    <td>${toStr(m.pzsAsignadas)}</td>
-    <td class="mx-catalog-fin-col">$${Number(m.costo||m.costo_unitario||0).toFixed(2)}</td>
-    <td class="mx-catalog-fin-col">$${Number(m.precio_venta||m.precioVenta||0).toFixed(2)}</td>
-    <td class="mx-catalog-fin-col">${Number(m.iva_pct||m.ivaPct||0).toFixed(2)}%</td>
-    <td class="mx-catalog-fin-col">${Number(m.ieps_pct||m.iepsPct||0).toFixed(2)}%</td>
-    <td>
-      <button class="btn" data-ced="${m._id}">✏️</button>
-      <button class="btn danger" data-cdel="${m._id}">🗑️</button>
-    </td>
-  </tr>`).join('');
-  tb.querySelectorAll('[data-ced]').forEach(b=>b.onclick=()=>openCpmEdit(Number(b.getAttribute('data-ced'))));
-  tb.querySelectorAll('[data-cdel]').forEach(b=>b.onclick=async()=>{
-    const id=Number(b.getAttribute('data-cdel')); if(!await mxConfirm('¿Eliminar producto del Catálogo?')) return;
-    await idbDelete('cpm', id); drawCpm();
-  });
+    if(!updates.length)return 0;
+    if(window.electronSql?.isElectron&&typeof window.electronSql.transactionDurable==='function'){
+      await window.electronSql.transactionDurable(updates.map(value=>({type:'put',store:'inventory',value})));
+    }else{
+      for(const value of updates)await idbPut('inventory',value);
+    }
+    try{window.__mxClearSqlCache?.('inventory');}catch(_e){}
+    try{await refreshCacheInv?.();}catch(_e){}
+    try{await drawInventario?.();}catch(_e){}
+    try{await window.__mxPersistAllNow?.();}catch(_e){}
+    return updates.length;
+  }catch(e){console.warn('[CATALOGO > INVENTARIO]',e);throw e;}
 }
-document.getElementById('cpmBusca')?.addEventListener('input', ()=>{ const st=_mxPagerState('cpm'); st.page=1; drawCpm(); });
-document.getElementById('btnAddCpm')?.addEventListener('click', ()=>openCpmEdit(null));
+
+async function drawCpm(opts){
+  opts=opts||{};
+  if(!cpmRepairDone)await mxCpmRepairDuplicates();
+  if(!window.__mxCpmInitialMetaSyncDone){
+    window.__mxCpmInitialMetaSyncDone=true;
+    try{if(typeof mxSyncCpmMetaFromInventario==='function')await mxSyncCpmMetaFromInventario();}catch(_e){}
+  }
+  const q=($('#cpmBusca')?.value||'').toLowerCase(),prioritizeId=Number(opts.prioritizeId||0)||null;
+  const data=(await mxCpmFreshRows()).sort((a,b)=>toStr(a.descripcion).localeCompare(toStr(b.descripcion),'es',{sensitivity:'base'}));
+  let rows=data.filter(x=>(toStr(x.csg)+' '+toStr(x.descripcion)).toLowerCase().includes(q));
+  if(prioritizeId){const idx=rows.findIndex(x=>Number(x?._id)===prioritizeId);if(idx>0){const item=rows.splice(idx,1)[0];rows.unshift(item);}}
+  const st=_mxPagerState('cpm');st.pageSize=500;_mxEnsurePager('cpm','#tblCpm',()=>drawCpm());_mxPagerUpdate('cpm',rows.length);
+  const start=(st.page-1)*st.pageSize,pageRows=rows.slice(start,start+st.pageSize),tb=document.querySelector('#tblCpm tbody');if(!tb)return;
+  tb.innerHTML=pageRows.map(m=>`<tr data-cpm-row-id="${Number(m._id)||0}" data-cpm-row-key="${encodeURIComponent(mxCpmNormKey(m.csg||m.clave))}">
+    <td>${toStr(m.csg)}</td><td>${toStr(m.grupo)}</td><td>${toStr(m.descripcion)}</td><td>${toStr(m.unidad)}</td><td>${toStr(m.clasificacion||'')}</td><td>${toStr(m.restriccion||'')}</td><td>${toStr(m.ubicacion||m['UBICACIÓN']||m['ubicación']||'')}</td><td>${toStr(m.pzsAsignadas)}</td>
+    <td class="mx-catalog-fin-col">$${Number(m.costo||m.costo_unitario||0).toFixed(2)}</td><td class="mx-catalog-fin-col">$${Number(m.precio_venta||m.precioVenta||0).toFixed(2)}</td><td class="mx-catalog-fin-col">${Number(m.iva_pct||m.ivaPct||0).toFixed(2)}%</td><td class="mx-catalog-fin-col">${Number(m.ieps_pct||m.iepsPct||0).toFixed(2)}%</td>
+    <td><button class="btn" data-ced="${Number(m._id)||0}" data-ckey="${encodeURIComponent(mxCpmNormKey(m.csg||m.clave))}">✏️</button><button class="btn danger" data-cdel="${Number(m._id)||0}" data-ckey="${encodeURIComponent(mxCpmNormKey(m.csg||m.clave))}">🗑️</button></td></tr>`).join('');
+  tb.querySelectorAll('[data-ced]').forEach(b=>b.onclick=()=>openCpmEdit(Number(b.dataset.ced),decodeURIComponent(b.dataset.ckey||'')));
+  tb.querySelectorAll('[data-cdel]').forEach(b=>b.onclick=()=>deleteCpmRecord(Number(b.dataset.cdel),decodeURIComponent(b.dataset.ckey||'')));
+}
+document.getElementById('cpmBusca')?.addEventListener('input',()=>{const st=_mxPagerState('cpm');st.page=1;drawCpm();});
+document.getElementById('btnAddCpm')?.addEventListener('click',()=>openCpmEdit(null,''));
 
 function closeCpmEdit(){
-  const modal = document.getElementById('cpmEditModal');
-  if(modal) modal.classList.remove('show');
-  cpmEditId = null;
+  const modal=document.getElementById('cpmEditModal');if(modal)modal.classList.remove('show');cpmEditId=null;cpmEditOriginalKey='';
 }
 
-async function openCpmEdit(id){
-  cpmEditId = id ? Number(id) : null;
-  const all = await idbAll('cpm');
-  const m = cpmEditId ? (all.find(x=>Number(x?._id)===cpmEditId) || {}) : {};
-  const modal = document.getElementById('cpmEditModal');
-  if(!modal){
-    mxAlert('No se pudo abrir el editor del Catálogo.');
-    return;
-  }
-
-  const setVal = (id, value)=>{
-    const el = document.getElementById(id);
-    if(el) el.value = value == null ? '' : String(value);
-  };
-
-  const title = document.getElementById('cpmEditModalTitle');
-  if(title) title.textContent = cpmEditId ? 'Editar producto del Catálogo' : 'Agregar producto al Catálogo';
-
-  setVal('cpmEditCsg', m.csg);
-  setVal('cpmEditGrupo', m.grupo);
-  setVal('cpmEditDescripcion', m.descripcion);
-  setVal('cpmEditUnidad', m.unidad);
-  setVal('cpmEditClasificacion', m.clasificacion);
-  setVal('cpmEditRestriccion', m.restriccion);
-  setVal('cpmEditUbicacion', m.ubicacion || m['UBICACIÓN'] || m['ubicación']);
-  setVal('cpmEditPzs', Number(m.pzsAsignadas||0));
-  setVal('cpmEditCosto', Number(m.costo||m.costo_unitario||0));
-  setVal('cpmEditPrecio', Number(m.precio_venta||m.precioVenta||0));
-  setVal('cpmEditIva', Number(m.iva_pct||m.ivaPct||0));
-  setVal('cpmEditIeps', Number(m.ieps_pct||m.iepsPct||0));
-
-  const saveBtn = document.getElementById('cpmEditSave');
-  if(saveBtn) saveBtn.textContent = cpmEditId ? 'Guardar cambios' : 'Agregar producto';
-
-  modal.classList.add('show');
-  setTimeout(()=>{
-    try{
-      const target = document.getElementById(cpmEditId ? 'cpmEditDescripcion' : 'cpmEditCsg');
-      target?.focus();
-      if(target?.select && !cpmEditId) target.select();
-    }catch(e){}
-  }, 40);
+async function openCpmEdit(id,expectedKey=''){
+  const all=await mxCpmFreshRows();
+  let m={};
+  if(id){
+    m=all.find(x=>Number(x?._id)===Number(id))||null;
+    if(m&&expectedKey&&mxCpmNormKey(m.csg||m.clave)!==mxCpmNormKey(expectedKey))m=null;
+    if(!m&&expectedKey)m=all.find(x=>mxCpmNormKey(x?.csg??x?.clave)===mxCpmNormKey(expectedKey))||null;
+    if(!m){mxAlert('Ese producto cambió o ya no existe. Se actualizará el Catálogo para evitar editar otro registro.');await drawCpm();return;}
+    cpmEditId=Number(m._id)||null;cpmEditOriginalKey=mxCpmNormKey(m.csg||m.clave);
+  }else{cpmEditId=null;cpmEditOriginalKey='';m={};}
+  const modal=document.getElementById('cpmEditModal');if(!modal){mxAlert('No se pudo abrir el editor del Catálogo.');return;}
+  const setVal=(id,value)=>{const el=document.getElementById(id);if(el)el.value=value==null?'':String(value);};
+  const title=document.getElementById('cpmEditModalTitle');if(title)title.textContent=cpmEditId?'Editar producto del Catálogo':'Agregar producto al Catálogo';
+  setVal('cpmEditCsg',m.csg||m.clave);setVal('cpmEditGrupo',m.grupo);setVal('cpmEditDescripcion',m.descripcion);setVal('cpmEditUnidad',m.unidad);setVal('cpmEditClasificacion',m.clasificacion);setVal('cpmEditRestriccion',m.restriccion);setVal('cpmEditUbicacion',m.ubicacion||m['UBICACIÓN']||m['ubicación']);setVal('cpmEditPzs',Number(m.pzsAsignadas||0));setVal('cpmEditCosto',Number(m.costo||m.costo_unitario||0));setVal('cpmEditPrecio',Number(m.precio_venta||m.precioVenta||0));setVal('cpmEditIva',Number(m.iva_pct||m.ivaPct||0));setVal('cpmEditIeps',Number(m.ieps_pct||m.iepsPct||0));
+  const saveBtn=document.getElementById('cpmEditSave');if(saveBtn){saveBtn.textContent=cpmEditId?'Guardar cambios':'Agregar producto';saveBtn.disabled=false;}
+  modal.classList.add('show');setTimeout(()=>{const target=document.getElementById(cpmEditId?'cpmEditDescripcion':'cpmEditCsg');target?.focus();if(target?.select&&!cpmEditId)target.select();},40);
 }
 
 async function saveCpmEdit(){
-  const currentId = cpmEditId;
-  const wasEdit = !!currentId;
-  const all = await idbAll('cpm');
-  const m = currentId ? (all.find(x=>Number(x?._id)===Number(currentId)) || {}) : {};
-
-  const val = (id)=>String(document.getElementById(id)?.value ?? '').trim();
-  const csg = val('cpmEditCsg');
-  const grupo = val('cpmEditGrupo');
-  const descripcion = val('cpmEditDescripcion');
-  const unidad = val('cpmEditUnidad');
-  const clasificacion = val('cpmEditClasificacion');
-  const restriccion = val('cpmEditRestriccion');
-  const ubicacion = val('cpmEditUbicacion');
-  const pzsRaw = Number(document.getElementById('cpmEditPzs')?.value || 0);
-  const pzsAsignadas = Math.max(0, Number.isFinite(pzsRaw) ? pzsRaw : 0);
-  const costo = Math.max(0, Number(document.getElementById('cpmEditCosto')?.value || 0) || 0);
-  const precio_venta = Math.max(0, Number(document.getElementById('cpmEditPrecio')?.value || 0) || 0);
-  const iva_pct = Math.max(0, Number(document.getElementById('cpmEditIva')?.value || 0) || 0);
-  const ieps_pct = Math.max(0, Number(document.getElementById('cpmEditIeps')?.value || 0) || 0);
-
-  if(!descripcion){
-    mxAlert('La descripción es obligatoria.');
-    setTimeout(()=>document.getElementById('cpmEditDescripcion')?.focus(), 30);
-    return;
-  }
-
-  const payload = {
-    ...(m||{}),
-    csg, grupo, descripcion, unidad,
-    clasificacion, restriccion, ubicacion,
-    pzsAsignadas, costo, precio_venta, iva_pct, ieps_pct
-  };
-
-  let savedId = currentId;
-  if(savedId){
-    payload._id = Number(savedId);
-    await idbPut('cpm', payload);
-  }else{
-    savedId = Date.now();
-    payload._id = savedId;
-    await idbPut('cpm', payload);
-  }
-
-  const modal = document.getElementById('cpmEditModal');
-  if(modal) modal.classList.remove('show');
-  cpmEditId = null;
-
-  await drawCpm({ prioritizeId: Number(savedId) });
-  setTimeout(()=>{ try{ drawCpm(); }catch(e){} }, 900);
-  mxAlert(wasEdit ? 'Producto del Catálogo actualizado.' : 'Producto agregado al Catálogo.');
+  if(cpmSaveBusy)return;cpmSaveBusy=true;
+  const saveBtn=document.getElementById('cpmEditSave'),originalText=saveBtn?.textContent||'Guardar';if(saveBtn){saveBtn.disabled=true;saveBtn.textContent='Guardando…';}
+  try{
+    const currentId=Number(cpmEditId)||null,all=await mxCpmFreshRows();let previous=null;
+    if(currentId){previous=all.find(x=>Number(x?._id)===currentId)||null;if(previous&&cpmEditOriginalKey&&mxCpmNormKey(previous.csg||previous.clave)!==cpmEditOriginalKey)previous=null;if(!previous&&cpmEditOriginalKey)previous=all.find(x=>mxCpmNormKey(x?.csg??x?.clave)===cpmEditOriginalKey)||null;if(!previous)throw new Error('El producto que estabas editando ya no existe. No se creó un registro nuevo.');}
+    const val=id=>String(document.getElementById(id)?.value??'').trim(),csg=val('cpmEditCsg'),newKey=mxCpmNormKey(csg),descripcion=val('cpmEditDescripcion');
+    if(!csg){document.getElementById('cpmEditCsg')?.focus();throw new Error('La clave del producto es obligatoria.');}
+    if(!descripcion){document.getElementById('cpmEditDescripcion')?.focus();throw new Error('El nombre/descripción del producto es obligatorio.');}
+    const collision=all.find(x=>mxCpmNormKey(x?.csg??x?.clave)===newKey&&(!previous||Number(x?._id)!==Number(previous._id))&&mxCpmNormKey(x?.csg??x?.clave)!==cpmEditOriginalKey);
+    if(collision)throw new Error(`La clave ${csg} ya pertenece a otro producto del Catálogo. No se generó ningún duplicado.`);
+    const payload={...(previous||{}),csg,clave:csg,grupo:val('cpmEditGrupo'),descripcion,unidad:val('cpmEditUnidad'),clasificacion:val('cpmEditClasificacion'),restriccion:val('cpmEditRestriccion'),ubicacion:val('cpmEditUbicacion'),pzsAsignadas:Math.max(0,Number(document.getElementById('cpmEditPzs')?.value||0)||0),costo:Math.max(0,Number(document.getElementById('cpmEditCosto')?.value||0)||0),precio_venta:Math.max(0,Number(document.getElementById('cpmEditPrecio')?.value||0)||0),iva_pct:Math.max(0,Number(document.getElementById('cpmEditIva')?.value||0)||0),ieps_pct:Math.max(0,Number(document.getElementById('cpmEditIeps')?.value||0)||0),updatedAt:new Date().toISOString()};
+    let savedId;
+    if(previous){payload._id=Number(previous._id);savedId=await idbPut('cpm',payload);savedId=Number(savedId)||Number(previous._id);}else{delete payload._id;savedId=Number(await idbPut('cpm',payload))||0;}
+    if(!savedId)throw new Error('No se recibió confirmación del guardado del Catálogo.');
+    payload._id=savedId;
+    // Limpia residuos de la falla antigua: una clave debe tener un solo registro.
+    const after=await mxCpmFreshRows(),same=after.filter(x=>mxCpmNormKey(x?.csg??x?.clave)===newKey),extras=same.filter(x=>Number(x?._id)!==savedId).map(x=>Number(x?._id));
+    if(extras.length)await mxCpmDeleteIds(extras);
+    const invUpdated=previous?await mxSyncInventoryFromCpmEdit(previous,payload):0;
+    await mxCpmPersistNow();closeCpmEdit();await drawCpm({prioritizeId:savedId});
+    mxAlert(previous?`✅ Producto del Catálogo actualizado en el mismo registro.${invUpdated?` También se actualizaron ${invUpdated} registro(s) de Inventario con esa clave.`:' No había existencias de esa clave en Inventario para actualizar.'}`:'✅ Producto agregado al Catálogo.');
+  }catch(err){mxAlert('No se pudo guardar el producto del Catálogo: '+(err?.message||err));}
+  finally{cpmSaveBusy=false;if(saveBtn&&document.body.contains(saveBtn)){saveBtn.disabled=false;saveBtn.textContent=originalText;}}
 }
 
-document.getElementById('cpmEditCancel')?.addEventListener('click', closeCpmEdit);
-document.getElementById('cpmEditSave')?.addEventListener('click', ()=>{
-  saveCpmEdit().catch(err=>mxAlert('No se pudo guardar el producto del Catálogo: '+(err?.message||err)));
-});
-document.getElementById('cpmEditModal')?.addEventListener('click', (event)=>{
-  if(event.target?.id === 'cpmEditModal') closeCpmEdit();
-});
-document.getElementById('cpmEditModal')?.addEventListener('keydown', (event)=>{
-  if(event.key === 'Escape'){
-    event.preventDefault();
-    closeCpmEdit();
-  }else if(event.key === 'Enter' && event.ctrlKey){
-    event.preventDefault();
-    saveCpmEdit().catch(err=>mxAlert('No se pudo guardar el producto del Catálogo: '+(err?.message||err)));
-  }
-});
+async function deleteCpmRecord(id,expectedKey=''){
+  const token=`${Number(id)||0}|${mxCpmNormKey(expectedKey)}`;if(cpmDeleteBusy.has(token))return;cpmDeleteBusy.add(token);
+  try{
+    const all=await mxCpmFreshRows();let target=all.find(x=>Number(x?._id)===Number(id))||null;
+    if(target&&expectedKey&&mxCpmNormKey(target.csg||target.clave)!==mxCpmNormKey(expectedKey))target=null;
+    if(!target&&expectedKey)target=all.find(x=>mxCpmNormKey(x?.csg??x?.clave)===mxCpmNormKey(expectedKey))||null;
+    if(!target){mxAlert('El producto ya no existe. Se actualizó la lista y no se eliminó ningún otro registro.');await drawCpm();return;}
+    const key=mxCpmNormKey(target.csg||target.clave),label=`${mxCpmText(target.csg||target.clave)} · ${mxCpmText(target.descripcion)||'Sin descripción'}`;
+    if(!await mxConfirm(`¿Eliminar del Catálogo este producto?\n\n${label}\n\nEsto NO elimina sus existencias del Inventario.`))return;
+    const ids=all.filter(x=>key&&mxCpmNormKey(x?.csg??x?.clave)===key).map(x=>Number(x?._id)).filter(Boolean);if(!ids.length&&target._id)ids.push(Number(target._id));
+    await mxCpmDeleteIds(ids);
+    const verify=await mxCpmFreshRows(),remains=verify.some(x=>ids.includes(Number(x?._id))||(key&&mxCpmNormKey(x?.csg??x?.clave)===key));
+    if(remains)throw new Error('La eliminación no pudo confirmarse; el registro se conservó para evitar borrar otro producto.');
+    await drawCpm();mxAlert('✅ Producto eliminado correctamente del Catálogo. El Inventario se conserva.');
+  }catch(err){mxAlert('No se pudo eliminar el producto del Catálogo: '+(err?.message||err));}
+  finally{cpmDeleteBusy.delete(token);}
+}
+
+document.getElementById('cpmEditCancel')?.addEventListener('click',closeCpmEdit);
+document.getElementById('cpmEditSave')?.addEventListener('click',()=>saveCpmEdit());
+document.getElementById('cpmEditModal')?.addEventListener('click',event=>{if(event.target?.id==='cpmEditModal')closeCpmEdit();});
+document.getElementById('cpmEditModal')?.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();closeCpmEdit();}else if(event.key==='Enter'&&event.ctrlKey){event.preventDefault();saveCpmEdit();}});
 
 
 /* ===== Catálogo operativo: alta automática desde Entradas ===== */
@@ -11906,21 +12019,26 @@ function readFileToRows(file, storeHint){
 
         const sheetName = mxPickSheetName(wb, storeHint);
         const ws = wb.Sheets[sheetName || wb.SheetNames[0]];
-
+        if(!ws)throw new Error('No se encontró la hoja de importación.');
         const json=XLSX.utils.sheet_to_json(ws,{defval:''});
-        // Una celda de Excel formateada 16% se almacena como 0.16.
-        if(ws && ws['!ref']){
-          const range=XLSX.utils.decode_range(ws['!ref']);
-          const hdr=[];
+        // Excel almacena 16% como 0.16. Convertir solo cuando la celda tiene
+        // formato porcentaje real; el valor simple 16 sigue siendo 16.
+        try{
+          const range=XLSX.utils.decode_range(ws['!ref']||'A1');
+          const headers=[];
           for(let c=range.s.c;c<=range.e.c;c++){
-            const name=String(ws[XLSX.utils.encode_cell({r:range.s.r,c})]?.v??'');
-            if(['iva_pct','ieps_pct','margen_pct','margen_ganancia'].includes(mxImportCanonicalKey(name)))hdr.push({c,name});
+            const addr=XLSX.utils.encode_cell({r:range.s.r,c});
+            headers.push({c,name:String(ws[addr]?.v??'')});
           }
-          for(let ri=0;ri<json.length;ri++)for(const h of hdr){
-            const cell=ws[XLSX.utils.encode_cell({r:range.s.r+1+ri,c:h.c})];
-            if(cell && typeof cell.v==='number' && typeof cell.z==='string' && cell.z.includes('%'))json[ri][h.name]=cell.v*100;
+          const pctHeaders=headers.filter(h=>['iva_pct','ieps_pct','margen_pct','margen_ganancia'].includes(mxImportCanonicalKey(h.name)));
+          for(let ri=0;ri<json.length;ri++){
+            const excelRow=range.s.r+1+ri;
+            for(const h of pctHeaders){
+              const cell=ws[XLSX.utils.encode_cell({r:excelRow,c:h.c})];
+              if(cell && typeof cell.v==='number' && typeof cell.z==='string' && cell.z.includes('%'))json[ri][h.name]=cell.v*100;
+            }
           }
-        }
+        }catch(e){console.warn('[IMPORT] No se pudo normalizar formato porcentual',e);}
         resolve(json);
       }catch(err){ reject(err); }
     };
@@ -12033,6 +12151,9 @@ function mxConsolidarInventarioImportado(rows){
     if(!normTxt(base.clasificacion) && normTxt(row.clasificacion)) base.clasificacion = row.clasificacion;
     if(!normTxt(base.restriccion) && normTxt(row.restriccion)) base.restriccion = row.restriccion;
     if(!normTxt(base.ubicacion) && normTxt(row.ubicacion)) base.ubicacion = row.ubicacion;
+    for(const field of ['proveedor','proveedor_rfc','proveedor_id','departamento','presentacion','registro_sanitario','denominacion_generica','titular','grupo','costo','precio_venta','iva_pct','ieps_pct']){
+      if((base[field]==null || base[field]==='' || base[field]===0) && row[field]!=null && row[field]!=='' && row[field]!==0)base[field]=row[field];
+    }
   }
 
   return out;
@@ -12048,7 +12169,7 @@ async function importReplace(files,store,onMap){
   if(!files || !files.length) return mxAlert('Selecciona archivo(s)');
 
   // Primero se leen, convierten y validan TODOS los archivos. No se borra nada antes.
-  let allMapped=[];
+  let allMapped=[],auditImportReport=null;
   try{
     for(const f of files){
       const rows=await readFileToRows(f,store);
@@ -12057,9 +12178,21 @@ async function importReplace(files,store,onMap){
       if(!mapped.length) throw new Error('El archivo '+f.name+' no contiene filas válidas.');
       allMapped.push(...mapped);
     }
-    if(store==='inventory'||store==='cpm'){
-      const missing=allMapped.some(r=>!String(store==='cpm'?(r.csg||r.clave||''):(r.clave||'')).trim());
-      if(missing)throw new Error('Hay filas sin CLAVE/CSG. No se modificó ningún registro; corrige la plantilla.');
+    if(store==='inventory' || store==='cpm'){
+      const valid=(r)=>String(store==='cpm'?(r.csg||r.clave||''):(r.clave||'')).trim();
+      if(!allMapped.length || !allMapped.every(valid))throw new Error('Hay filas sin CLAVE/CSG o el archivo no contiene productos válidos. Comprueba la plantilla antes de reemplazar registros.');
+    }
+    if(store==='entradas'){
+      const wrong=[];
+      allMapped=allMapped.map((row,i)=>{
+        const copy={...row};
+        const source=copy.fecha||copy.fechaIso||copy.createdAt||copy['fecha movimiento'];
+        const parsed=typeof parseFechaFlexible==='function'?parseFechaFlexible(source):null;
+        if(!parsed||isNaN(parsed.getTime())){wrong.push(i+2);return copy;}
+        copy.fecha=[String(parsed.getDate()).padStart(2,'0'),String(parsed.getMonth()+1).padStart(2,'0'),parsed.getFullYear()].join('/');
+        return copy;
+      });
+      if(wrong.length)throw new Error('Entradas sin FECHA válida (filas '+wrong.slice(0,12).join(', ')+(wrong.length>12?'…':'')+'). Agrega la fecha real en DD/MM/AAAA; no se asigna hoy a movimientos históricos.');
     }
     if(store==='inventory') allMapped=mxConsolidarInventarioImportado(allMapped);
     if(['inventory','entradas','salidas','cpm'].includes(store) && typeof window.mxFinancialNormalizeRecord==='function'){
@@ -12095,11 +12228,19 @@ async function importReplace(files,store,onMap){
     if(__negTemp){ mxSetAllowNegTemp(false); const sw=document.getElementById('cfgAllowNegTemp'); if(sw) sw.checked=false; }
   }
   if(store==='salidas'){ drawSalidas(); try{ await syncEntradasSalidasInventario(); if(typeof drawInventario==='function') drawInventario(); }catch(_e){} }
-  if(store==='entradas'){ drawEntradas(); try{ await syncEntradasSalidasInventario(); if(typeof drawInventario==='function') drawInventario(); }catch(_e){} }
+  if(store==='entradas'){
+    drawEntradas();
+    try{
+      await syncEntradasSalidasInventario({force:true});
+      window.__mxInvalidateInventoryCache?.();
+      if(typeof drawInventario==='function')await drawInventario({forceDb:true});
+      auditImportReport=await window.mxAuditEntradasSinInventario?.({repair:false,quiet:true});
+    }catch(e){console.error('[MX ENTRADAS CONSISTENCIA]',e);window.mxAlert?.('La importación terminó, pero falló la revisión de inventario. No repitas la carga; revisa con el botón de auditoría. '+(e?.message||e));}
+  }
   if(store==='medicos') drawMedicos();
   if(store==='cpm') drawCpm();
   if(typeof renderDashboard==='function') renderDashboard();
-  {const mode=(typeof window.mxFinancialEnabled==='function'&&window.mxFinancialEnabled())?'FINANCIERO':'NORMAL';mxAlert(`✅ Importación completada y validada. Modo actual: ${mode}.${mode==='FINANCIERO'&&['inventory','entradas','salidas'].includes(store)?' Se conservaron y recalcularon los campos financieros disponibles.':' Los campos financieros existentes se conservan en los registros, pero permanecen ocultos en modo Normal.'}`);}
+  {const mode=(typeof window.mxFinancialEnabled==='function'&&window.mxFinancialEnabled())?'FINANCIERO':'NORMAL';const warning=store==='entradas'&&auditImportReport?.missing?` ⚠️ ${auditImportReport.missing} lotes tienen Entradas pero NO aparecen en Inventario: usa el botón Revisar Entradas sin Inventario para recuperar los ${auditImportReport.safe} lotes seguros tras confirmación. ${auditImportReport.manual} requieren revisión manual.`:'';mxAlert(`✅ Importación completada y validada. Modo actual: ${mode}.${mode==='FINANCIERO'&&['inventory','entradas','salidas'].includes(store)?' Se conservaron y recalcularon los campos financieros disponibles.':' Los campos financieros existentes se conservan en los registros, pero permanecen ocultos en modo Normal.'}${warning}`);}
 }
 
 function mxReadAlias(obj, aliases, fallback){
@@ -12206,80 +12347,36 @@ async function mxRepairColumnConnectionsOnce(force=false){
 }
 
 function mapInventario(r){
-  const o = mxImportPrepareKeys(r);
-
-  function normalizarFecha(fecha) {
-    if (!fecha) return "";
-
-    if (!isNaN(fecha)) {
-      const base = new Date(1900, 0, fecha - 1); // Excel usa base 1900-01-00
-      return base.toLocaleDateString("es-MX", { day: "2-digit", month: "2-digit", year: "numeric" });
-    }
-
-    const parts = fecha.toString().split(/[-/]/);
-    if (parts.length === 3) {
-      let [a, b, c] = parts.map(x => x.padStart(2, "0"));
-      if (Number(a) > 12) return `${a}/${b}/${c}`; // ya está en DD/MM/YYYY
-      if (Number(b) > 12) return `${b}/${a}/${c}`; // era MM/DD/YYYY
-      return `${a}/${b}/${c}`;
-    }
-
-    return fecha;
-  }
-
-  const existenciaCol = mxReadAlias(o, ['existencia','existencias','existencias por lote','existencia por lote','total','pzs_total','pzstotal','exis','pzs'], 0);
-
-  const almIn = mxReadAlias(o, ['almacen','almacén','existencia almacen','existencia_almacen','existencia en almacen','existencia en almacén','existenciaalmacen','pzs almacen','pzs_almacen','pzsalmacen','alm','existenciaalmacen','existenciaalmacén'], undefined);
-
-  const estIn = mxReadAlias(o, ['estantes','estante','existencia estante','existencia_estante','existencia estantes','existencia_estantes','existencia en estante','existencia en estantes','existenciaestante','existenciaestantes','pzs estante','pzs_estante','pzsestante','pzs estantes','pzs_estantes','pzsestantes','est','existenciaestante'], undefined);
-
-  const alm = (almIn===undefined || almIn===null || almIn==='') ? mxNumSan(existenciaCol,0) : mxNumSan(almIn,0);
-  const est = (estIn===undefined || estIn===null || estIn==='') ? 0 : mxNumSan(estIn,0);
-  const total = mxNumSan(alm,0) + mxNumSan(est,0);
-
+  const o=mxImportPrepareKeys(r);
+  const text=(names)=>mxImportNormText(mxImportField(o,names,''));
+  const num=(names,def=0)=>mxImportNormNum(mxImportField(o,names,def));
+  const existenciaCol=mxImportField(o,['EXISTENCIA','EXISTENCIAS','EXISTENCIAS POR LOTE','EXISTENCIA POR LOTE','TOTAL','PZS_TOTAL','PZS','EXIS'],0);
+  const almIn=mxImportField(o,['ALMACEN','ALMACÉN','EXISTENCIA ALMACEN','EXISTENCIA EN ALMACEN','PZS ALMACEN','ALM'],undefined);
+  const estIn=mxImportField(o,['ESTANTES','ESTANTE','EXISTENCIA ESTANTE','EXISTENCIA ESTANTES','EXISTENCIA EN ESTANTES','PZS ESTANTES','EST'],undefined);
+  const alm=(almIn===undefined || almIn===null || almIn==='')?mxNumSan(existenciaCol,0):mxNumSan(almIn,0);
+  const est=(estIn===undefined || estIn===null || estIn==='')?0:mxNumSan(estIn,0);
+  const total=alm+est;
+  const base=mxImportField(o,['EXISTENCIA_BASE','EXISTENCIA BASE','BASE_EXIST','BASE'],undefined);
   return {
-    clave: o['clave']||o['id']||o['codigo']||'',
-    codigo_barras: (
-      o['codigo de barras'] ??
-      o['código de barras'] ??
-      o['codigo_barras'] ??
-      o['código_barras'] ??
-      o['codigobarras'] ??
-      o['codbarras'] ??
-      o['barcode'] ??
-      o['ean'] ??
-      o['ean13'] ??
-      ''
-    ),
-    descripcion: o['descripcion']||o['descripción']||o['nombre']||'',
-    unidad: o['unidad']||'',
-    lote: o['lote']||'',
-    caducidad: mxImportNormFecha(mxImportField(o,['CADUCIDAD','CADUCIDAD/LOTE','CAD'],'')),
-    entradas: Number(o['entradas']||0),
-    salidas: Number(o['salidas']||0),
-
-    almacen: alm,
-    estantes: est,
-
-    base_exist: (()=>{
-      const b = mxReadAlias(o, ['existencia_base','existencia base','base_exist','base'], undefined);
-      const bn = (b===undefined || b===null || b==='') ? NaN : mxNumSan(b, NaN);
-      return isNaN(bn) ? Number(total||0) : bn;
-    })(),
-    existencia: Number(total||0),
-
-    clasificacion: (o['clasificacion']||o['clasificación']||o['clasif']||o['tipo']||''),
-    restriccion: (o['restriccion']||o['restricción']||''),
-
-    ubicacion: (o['ubicacion']||o['ubicación']||o['ubica']||o['anaquel']||o['estante ubicacion']||o['estante_ubicacion']||''),
-    costo: mxImportNormNum(mxReadAlias(o,['costo','costo unitario','costo_unitario','precio compra','precio_compra'],0)),
-    iva_pct: mxImportNormNum(mxReadAlias(o,['iva %','iva%','iva pct','iva_pct','tasa iva','tasa_iva'],0)),
-    ieps_pct: mxImportNormNum(mxReadAlias(o,['ieps %','ieps%','ieps pct','ieps_pct','tasa ieps','tasa_ieps'],0)),
-    precio_venta: mxImportNormNum(mxReadAlias(o,['precio de venta','precio venta','precio_venta','p venta','venta'],0)),
-    iva: mxImportNormNum(mxReadAlias(o,['iva unitario','iva_unitario','iva importe'],0)),
-    ieps: mxImportNormNum(mxReadAlias(o,['ieps unitario','ieps_unitario','ieps importe'],0)),
-    costo_final: mxImportNormNum(mxReadAlias(o,['costo final unitario','costo_final_unitario','costo final','costo_final'],0)),
-    margen_ganancia: mxImportNormNum(mxReadAlias(o,['margen %','margen_%','margen','margen ganancia','margen_ganancia'],0)),
+    clave:text(['CLAVE','ID','CODIGO']),
+    codigo_barras:text(['CODIGO_BARRAS','CODIGO DE BARRAS','CODIGOBARRAS','CODBARRAS','BARCODE','EAN','EAN13']),
+    descripcion:text(['DESCRIPCION','DESCRIP','NOMBRE']),
+    unidad:text(['UNIDAD','UNIDAD DE MEDIDA']),
+    lote:text(['LOTE']),
+    caducidad:mxImportNormFecha(mxImportField(o,['CADUCIDAD','CADUCIDAD/LOTE','CAD'],'')),
+    entradas:num(['ENTRADAS']),salidas:num(['SALIDAS']),
+    almacen:alm,estantes:est,
+    base_exist:(base===undefined || base===null || base==='')?total:mxImportNormNum(base),
+    existencia:total,
+    clasificacion:text(['CLASIFICACION','CLASIF','TIPO']),
+    restriccion:text(['RESTRICCION']),
+    ubicacion:text(['UBICACION','UBICA','ANAQUEL','ESTANTE UBICACION']),
+    departamento:text(['DEPARTAMENTO']),
+    presentacion:text(['PRESENTACION']),
+    registro_sanitario:text(['REGISTRO_SANITARIO','REGISTRO SANITARIO']),
+    denominacion_generica:text(['DENOMINACION_GENERICA','DENOMINACION GENERICA']),
+    titular:text(['TITULAR','RESPONSABLE SANITARIO']),
+    grupo:text(['GRUPO','GRUPO TERAPEUTICO']),
     ...mxImportFinanceFields(o)
   };
 }
@@ -12288,12 +12385,26 @@ function mxImportNormText(v){
   return String(v ?? '').trim();
 }
 function mxImportNormNum(v){
-  if(v === null || v === undefined || v === '') return 0;
-  if(typeof v === 'number') return Number.isFinite(v) ? v : 0;
-  const s = String(v).replace(/[$,%\s]/g,'').replace(/,/g,'').trim();
-  const n = Number(s);
-  return Number.isFinite(n) ? n : 0;
+  if(v===null || v===undefined || v==='')return 0;
+  if(typeof v==='number')return Number.isFinite(v)?v:0;
+  let s=String(v).replace(/[\u00a0\s$%]/g,'').replace(/[^\d.,+\-]/g,'');
+  if(!s)return 0;
+  const comma=s.lastIndexOf(','),dot=s.lastIndexOf('.');
+  if(comma>=0 && dot>=0){
+    if(comma>dot)s=s.replace(/\./g,'').replace(',','.');
+    else s=s.replace(/,/g,'');
+  }else if(comma>=0){
+    const parts=s.split(',');
+    if(parts.length===2 && parts[1].length!==3)s=s.replace(',','.');
+    else s=s.replace(/,/g,'');
+  }else if(dot>=0){
+    // El punto único es decimal (costo 125.375), no separador de miles.
+    // Solo varios puntos sin coma se interpretan como grupos de miles.
+    if(s.split('.').length>2)s=s.replace(/\./g,'');
+  }
+  const n=Number(s);return Number.isFinite(n)?n:0;
 }
+
 function mxImportNormFecha(v){
   if(v === null || v === undefined || v === '') return '';
   if(typeof v === 'number' && Number.isFinite(v)){
@@ -12318,7 +12429,7 @@ function mxImportNormFecha(v){
 function mapEntradaImport(r){
   const o = mxImportPrepareKeys(r);
   return {
-    fecha: mxImportNormText(o['fecha'] || o['f. movimiento'] || o['fecha movimiento']),
+    fecha: mxImportNormFecha(o['fecha'] ?? o['f. movimiento'] ?? o['fecha movimiento'] ?? o['fecha_registro']),
     usuario: mxImportNormText(o['usuario'] || o['responsable']),
     clave: mxImportNormText(o['clave'] || o['codigo'] || o['código']),
     codigo_barras: mxImportNormText(o['codigo de barras'] || o['código de barras'] || o['codigo_barras'] || o['código_barras'] || o['codigobarras'] || o['barcode'] || o['ean'] || o['ean13']),
@@ -12344,16 +12455,6 @@ function mapEntradaImport(r){
     departamento: mxImportNormText(o['departamento']),
     presentacion: mxImportNormText(o['presentacion'] || o['presentación']),
     denominacion_generica: mxImportNormText(o['denominacion generica'] || o['denominación genérica'] || o['denominacion_generica']),
-    costo: mxImportNormNum(o['costo'] ?? o['costo unitario'] ?? o['costo_unitario'] ?? o['precio compra'] ?? o['precio_compra']),
-    iva_pct: mxImportNormNum(o['iva %'] ?? o['iva%'] ?? o['iva pct'] ?? o['iva_pct'] ?? o['tasa iva'] ?? o['tasa_iva']),
-    iva: mxImportNormNum(o['iva unitario'] ?? o['iva_unitario'] ?? o['iva importe']),
-    ieps_pct: mxImportNormNum(o['ieps %'] ?? o['ieps%'] ?? o['ieps pct'] ?? o['ieps_pct'] ?? o['tasa ieps'] ?? o['tasa_ieps']),
-    ieps: mxImportNormNum(o['ieps unitario'] ?? o['ieps_unitario'] ?? o['ieps importe']),
-    costo_final: mxImportNormNum(o['costo final unitario'] ?? o['costo_final_unitario'] ?? o['costo final'] ?? o['costo_final']),
-    precio_venta: mxImportNormNum(o['precio de venta'] ?? o['precio venta'] ?? o['precio_venta'] ?? o['p venta']),
-    margen_ganancia: mxImportNormNum(o['margen %'] ?? o['margen_%'] ?? o['margen'] ?? o['margen ganancia'] ?? o['margen_ganancia']),
-    valor_costo: mxImportNormNum(o['valor costo'] ?? o['valor_costo'] ?? o['total costo'] ?? o['total_costo']),
-    valor_venta: mxImportNormNum(o['valor venta'] ?? o['valor_venta'] ?? o['total venta'] ?? o['total_venta']),
     ...mxImportFinanceFields(o)
   };
 }
@@ -12403,16 +12504,6 @@ function mapSalidaImport(r){
     solicitante: mxImportNormText(o['solicitante'] || o['enfermera que solicita'] || o['quien solicita']),
     observaciones: mxImportNormText(o['observaciones'] || o['observacion'] || o['observación']),
     folio: mxImportNormText(o['folio'] || o['folio_doc'] || o['documento']),
-    costo: mxImportNormNum(o['costo'] ?? o['costo unitario'] ?? o['costo_unitario'] ?? o['precio compra'] ?? o['precio_compra']),
-    iva_pct: mxImportNormNum(o['iva %'] ?? o['iva%'] ?? o['iva pct'] ?? o['iva_pct'] ?? o['tasa iva'] ?? o['tasa_iva']),
-    iva: mxImportNormNum(o['iva unitario'] ?? o['iva_unitario'] ?? o['iva importe']),
-    ieps_pct: mxImportNormNum(o['ieps %'] ?? o['ieps%'] ?? o['ieps pct'] ?? o['ieps_pct'] ?? o['tasa ieps'] ?? o['tasa_ieps']),
-    ieps: mxImportNormNum(o['ieps unitario'] ?? o['ieps_unitario'] ?? o['ieps importe']),
-    costo_final: mxImportNormNum(o['costo final unitario'] ?? o['costo_final_unitario'] ?? o['costo final'] ?? o['costo_final']),
-    precio_venta: mxImportNormNum(o['precio de venta'] ?? o['precio venta'] ?? o['precio_venta'] ?? o['p venta']),
-    margen_ganancia: mxImportNormNum(o['margen %'] ?? o['margen_%'] ?? o['margen'] ?? o['margen ganancia'] ?? o['margen_ganancia']),
-    valor_costo: mxImportNormNum(o['valor costo'] ?? o['valor_costo'] ?? o['total costo'] ?? o['total_costo']),
-    valor_venta: mxImportNormNum(o['valor venta'] ?? o['valor_venta'] ?? o['total venta'] ?? o['total_venta']),
     ...mxImportFinanceFields(o)
   };
 }
@@ -12554,48 +12645,51 @@ Registros eliminados: ${borrados}`);
   }
 };
 
-
-/* MACROXEL V255 · PLANTILLAS EXCEL POR MÓDULO Y MODALIDAD */
+/* v250: plantillas de importación por módulo y por modalidad, compatibles
+   con las exportaciones financieras del propio sistema. */
 function mxImportBuildTemplate(kind){
   if(typeof XLSX==='undefined')throw new Error('La biblioteca Excel no está cargada.');
-  const financial=typeof window.mxFinancialEnabled==='function' && !!window.mxFinancialEnabled();
+  const financial=typeof window.mxFinancialEnabled==='function'&&window.mxFinancialEnabled();
   const base={
     inventory:['CODIGO_BARRAS','CLAVE','DESCRIPCION','UNIDAD','LOTE','CADUCIDAD','ALMACEN','ESTANTES','EXISTENCIA_BASE','CLASIFICACION','RESTRICCION','UBICACION'],
     entradas:['FECHA','USUARIO','CLAVE','CODIGO_BARRAS','DESCRIPCION','UNIDAD','LOTE','CADUCIDAD','ANTES','PZS','SALDO_FINAL','TIPO_DOC','FOLIO','PROVEEDOR'],
     salidas:['FECHA','USUARIO','CLAVE','CODIGO_BARRAS','DESCRIPCION','UNIDAD','LOTE','CADUCIDAD','ANTES','PZS','SALDO_FINAL','TIPO_DOC','FOLIO','MEDICO','CEDULA','PACIENTE','EXPEDIENTE'],
     cpm:['CSG','GRUPO_TERAPEUTICO','DESCRIPCION','UNIDAD','CLASIFICACION','RESTRICCION','UBICACION','PZS_ASIGNADAS']
   };
-  const extra={
+  const extras={
     inventory:['COSTO_UNITARIO','IVA_%','IEPS_%','IVA_UNITARIO','IEPS_UNITARIO','COSTO_FINAL_UNITARIO','PRECIO_VENTA','MARGEN_%','PROVEEDOR','PROVEEDOR_RFC','PROVEEDOR_ID','DEPARTAMENTO','PRESENTACION','REGISTRO_SANITARIO','DENOMINACION_GENERICA','TITULAR','GRUPO_TERAPEUTICO'],
     entradas:['COSTO_UNITARIO','IVA_%','IEPS_%','IVA_UNITARIO','IEPS_UNITARIO','COSTO_FINAL_UNITARIO','PRECIO_VENTA','MARGEN_%','PROVEEDOR_RFC','PROVEEDOR_ID','DEPARTAMENTO','PRESENTACION','REGISTRO_SANITARIO','DENOMINACION_GENERICA'],
     salidas:['COSTO_UNITARIO','IVA_%','IEPS_%','IVA_UNITARIO','IEPS_UNITARIO','COSTO_FINAL_UNITARIO','PRECIO_VENTA','MARGEN_%','PROVEEDOR','PROVEEDOR_RFC','PROVEEDOR_ID'],
     cpm:['COSTO_UNITARIO','IVA_%','IEPS_%','COSTO_FINAL_UNITARIO','PRECIO_VENTA','MARGEN_%','PROVEEDOR','PROVEEDOR_RFC','PROVEEDOR_ID']
   };
-  if(!base[kind])throw new Error('Módulo desconocido.');
-  const labels={inventory:'INVENTARIO',entradas:'ENTRADAS',salidas:'SALIDAS',cpm:'CPM'};
-  const name=labels[kind],headers=[...base[kind],...(financial?extra[kind]:[])];
-  const wb=XLSX.utils.book_new();
-  const ws=XLSX.utils.aoa_to_sheet([headers]);
-  ws['!cols']=headers.map(h=>({wch:h.includes('DESCRIPCION')?52:h.includes('PROVEEDOR')?26:h.includes('CLAVE')||h.includes('COSTO')||h.includes('PRECIO')?20:17}));
-  XLSX.utils.book_append_sheet(wb,ws,name);
-  const info=[
-    ['MACROXEL HPS - PLANTILLA '+name+(financial?' (FINANCIERO)':' (NORMAL)')],
-    ['Captura los datos en la primera hoja sin cambiar los encabezados.'],
-    ['CLAVE es obligatoria en Inventario y CSG en Catálogo. Conserva LOTE para distinguir productos.'],
-    ['En IVA_% e IEPS_% escribe 16 para 16% o escribe el porcentaje en formato Excel.'],
-    ['COSTO_UNITARIO es el costo sin impuestos; PRECIO_VENTA es el precio unitario de venta.'],
-    ['PROVEEDOR y sus identificadores se conservan en la importación; no crean un proveedor nuevo en el catálogo.'],
-    ['ATENCIÓN: Importar Inventario/Entradas/Salidas/Catálogo reemplaza el contenido del módulo; haz respaldo antes.']
+  const headers=[...base[kind],...(financial?extras[kind]:[])];
+  const sheetName=({inventory:'INVENTARIO',entradas:'ENTRADAS',salidas:'SALIDAS',cpm:'CPM'})[kind];
+  const wb=XLSX.utils.book_new(),ws=XLSX.utils.aoa_to_sheet([headers]);
+  ws['!cols']=headers.map(h=>({wch:/DESCRIPCION/.test(h)?52:/DENOMINACION|GRUPO_TERAPEUTICO/.test(h)?30:/PROVEEDOR|REGISTRO/.test(h)?25:/CADUCIDAD|CLASIFICACION|UBICACION/.test(h)?19:/CLAVE|CODIGO|CSG|COSTO|PRECIO/.test(h)?19:15}));
+  XLSX.utils.book_append_sheet(wb,ws,sheetName);
+  const instructions=[
+    ['MACROXEL HPS - PLANTILLA '+sheetName+(financial?' (FINANCIERO)':' (NORMAL)')],
+    ['Captura los datos en la primera hoja ('+sheetName+'). No cambies sus encabezados.'],
+    ['CLAVE es obligatoria para Inventario y CSG/CLAVE para Catálogo. Conserva LOTE para distinguir productos.'],
+    ['En IVA_% e IEPS_% escribe 16 para 16%, 8 para 8%, o 0 para exento.'],
+    ['Puedes usar formato de celda porcentaje de Excel (16%); también se interpreta correctamente.'],
+    ['COSTO_UNITARIO = costo sin impuestos. COSTO_FINAL_UNITARIO, IVA_UNITARIO, IEPS_UNITARIO y MARGEN_% se recalculan del costo y las tasas.'],
+    ['PROVEEDOR, PROVEEDOR_RFC y PROVEEDOR_ID son datos del producto/movimiento, no crean automáticamente un proveedor en el catálogo.'],
+    ['IMPORTANTE: los botones de Configuración reemplazan los registros de ese módulo. Haz respaldo antes de importar.'],
+    ['Las columnas financieras se importan también desde versiones anteriores de Excel; en modo normal permanecen ocultas.']
   ];
-  const help=XLSX.utils.aoa_to_sheet(info);help['!cols']=[{wch:130}];
+  const help=XLSX.utils.aoa_to_sheet(instructions);help['!cols']=[{wch:125}];
   XLSX.utils.book_append_sheet(wb,help,'INSTRUCCIONES');
-  XLSX.writeFile(wb,'PLANTILLA_'+name+'_MACROXEL'+(financial?'_FINANCIERO':'')+'.xlsx');
+  const fname='PLANTILLA_'+sheetName+'_MACROXEL'+(financial?'_FINANCIERO':'')+'.xlsx';
+  XLSX.writeFile(wb,fname);
 }
 for(const [id,kind] of [['btnTplInv','inventory'],['btnTplEnt','entradas'],['btnTplSal','salidas'],['btnTplCPM','cpm'],['btnEntPedidoPlantilla','entradas']]){
   document.getElementById(id)?.addEventListener('click',()=>{
     try{mxImportBuildTemplate(kind);}catch(e){mxAlert('No se pudo generar la plantilla Excel: '+(e?.message||e));}
   });
 }
+
+
 
 async function mxResetFirebaseEcosystem(reason='RESET_TOTAL'){
   const base = String(typeof mxRemoteDbUrl==='function' ? mxRemoteDbUrl() : '').trim();
@@ -12979,6 +13073,17 @@ document.getElementById('btnExportInv').onclick = async function exportarTodoExc
         'ESTANTES': est,
         'EXISTENCIA': tot,
         ...(typeof window.mxFinancialExportFields==='function'?window.mxFinancialExportFields(r):{}),
+        ...(typeof window.mxFinancialEnabled==='function'&&window.mxFinancialEnabled()?{
+          'PROVEEDOR':pick(r,['proveedor','PROVEEDOR']),
+          'PROVEEDOR_RFC':pick(r,['proveedor_rfc','proveedorRfc','rfc_proveedor']),
+          'PROVEEDOR_ID':pick(r,['proveedor_id','proveedorId']),
+          'DEPARTAMENTO':pick(r,['departamento']),
+          'PRESENTACION':pick(r,['presentacion']),
+          'REGISTRO_SANITARIO':pick(r,['registro_sanitario']),
+          'DENOMINACION_GENERICA':pick(r,['denominacion_generica']),
+          'TITULAR':pick(r,['titular']),
+          'GRUPO_TERAPEUTICO':pick(r,['grupo'])
+        }:{}),
         'CLASIFICACION': pick(r,['clasificacion','CLASIFICACION','clasificación','CLASIFICACIÓN','clasif','tipo']),
         'RESTRICCION': pick(r,['restriccion','RESTRICCION','restricción','RESTRICCIÓN']),
         'UBICACION': pick(r,['ubicacion','UBICACION','ubicación','UBICACIÓN']),
@@ -13475,8 +13580,10 @@ function attachMedicoAutocomplete(nameInputId, cedInputId){
   let pendingEnter = false;
   let pendingMove = 0;
   let cache = [];
+  let cacheIndex = [];
   let cacheAt = 0;
   let itemCache = [];
+  let searchTimer = null;
   let lastEraseAt = 0;
   const DOUBLE_ERASE_MS = 700;
 
@@ -13526,25 +13633,32 @@ function attachMedicoAutocomplete(nameInputId, cedInputId){
   };
 
   const clearDoctorSelection = ()=>{
-    // Invalida búsquedas asíncronas anteriores para impedir que reaparezca una lista vieja.
+    // Flujo rápido: dos pulsaciones consecutivas de Supr/Backspace sobre el NOMBRE
+    // limpian nombre + cédula. La primera pulsación sigue siendo nativa y la segunda
+    // no dispara consultas ni renderizados pesados.
     requestSeq++;
     pendingEnter = false;
     pendingMove = 0;
     lastEraseAt = 0;
+    clearTimeout(searchTimer);
     close();
     inp.value = '';
     ced.value = '';
+    try{ inp.dispatchEvent(new Event('input',{bubbles:true})); }catch(_e){}
+    try{ ced.dispatchEvent(new Event('input',{bubbles:true})); }catch(_e){}
     focusName();
   };
 
-  const fill = (m)=>{
+  const fill = (m, opts={})=>{
     inp.value = str(m?.nombre || m?.NOMBRE || '');
     ced.value = str(m?.cedula || m?.CEDULA || m?.['cédula'] || m?.['Cédula'] || '');
     pendingEnter = false;
     pendingMove = 0;
     lastEraseAt = 0;
     close();
-    mxFocusSalidaDespuesDeMedico(nameInputId);
+    // Solo una selección explícita (clic/Enter) mueve el foco. Un blur/change nunca
+    // debe robar el foco del campo al que el usuario ya se cambió.
+    if(opts.moveFocus !== false) mxFocusSalidaDespuesDeMedico(nameInputId);
   };
 
   const loadMedicos = async ()=>{
@@ -13553,20 +13667,31 @@ function attachMedicoAutocomplete(nameInputId, cedInputId){
     await ensureDBReady();
     const all = await idbAll('medicos').catch(()=>[]);
     cache = Array.isArray(all) ? all : [];
+    // Índice normalizado una sola vez. Antes se normalizaban TODOS los médicos por
+    // cada letra escrita, trabajo innecesario en catálogos grandes.
+    cacheIndex = cache.map(m=>({
+      m,
+      nombre:norm(m?.nombre || m?.NOMBRE || ''),
+      cedula:cleanCed(m?.cedula || m?.CEDULA || m?.['cédula'] || m?.['Cédula'] || '')
+    }));
     cacheAt = now;
     return cache;
   };
 
   const getMatches = async (q, mode)=>{
-    const all = await loadMedicos();
+    await loadMedicos();
     const nq = norm(q), cq = cleanCed(q);
     if(!nq && !cq) return [];
-    return all.filter(m=>{
-      const nombre = norm(m?.nombre || m?.NOMBRE || '');
-      const cedula = cleanCed(m?.cedula || m?.CEDULA || m?.['cédula'] || m?.['Cédula'] || '');
-      if(mode === 'cedula') return cedula.includes(cq) || nombre.includes(nq);
-      return nombre.includes(nq) || cedula.includes(cq);
-    }).slice(0,40);
+    const out=[];
+    for(const row of cacheIndex){
+      const match = mode === 'cedula'
+        ? (row.cedula.includes(cq) || row.nombre.includes(nq))
+        : (row.nombre.includes(nq) || row.cedula.includes(cq));
+      if(!match) continue;
+      out.push(row.m);
+      if(out.length>=20) break;
+    }
+    return out;
   };
 
   const render = (list, source)=>{
@@ -13637,8 +13762,9 @@ function attachMedicoAutocomplete(nameInputId, cedInputId){
   const keyHandler = (source)=>(ev)=>{
     const isErase = ev.key === 'Backspace' || ev.key === 'Delete';
 
-    // Solo en el campo de nombre: dos pulsaciones consecutivas de Backspace/Supr
-    // limpian de inmediato tanto el nombre como la cédula asociada.
+    // En el NOMBRE DEL MÉDICO, dos pulsaciones rápidas limpian todo el médico.
+    // Primera pulsación: comportamiento nativo. Segunda pulsación: borra nombre
+    // y cédula de inmediato, sin esperar al autocompletado.
     if(source === 'nombre' && isErase && !ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.repeat){
       const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
       if(lastEraseAt && (now-lastEraseAt) <= DOUBLE_ERASE_MS){
@@ -13648,9 +13774,20 @@ function attachMedicoAutocomplete(nameInputId, cedInputId){
         return;
       }
       lastEraseAt = now;
-    }else if(!isErase){
-      lastEraseAt = 0;
+      requestSeq++;
+      pendingEnter=false;
+      pendingMove=0;
+      close();
+      return;
     }
+    if(isErase){
+      requestSeq++;
+      pendingEnter=false;
+      pendingMove=0;
+      close();
+      return;
+    }
+    lastEraseAt = 0;
 
     if(ev.key === 'Escape'){
       ev.preventDefault();
@@ -13685,8 +13822,13 @@ function attachMedicoAutocomplete(nameInputId, cedInputId){
     }
   };
 
-  inp.addEventListener('input', ()=>{ pendingEnter=false; pendingMove=0; show('nombre'); });
-  ced.addEventListener('input', ()=>{ pendingEnter=false; pendingMove=0; show('cedula'); });
+  const scheduleShow=(source)=>{
+    pendingEnter=false;pendingMove=0;requestSeq++;
+    clearTimeout(searchTimer);
+    searchTimer=setTimeout(()=>{ Promise.resolve(show(source)).catch(()=>{}); },110);
+  };
+  inp.addEventListener('input', ()=>scheduleShow('nombre'));
+  ced.addEventListener('input', ()=>scheduleShow('cedula'));
   inp.addEventListener('keydown', keyHandler('nombre'));
   ced.addEventListener('keydown', keyHandler('cedula'));
 
@@ -13695,7 +13837,7 @@ function attachMedicoAutocomplete(nameInputId, cedInputId){
     if(!c) return;
     const list = await getMatches(c,'cedula');
     const exact = list.find(m=> cleanCed(m?.cedula || m?.CEDULA || m?.['cédula'] || m?.['Cédula'] || '') === c);
-    if(exact) fill(exact);
+    if(exact) fill(exact,{moveFocus:false});
   };
   ced.addEventListener('change', exactFillByCedula);
   ced.addEventListener('blur', ()=>setTimeout(exactFillByCedula,120));
@@ -13706,7 +13848,18 @@ function attachMedicoAutocomplete(nameInputId, cedInputId){
 attachMedicoAutocomplete('#salMedicoAb', '#salCedulaAb');
 attachMedicoAutocomplete('#salMedicoJ',  '#salCedulaJ');
 attachMedicoAutocomplete('#salMedicoOrd', '#salCedulaOrd');
-document.getElementById('salMedicoJ')?.addEventListener('change', ()=>{ mxFocusSalidaDespuesDeMedico('#salMedicoJ'); });
+// El cambio manual de médico no mueve el foco automáticamente; Enter/selección explícita sí lo hace.
+
+// El catálogo se precarga cuando el navegador tenga tiempo libre; nunca en la ruta de la tecla.
+try{
+  const warmMed=()=>{
+    ['salMedicoAb','salMedicoJ','salMedicoOrd'].forEach(id=>{
+      const el=document.getElementById(id);
+      if(el) el.setAttribute('autocomplete','off');
+    });
+  };
+  if(window.requestIdleCallback) requestIdleCallback(warmMed,{timeout:1200}); else setTimeout(warmMed,500);
+}catch(_e){}
 
 function mxNowIsoLocal(){
   const d = new Date();
@@ -20796,15 +20949,16 @@ const MX_VIEWER_GITHUB_APPS=[
  ['COLECTIVOS','Colectivos / Pacientes',['COLECTIVOS-Y-PACIENTES','Macroxel-Servicios-Colectivos-Y-Pacientes']],
  ['MACROXEL_ADMINISTRADOR','Administrador',['ADMINISTRADOR','MACROXEL-ADMINISTRADOR-CENTRAL']],
  ['FARMACOVIGILANCIA','Farmacovigilancia',['FARMACOVIGILANCIA','MACROXEL-FARMACOVIGILANCIA']],
+ ['QUIROFANO_STOCK','Quirófano · Stock antibióticos',['ECOSISTEMA-MACROXEL-HOSPITAL/MACROXEL-VISORES-CENTRAL/QUIROFANO-STOCK-ANTIBIOTICOS','Macroxel-HPS-Quirofano-Stock','Quirofano-Stock-Antibioticos','QUIROFANO-STOCK-ANTIBIOTICOS']],
+ ['HOSPITAL_MIRROR','Espejo hospitalario',['ECOSISTEMA-MACROXEL-HOSPITAL/MACROXEL-VISORES-CENTRAL/espejo hospitalario','ESPEJO-HOSPITALARIO','Espejo-Hospitalario','MACROXEL-ESPEJO-HOSPITALARIO']],
  ['FARMACIA_AJUSCO_MEDIO','Farmacia Ajusco Medio',['FARMACIA-AJUSCO-M','MACROXEL-FARMACIA-AJUSCO-MEDIO','Macroxel-Farmacia-Ajusco-Medio']],
  ['RECETAS','Recetas',['RECETAS','MACROXEL-RECETAS','Macroxel-Recetas']],
  ['CENSO_HOSPITALARIO','Censo hospitalario',['CENSO_HOSPITALARIO','CENSO-HOSPITALARIO','MACROXEL-CENSO-HOSPITALARIO']],
- ['ADMINISTRADOR_ECOSISTEMA','Administrador del Ecosistema',['ADMINISTRADOR-ECOSISTEMA']],
- ['HOSPITAL_MIRROR','Espejo hospitalario',['ESPEJO-HOSPITALARIO','Espejo-Hospitalario','ESPEJO_HOSPITALARIO']]
+ ['ADMINISTRADOR_ECOSISTEMA','Administrador del Ecosistema',['ADMINISTRADOR-ECOSISTEMA']]
 ];
 function mxViewerGithubCode(value){
  const n=String(value||'').trim().toUpperCase().replace(/[ÁÀÄÂ]/g,'A').replace(/[ÉÈËÊ]/g,'E').replace(/[ÍÌÏÎ]/g,'I').replace(/[ÓÒÖÔ]/g,'O').replace(/[ÚÙÜÛ]/g,'U').replace(/[^A-Z0-9]+/g,'_').replace(/^_+|_+$/g,'');
- const aliases={CENSO_HOSPITALARIO:'CENSO_HOSPITALARIO',ADMINISTRADOR:'MACROXEL_ADMINISTRADOR',ADMIN:'MACROXEL_ADMINISTRADOR',ANALISIS:'TRANSFERENCIAS',ANALISIS_SISTEMA:'TRANSFERENCIAS',SURTIDO:'TRANSFERENCIAS',SURTIDO_COLECTIVOS:'TRANSFERENCIAS',FARMACIA_AJUSCO:'FARMACIA_AJUSCO_MEDIO',RECETA:'RECETAS',ESPEJO:'HOSPITAL_MIRROR',ESPEJO_HOSPITALARIO:'HOSPITAL_MIRROR',HOSPITALARIO:'HOSPITAL_MIRROR'};
+ const aliases={CENSO_HOSPITALARIO:'CENSO_HOSPITALARIO',QUIROFANO_STOCK:'QUIROFANO_STOCK',MACROXEL_QUIROFANO_STOCK:'QUIROFANO_STOCK',HOSPITAL_MIRROR:'HOSPITAL_MIRROR',ESPEJO_HOSPITALARIO:'HOSPITAL_MIRROR',MIRROR_HOSPITALARIO:'HOSPITAL_MIRROR',ADMINISTRADOR:'MACROXEL_ADMINISTRADOR',ADMIN:'MACROXEL_ADMINISTRADOR',ANALISIS:'TRANSFERENCIAS',ANALISIS_SISTEMA:'TRANSFERENCIAS',SURTIDO:'TRANSFERENCIAS',SURTIDO_COLECTIVOS:'TRANSFERENCIAS',FARMACIA_AJUSCO:'FARMACIA_AJUSCO_MEDIO',RECETA:'RECETAS'};
  const c=aliases[n]||n;return MX_VIEWER_GITHUB_APPS.some(x=>x[0]===c)?c:'';
 }
 function mxViewerGithubLabel(code){const c=mxViewerGithubCode(code);return MX_VIEWER_GITHUB_APPS.find(x=>x[0]===c)?.[1]||c||'Visor'}
@@ -20818,7 +20972,7 @@ function mxViewerGithubRoutesLocal(){let out={};try{const base=mxViewerGithubBas
 function mxViewerGithubRouteFor(appCode){return mxViewerGithubRoutesLocal()[mxViewerGithubCode(appCode)]||''}
 function mxViewerGithubDetectFromHtml(html,url=''){const s=String(html||''),patterns=[/APP_CODE\s*[=:]\s*["']([^"']+)["']/i,/data-app-code=["']([^"']+)["']/i,/APP\s*[=:]\s*["']([^"']+)["']/i];for(const re of patterns){const m=s.match(re);if(m){const c=mxViewerGithubCode(m[1]);if(c)return c}}const hay=(s+' '+url).toUpperCase();for(const[c]of MX_VIEWER_GITHUB_APPS){const tokens=c.split('_').filter(x=>x.length>3);if(tokens.every(t=>hay.includes(t)))return c}return''}
 async function mxViewerGithubFetchText(url){const r=await fetch(url,{cache:'no-store',redirect:'follow'});if(!r.ok)throw new Error(`HTTP ${r.status}`);return await r.text()}
-function mxViewerGithubCandidate(base,repo){return mxNormalizeViewerGithubUrl(`${String(base||'').replace(/\/+$/,'')}/${encodeURIComponent(repo)}/`)}
+function mxViewerGithubCandidate(base,repo){const rel=String(repo||'').split('/').filter(Boolean).map(encodeURIComponent).join('/');return mxNormalizeViewerGithubUrl(`${String(base||'').replace(/\/+$/,'')}/${rel}/`)}
 async function mxViewerGithubDiscoverAll(value){
  const base=mxNormalizeGithubPagesBase(value),owner=mxGithubOwnerFromBase(base);if(!base||!owner)throw new Error('Pega una base válida de GitHub Pages, por ejemplo: https://usuario.github.io');
  const found={};
@@ -20829,7 +20983,7 @@ async function mxViewerGithubDiscoverAll(value){
 }
 function mxViewerGithubRender(){const input=document.getElementById('mxViewerGithubBaseInput'),note=document.getElementById('mxViewerGithubRouteNote');const base=mxViewerGithubBaseLocal(),map=mxViewerGithubRoutesLocal(),count=MX_VIEWER_GITHUB_APPS.filter(([c])=>map[c]).length;if(input)input.value=base;if(note)note.textContent=base?`✅ Base GitHub asociada a este Sistema Principal. ${count} de ${MX_VIEWER_GITHUB_APPS.length} rutas directas verificadas; los visores también se vinculan por esta base sin exponer sus URLs.`:'Configura únicamente la base de GitHub Pages. No se consulta ni se muestra el perfil de GitHub.'}
 async function mxViewerGithubSave(){const input=document.getElementById('mxViewerGithubBaseInput'),btn=document.getElementById('mxViewerGithubSaveLocal');if(!input)return;const base=mxNormalizeGithubPagesBase(input.value);if(!base){mxAlert('⚠ Pega únicamente la base de GitHub Pages.\n\nEjemplo: https://usuario.github.io');return}const prev=mxViewerGithubBaseLocal();if(prev&&prev!==base){try{localStorage.removeItem(MX_VIEWER_GITHUB_ROUTES_KEY);localStorage.removeItem(MX_VIEWER_GITHUB_ROUTES_ACCOUNT_KEY)}catch(_e){}}try{if(btn){btn.disabled=true;btn.textContent='🔎 Verificando…'}const map=await mxViewerGithubDiscoverAll(base),count=MX_VIEWER_GITHUB_APPS.filter(([c])=>map[c]).length;input.value=base;mxViewerGithubRender();mxAlert(`✅ Base guardada.\n\n${count} visor(es) verificados sin consultar el perfil público de GitHub.`)}catch(e){mxAlert('❌ No se pudo verificar GitHub Pages.\n\n'+(e?.message||e))}finally{if(btn){btn.disabled=false;btn.textContent='🔎 Verificar visores'}}}
-function mxOpenViewerGithub(appCode){const c=mxViewerGithubCode(appCode),raw=mxViewerGithubRouteFor(c);if(!c||!raw){mxAlert(`⚠ Macroxel aún no ha verificado internamente ${mxViewerGithubLabel(c||appCode)}.\n\nEn Configuración > Ruta visores GitHub pulsa Verificar visores.`);return false}try{const u=new URL(raw),sid=String(window.mxGetSucursalFromLicense?.()||'').trim().toUpperCase();if(/^MACROXEL-[A-Z0-9_-]{4,}$/.test(sid))u.searchParams.set('mxSystem',sid);window.open(u.toString(),'_blank','noopener,noreferrer');return true}catch(_e){return false}}
+function mxOpenViewerGithub(appCode){const c=mxViewerGithubCode(appCode),raw=mxViewerGithubRouteFor(c);if(!c||!raw){mxAlert(`⚠ Macroxel aún no ha verificado internamente ${mxViewerGithubLabel(c||appCode)}.\n\nEn Configuración > Ruta visores GitHub pulsa Verificar visores.`);return false}try{const u=new URL(raw),sid=String(window.mxGetSucursalFromLicense?.()||'').trim().toUpperCase(),db=String(window.mxRemoteDbUrl?.()||'').trim().replace(/\.json\/?$/i,'').replace(/\/+$/,'');if(/^MACROXEL-[A-Z0-9_-]{4,}$/.test(sid))u.searchParams.set('mxSystem',sid);try{if(db){const d=new URL(db),h=d.hostname.toLowerCase();if(d.protocol==='https:'&&/(?:firebaseio\.com|firebasedatabase\.app)$/i.test(h)&&h!=='licenciasmacroxel-default-rtdb.firebaseio.com'&&h!=='ecosistema-macroxel-default-rtdb.firebaseio.com')u.searchParams.set('mxDb',db)}}catch(_e){}window.open(u.toString(),'_blank','noopener,noreferrer');return true}catch(_e){return false}}
 function installViewerGithubRoutesCard(){
  const host=document.getElementById('configContent')||document.querySelector('.config-content')||document.body;let card=document.getElementById('mxViewerGithubRoutesCard');if(!card){card=document.createElement('div');card.id='mxViewerGithubRoutesCard'}mxPrepareDynamicConfigAccordion(card);card.className='cfg-section';card.innerHTML=`<h4 class="cfg-title">🔗 Ruta visores GitHub</h4><p class="cfg-help">Configura solo la base de GitHub Pages. Macroxel verifica internamente los visores conocidos sin abrir ni consultar el perfil público de GitHub.</p><div class="row" style="display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end"><label style="min-width:0"><span style="display:block;font-size:12px;font-weight:850;margin-bottom:5px">Base de GitHub Pages</span><input class="input" id="mxViewerGithubBaseInput" placeholder="https://usuario.github.io" autocomplete="off"></label><button class="btn cfg-btn" id="mxViewerGithubSaveLocal" type="button" style="background:#16a34a">🔎 Verificar visores</button></div><div id="mxViewerGithubRouteNote" class="badge" style="margin-top:8px"></div>`;
  const anchor=document.getElementById('mxInterconexionCard')||document.getElementById('mxFirebaseUrlsCard')||host.firstElementChild;if(anchor?.parentNode)anchor.parentNode.insertBefore(card,anchor.nextSibling);else host.appendChild(card);try{window.mxInitConfigAccordions?.();}catch(_e){}card.querySelector('#mxViewerGithubSaveLocal')?.addEventListener('click',mxViewerGithubSave);card.querySelector('#mxViewerGithubBaseInput')?.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();mxViewerGithubSave()}});mxViewerGithubRender();setTimeout(()=>mxForceGithubCardCollapsed(),0);setTimeout(()=>mxForceGithubCardCollapsed(),120);
@@ -23228,7 +23382,7 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   function mxAnaInventoryQty(it={}){try{if(typeof mxSalExistenciaReal==='function')return Math.max(0,num(mxSalExistenciaReal(it)));}catch(_e){}try{if(typeof pickExistencia==='function')return Math.max(0,num(pickExistencia(it)));}catch(_e){}const hasLoc=[it.almacen,it.ALMACEN,it.estantes,it.ESTANTES].some(v=>v!==undefined&&v!==null&&v!=='');return Math.max(0,hasLoc?(num(it.almacen??it.ALMACEN)+num(it.estantes??it.ESTANTES)):num(it.existencia??it.existencias??it.EXISTENCIA??it.pzs));}
   function mxAnaTreatmentClosed(r={}){const state=norm([r.estado_colectivo,r.estadoColectivo,r.estado_tratamiento,r.estadoTratamiento,r.cierre_servicio_estado,r.cierreServicioEstado,r.estado_cierre_servicio,r.estadoCierreServicio,r.status,r.estado,r.observaciones,r.observacion].filter(Boolean).join(' '));return r.tratamiento_activo===false||r.tratamientoActivo===false||r.activo===false||r.cierre_servicio===true||r.cierreServicio===true||r.canceladoPorServicio===true||r.tratamiento_completo===true||r.tratamientoCompleto===true||/(CERRAD|CANCEL|ANUL|RECHAZ|FINALIZADO TRATAMIENTO|TRATAMIENTO COMPLETO)/.test(state);}
   function mxAnaIsJustified(r={}){return norm(r.tipo_doc||r.tipoDocumento||r.tipo||r.tipoSalida).includes('COLECTIVO JUSTIFICADO');}
-  function mxAnaTreatmentTotal(r={}){return Math.max(0,num(r.cantidad_tratamiento_total??r.cantidadTratamientoTotal??r.total_unidades_tratamiento??r.totalUnidadesTratamiento??r.cantidadSolicitadaCalculada??r.autorizadoTratamiento??r.cantidadAutorizadaTratamiento));}
+  function mxAnaTreatmentTotal(r={}){const vals=[r.cantidad_tratamiento_total,r.cantidadTratamientoTotal,r.total_unidades_tratamiento,r.totalUnidadesTratamiento,r.cantidadSolicitadaCalculada,r.autorizadoTratamiento,r.cantidadAutorizadaTratamiento].map(num).filter(v=>v>0),perDay=Math.max(0,num(r.cantidad_24_horas??r.cantidad24Horas)),days=Math.max(0,num(r.tiempo_tratamiento_dias??r.tiempoTratamientoDias));if(perDay>0&&days>0)vals.push(perDay*days);return vals.length?Math.min(...vals):0;}
   function mxAnaTreatmentRemaining(r={},total=0){for(const v of [r.cantidad_restante,r.cantidadRestante]){if(v!==undefined&&v!==null&&String(v).trim()!=='')return Math.max(0,num(v));}const obs=txt(r.observaciones||r.observacion);const m=obs.match(/FALTAN\s+(\d+(?:[.,]\d+)?)\s+PZS?\s+PARA\s+CUBRIR/i);if(m)return Math.max(0,Number(String(m[1]).replace(',','.'))||0);const received=Math.max(0,num(r.cantidad_recibida_acumulada??r.cantidadRecibidaAcumulada));return total>0&&received>0?Math.max(0,total-received):null;}
   function mxAnaTreatmentKey(r={},clave=''){const folio=norm(r.folioPacienteAsignado||r.folio_paciente_asignado||r.folioSolicitud||r.folioFinal||r.folio||r.folio_doc);const patient=norm(r.paciente||r.nombrePaciente||r.nombre);const exp=norm(r.expediente);return `${folio||patient+'|'+exp}|${norm(clave||r.clave||r.medicamentoClave||r.medicamento)}`;}
   function mxAnaProductKey(r={}){return norm(r.clave||r.csg||r.CSG||r.codigo||r.codigo_barras||r.codigoBarras);}
@@ -23246,7 +23400,10 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   function mxAnaActivityDate(...values){let best='';for(const v of values){const d=dateOnly(v);if(/^\d{4}-\d{2}-\d{2}$/.test(d)&&d>best)best=d;}return best;}
   function mxAnaOrderActivityDate(o={},it={}){return mxAnaActivityDate(it.ultimaSolicitudAt,o.ultimaSolicitudAt,it.lastRequestAt,o.lastRequestAt,it.fechaSolicitud,o.fechaSolicitud,it.createdAt,o.createdAt,it.fechaIso,o.fechaIso,it.fecha,o.fecha);}
   function mxAnaRequestedPieces(r={}){return Math.max(0,num(r.cantidadSolicitadaAhora??r.cantidadSolicitudActual??r.cantidadPorRecibir??r.cantidadRecibidaSolicitada??r.cantidad24Horas??r.cantidadSolicitada??r.pzsSolicitadas??r.pzs??r.piezas??r.cantidad));}
-  function mxAnaMergeTreatmentGroup(map,key,data){if(!key)return;const prev=map.get(key)||{key,clave:data.clave,folio:data.folio,patient:data.patient,total:0,dispensed:0,remaining:null,remainingAt:-1,closed:false,latest:0,activityDate:'',sources:new Set()};prev.total=Math.max(prev.total,Math.max(0,num(data.total)));prev.dispensed+=Math.max(0,num(data.dispensed));const stamp=Math.max(0,num(data.latest));if(data.remaining!==null&&data.remaining!==undefined&&(prev.remaining==null||stamp>=Number(prev.remainingAt||-1))){prev.remaining=Math.max(0,num(data.remaining));prev.remainingAt=stamp;}prev.closed=prev.closed||!!data.closed;prev.latest=Math.max(prev.latest,stamp);const activity=dateOnly(data.activityDate);if(/^\d{4}-\d{2}-\d{2}$/.test(activity)&&activity>prev.activityDate)prev.activityDate=activity;prev.sources.add(data.source||'local');map.set(key,prev);}
+  function mxAnaMergeTreatmentGroup(map,key,data){if(!key)return;const prev=map.get(key)||{key,clave:data.clave,folio:data.folio,patient:data.patient,total:0,totalAt:-1,dispensed:0,remaining:null,remainingAt:-1,closed:false,latest:0,activityDate:'',sources:new Set()};const stamp=Math.max(0,num(data.latest)),candidate=Math.max(0,num(data.total));if(candidate>0){const base=Math.max(0,num(prev.total)),absurd=base>0&&candidate>Math.max(base*10,base+100);if(!base||candidate<base||(stamp>=Number(prev.totalAt||-1)&&!absurd)){prev.total=candidate;prev.totalAt=stamp;}}prev.dispensed+=Math.max(0,num(data.dispensed));if(data.remaining!==null&&data.remaining!==undefined&&(prev.remaining==null||stamp>=Number(prev.remainingAt||-1))){let rem=Math.max(0,num(data.remaining));if(prev.total>0)rem=Math.min(rem,prev.total);prev.remaining=rem;prev.remainingAt=stamp;}prev.closed=prev.closed||!!data.closed;prev.latest=Math.max(prev.latest,stamp);const activity=dateOnly(data.activityDate);if(/^\d{4}-\d{2}-\d{2}$/.test(activity)&&activity>prev.activityDate)prev.activityDate=activity;prev.sources.add(data.source||'local');map.set(key,prev);}
+  // mx-ana-antibioticos-cj-v228: antibióticos calculados exclusivamente con Colectivo justificado.
+  // mx-ana-antibioticos-activos-v229: demanda y apartado usan solo tratamientos justificados ACTIVOS; cierre masivo optimizado.
+  // mx-ana-compromiso-3dias-v230: el apartado usa solo tratamientos abiertos con movimiento en los últimos 3 días; los antiguos no reservan stock.
   async function mxAnaBuildProductPlan(q,rows,from,to,force=false){
     if(!q)return null;
     const [inventory,orders]=await Promise.all([mxAnaLoadInventory(force),mxAnaLoadOrders(force)]);
@@ -23256,6 +23413,12 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     const claveKey=selected.key,invLots=(inventory||[]).filter(it=>mxAnaProductKey(it)===claveKey),existencia=invLots.reduce((s,it)=>s+mxAnaInventoryQty(it),0),clasificaciones=new Set(invLots.map(it=>txt(it.clasificacion||it.CLASIFICACION||it.CLASIFICACIÓN||it.departamento||it.clase)).filter(Boolean));
     if(!selected.classification&&clasificaciones.size)selected.classification=[...clasificaciones][0];
     if(!selected.desc){const rr=(rows||[]).find(x=>mxAnaProductKey(x)===claveKey);if(rr)selected.desc=mxAnaProductDesc(rr);}
+    // Los antibióticos se planean EXCLUSIVAMENTE con Colectivo justificado.
+    // Un mismo medicamento también puede salir por Colectivo ordinario u otros
+    // documentos, pero esas piezas no pertenecen al tratamiento justificado y
+    // no deben inflar demanda, promedio, días de abasto ni gráficas del antibiótico.
+    const hasJustifiedHistory=(rows||[]).some(raw=>{const r=typeof mxNormalizeSalidaRow==='function'?mxNormalizeSalidaRow(raw):raw;return mxAnaProductKey(r)===claveKey&&mxAnaIsJustified(r);})||(orders||[]).some(o=>{if(!o||typeof o!=='object')return false;const approved=Array.isArray(o.approvedItems)?o.approvedItems:(o.approvedItems&&typeof o.approvedItems==='object'?Object.values(o.approvedItems):[]),rawItems=Array.isArray(o.items)?o.items:(o.items&&typeof o.items==='object'?Object.values(o.items):[]),list=approved.length?approved:rawItems;return (mxAnaIsJustified(o)||list.some(mxAnaIsJustified))&&list.some(it=>mxAnaProductKey(it)===claveKey);});
+    const justifiedOnly=[selected.classification,...clasificaciones].some(mxAnaIsAntibioticText)||hasJustifiedHistory;
 
     // Planeación de demanda: ventana móvil fija de 30 días basada en SOLICITADO,
     // nunca en lo que se alcanzó a surtir. En colectivos justificados cada
@@ -23271,6 +23434,7 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     for(let oi=0;oi<(orders||[]).length;oi++){
       const o=orders[oi];if(!o||typeof o!=='object')continue;const approved=Array.isArray(o.approvedItems)?o.approvedItems:(o.approvedItems&&typeof o.approvedItems==='object'?Object.values(o.approvedItems):[]),rawItems=Array.isArray(o.items)?o.items:(o.items&&typeof o.items==='object'?Object.values(o.items):[]),list=approved.length?approved:rawItems,matched=(list||[]).filter(it=>mxAnaProductKey(it)===claveKey);if(!matched.length)continue;
       const justified=mxAnaIsJustified(o)||matched.some(mxAnaIsJustified),folio=txt(o.folioPacienteAsignado||o.folioSolicitud||o.folioFinal||o.folio),patient=txt(o.paciente||o.nombrePaciente),service=txt(o.servicioSolicitanteActual||o.ultimoServicio||o.servicio),date=mxAnaOrderDemandDate(o,matched[0]);
+      if(justifiedOnly&&!justified)continue;
       let requested=0;
       if(justified){for(const it of matched){requested=Math.max(requested,mxAnaTreatmentTotal(it)||mxAnaTreatmentTotal(o)||mxAnaRequestedPieces(it)||mxAnaRequestedPieces(o));}}
       else{for(const it of matched)requested+=mxAnaRequestedPieces(it);}
@@ -23282,13 +23446,13 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     for(let i=0;i<(rows||[]).length;i++){
       const raw=rows[i],r=typeof mxNormalizeSalidaRow==='function'?mxNormalizeSalidaRow(raw):raw;if(mxAnaProductKey(r)!==claveKey||!mxAnaIsJustified(r))continue;const requested=mxAnaTreatmentTotal(r);if(requested<=0)continue;const folio=txt(r?.folio||r?.folio_doc),patient=txt(r?.paciente),date=mxAnaFolioDate(folio)||mxAnaFirstDate(r?.createdAt,r?.fechaIso,r?.fecha),groupId=`CJ|${norm(folio)||norm(patient)||`LEG-${i}`}|${norm(patient)}|${claveKey}`;putDemand(groupId,{requested,date,folio,patient,service:txt(r?.servicio),justified:true,source:'salida_total'});
     }
-    const demandRows=[...demandGroups.values()],demandRequested30=demandRows.reduce((s,g)=>s+g.requested,0),demandFolioCount=demandRows.length,avgPerFolio30=demandFolioCount?demandRequested30/demandFolioCount:0,medianPerFolio30=mxAnaMedian(demandRows.map(g=>g.requested)),avgDaily=demandRequested30/demandDays;
+    let demandRows=[...demandGroups.values()],demandRequested30=demandRows.reduce((s,g)=>s+g.requested,0),demandFolioCount=demandRows.length,avgPerFolio30=demandFolioCount?demandRequested30/demandFolioCount:0,medianPerFolio30=mxAnaMedian(demandRows.map(g=>g.requested)),avgDaily=demandRequested30/demandDays;
 
     const todayIso=today(),yesterdayIso=mxAnaPrevIsoDay(todayIso);let actualDispensed30=0;const treatments=new Map(),cjEventsByDate=new Map();
     const recordCjEvent=(d,key,pieces,source)=>{if(!/^\d{4}-\d{2}-\d{2}$/.test(d)||pieces<=0)return;let day=cjEventsByDate.get(d);if(!day){day=new Map();cjEventsByDate.set(d,day);}const id=norm(key)||`EV_${day.size}`,prev=day.get(id)||{salida:0,pedido:0};if(source==='salida')prev.salida+=pieces;else prev.pedido=Math.max(prev.pedido,pieces);day.set(id,prev);};
     for(let i=0;i<(rows||[]).length;i++){
-      const raw=rows[i],r=typeof mxNormalizeSalidaRow==='function'?mxNormalizeSalidaRow(raw):raw;if(mxAnaProductKey(r)!==claveKey)continue;const f=dateOnly(r?.fecha),p=Math.max(0,num(r?.pzs));if(f&&f>=demandFrom&&f<=demandTo)actualDispensed30+=p;
-      if(!mxAnaIsJustified(r))continue;
+      const raw=rows[i],r=typeof mxNormalizeSalidaRow==='function'?mxNormalizeSalidaRow(raw):raw;if(mxAnaProductKey(r)!==claveKey)continue;const f=dateOnly(r?.fecha),p=Math.max(0,num(r?.pzs)),rowJustified=mxAnaIsJustified(r);if(f&&f>=demandFrom&&f<=demandTo&&(!justifiedOnly||rowJustified))actualDispensed30+=p;
+      if(!rowJustified)continue;
       const folio=txt(r?.folio||r?.folio_doc),patient=txt(r?.paciente),key=mxAnaTreatmentKey(r,selected.clave),total=mxAnaTreatmentTotal(r),explicit=mxAnaTreatmentRemaining(r,total),closed=mxAnaTreatmentClosed(r),latest=Date.parse(r?.updatedAt||r?.createdAt||r?.fechaIso||r?.fecha||0)||i;
       mxAnaMergeTreatmentGroup(treatments,key,{clave:selected.clave,folio,patient,total,dispensed:p,remaining:explicit,closed,latest,activityDate:f,source:'salidas'});
       if(f&&p>0)recordCjEvent(f,norm(folio)||norm(patient)||String(i),p,'salida');
@@ -23298,12 +23462,16 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
       const list=(Array.isArray(o.approvedItems)&&o.approvedItems.length)?o.approvedItems:(Array.isArray(o.items)?o.items:(o.items&&typeof o.items==='object'?Object.values(o.items):[]));
       for(const it of list){if(mxAnaProductKey(it)!==claveKey)continue;const total=mxAnaTreatmentTotal(it)||mxAnaTreatmentTotal(o),closed=baseClosed||mxAnaTreatmentClosed(it),received=Math.max(0,num(it.cantidadRecibidaAcumulada??o.cantidadRecibidaAcumulada)),explicit=mxAnaTreatmentRemaining(it,total),remaining=explicit!=null?explicit:(total>0?Math.max(0,total-received):null),key=mxAnaTreatmentKey({...o,...it,folio},selected.clave),activityDate=mxAnaOrderActivityDate(o,it),requested=mxAnaRequestedPieces(it)||mxAnaRequestedPieces(o);mxAnaMergeTreatmentGroup(treatments,key,{clave:selected.clave,folio,patient,total,dispensed:0,remaining,closed,latest,activityDate,source:'pedidos'});if(activityDate&&requested>0)recordCjEvent(activityDate,norm(folio)||norm(patient)||String(oi),requested,'pedido');}
     }
-    const groupRows=[];for(const g of treatments.values()){let remaining=g.remaining;if(remaining==null)remaining=g.total>0?Math.max(0,g.total-g.dispensed):0;if(g.closed)remaining=0;g.remaining=Math.max(0,remaining);groupRows.push(g);}
-    const openRows=groupRows.filter(g=>!g.closed&&g.remaining>0),hasToday=openRows.some(g=>g.activityDate===todayIso),hasYesterday=openRows.some(g=>g.activityDate===yesterdayIso),referenceDate=hasToday?todayIso:(hasYesterday?yesterdayIso:''),activeRows=referenceDate?openRows.filter(g=>g.activityDate===referenceDate):[];
-    const reserved=activeRows.reduce((s,g)=>s+g.remaining,0),activeTreatments=activeRows.length,activeRequested=activeRows.reduce((s,g)=>s+Math.max(0,num(g.total),num(g.dispensed)+num(g.remaining)),0),activeSupplied=activeRows.reduce((s,g)=>s+Math.max(0,num(g.dispensed),num(g.total)>0?Math.max(0,num(g.total)-num(g.remaining)):0),0),staleExcluded=openRows.length-activeRows.length,activeIds=new Set(activeRows.map(g=>norm(g.folio)||norm(g.patient)).filter(Boolean));
+    const groupRows=[];for(const g of treatments.values()){const total=Math.max(0,num(g.total)),dispensed=Math.max(0,num(g.dispensed));let remaining=g.remaining;if(total>0){const calc=Math.max(0,total-Math.min(total,dispensed));remaining=remaining==null?calc:Math.min(calc,Math.max(0,num(remaining)),total);}else if(remaining==null)remaining=0;if(g.closed)remaining=0;g.dispensed=total>0?Math.min(total,dispensed):dispensed;g.remaining=Math.max(0,remaining);groupRows.push(g);}
+    const openRows=groupRows.filter(g=>!g.closed&&g.remaining>0),commitmentTo=demandTo,commitmentFrom=mxAnaShiftIsoDay(commitmentTo,-2),activeRows=openRows.filter(g=>{const d=mxAnaFirstDate(g.activityDate);return /^\d{4}-\d{2}-\d{2}$/.test(d)&&d>=commitmentFrom&&d<=commitmentTo;}),referenceDate=commitmentTo,referenceLabel='ÚLTIMOS 3 DÍAS',staleExcluded=Math.max(0,openRows.length-activeRows.length);
+    // Para antibióticos la DEMANDA histórica de 30 días sigue usando únicamente
+    // Colectivo justificado, pero el APARTADO/COMPROMISO operativo solo considera
+    // tratamientos abiertos con movimiento en los últimos 3 días. Así un folio
+    // viejo que no se cerró administrativamente no sigue reservando existencia.
+    const reserved=activeRows.reduce((s,g)=>s+g.remaining,0),activeTreatments=activeRows.length,activeRequested=activeRows.reduce((s,g)=>s+(Math.max(0,num(g.total))||Math.max(0,num(g.dispensed)+num(g.remaining))),0),activeSupplied=activeRows.reduce((s,g)=>s+Math.max(0,num(g.dispensed)),0),activeIds=new Set(activeRows.map(g=>norm(g.folio)||norm(g.patient)).filter(Boolean));
     const dayEvents=referenceDate?cjEventsByDate.get(referenceDate):null,eventPieces=[];if(dayEvents){for(const [id,v] of dayEvents.entries()){if(activeIds.size&&!activeIds.has(norm(id)))continue;const pieces=v.pedido>0?v.pedido:v.salida;if(pieces>0)eventPieces.push(pieces);}}
-    const activeTotals=activeRows.filter(g=>g.total>0).map(g=>g.total),activeAvgTreatment=activeTotals.length?activeTotals.reduce((a,b)=>a+b,0)/activeTotals.length:0,avgCjEvent=eventPieces.length?eventPieces.reduce((a,b)=>a+b,0)/eventPieces.length:0,typicalPerFolio=medianPerFolio30||avgPerFolio30||activeAvgTreatment,free=Math.max(0,existencia-reserved),deficit=Math.max(0,reserved-existencia),daysSupply=avgDaily>0?existencia/avgDaily:null,daysFree=avgDaily>0?free/avgDaily:null,newTreatments=typicalPerFolio>0?Math.floor(free/typicalPerFolio):null,nextCj=avgCjEvent>0?Math.floor(free/avgCjEvent):null,isAntibiotic=[selected.classification,...clasificaciones].some(mxAnaIsAntibioticText)||groupRows.length>0,referenceLabel=referenceDate===todayIso?'HOY':(referenceDate===yesterdayIso?'AYER':'SIN ACTIVIDAD RECIENTE');
-    return{product:selected,existencia,lots:invLots.length,periodDays:demandDays,periodConsumption:demandRequested30,avgDaily,daysSupply,daysFree,reserved,free,deficit,activeTreatments,activeRequested,activeSupplied,avgTreatment:typicalPerFolio,activeAvgTreatment,avgCjEvent,newTreatments,nextCj,isAntibiotic,cjEvents:eventPieces.length,treatmentSamples:activeTotals.length,referenceDate,referenceLabel,staleExcluded,demandFrom,demandTo,demandRequested30,demandFolioCount,avgPerFolio30,medianPerFolio30,actualDispensed30,demandRows};
+    const activeTotals=activeRows.filter(g=>g.total>0).map(g=>g.total),activeAvgTreatment=activeTotals.length?activeTotals.reduce((a,b)=>a+b,0)/activeTotals.length:0,avgCjEvent=eventPieces.length?eventPieces.reduce((a,b)=>a+b,0)/eventPieces.length:0,typicalPerFolio=medianPerFolio30||avgPerFolio30||activeAvgTreatment,free=Math.max(0,existencia-reserved),deficit=Math.max(0,reserved-existencia),daysSupply=avgDaily>0?existencia/avgDaily:null,daysFree=avgDaily>0?free/avgDaily:null,newTreatments=typicalPerFolio>0?Math.floor(free/typicalPerFolio):null,nextCj=avgCjEvent>0?Math.floor(free/avgCjEvent):null,isAntibiotic=justifiedOnly||groupRows.length>0;
+    return{product:selected,existencia,lots:invLots.length,periodDays:demandDays,periodConsumption:demandRequested30,avgDaily,daysSupply,daysFree,reserved,free,deficit,activeTreatments,activeRequested,activeSupplied,avgTreatment:typicalPerFolio,activeAvgTreatment,avgCjEvent,newTreatments,nextCj,isAntibiotic,justifiedOnly,cjEvents:eventPieces.length,treatmentSamples:activeTotals.length,referenceDate,referenceLabel,staleExcluded,commitmentFrom,commitmentTo,demandFrom,demandTo,demandRequested30,demandFolioCount,avgPerFolio30,medianPerFolio30,actualDispensed30,demandRows};
   }
   window.mxBuildAntibioticCapacityPlanV146=async function(clave,force=false){const q=norm(clave);if(!q)return null;const rows=await loadSalidas(!!force),to=today(),from=mxAnaShiftIsoDay(to,-29);return mxAnaBuildProductPlan(q,rows,from,to,!!force);};
   function mxAnaFmtDays(v){if(v===null||v===undefined||!Number.isFinite(Number(v)))return '—';const n=Number(v);return n>=1000?'>999':n.toLocaleString('es-MX',{maximumFractionDigits:1});}
@@ -23314,16 +23482,16 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     box.classList.remove('hidden');
     if(plan.notFound){box.innerHTML=`<div class="mx-ana-stockplan-head"><div><b>📦 Planeación de abasto</b><small>No se encontró un producto único para “${esc(plan.query)}” en inventario ni historial.</small></div></div>`;return;}
     if(plan.ambiguous){const ex=(plan.examples||[]).map(x=>`${esc(x.clave)} · ${esc(x.desc)}`).join('<br>');box.innerHTML=`<div class="mx-ana-stockplan-head"><div><b>📦 Planeación de abasto</b><small>La búsqueda coincide con ${fmtNum(plan.count)} productos. Escribe una clave o descripción más específica.<br>${ex}</small></div></div>`;return;}
-    const p=plan.product||{},hasRecent=!!plan.referenceDate,refText=hasRecent?`${plan.referenceLabel} · ${fmtDate(plan.referenceDate)}`:'SIN COLECTIVOS ACTIVOS HOY/AYER';
+    const p=plan.product||{},hasRecent=plan.activeTreatments>0,refText=`ÚLTIMOS 3 DÍAS · ${fmtDate(plan.commitmentFrom)} al ${fmtDate(plan.commitmentTo)}`;
     const badge=[
       plan.isAntibiotic?'<span class="mx-ana-stockplan-badge antibiotico">💊 ANTIBIÓTICO</span>':'',
-      plan.activeTreatments>0?'<span class="mx-ana-stockplan-badge">🧾 COLECTIVO JUSTIFICADO</span>':'',
+      plan.justifiedOnly?'<span class="mx-ana-stockplan-badge">🧾 SOLO COLECTIVO JUSTIFICADO</span>':'',
       (!plan.isAntibiotic&&plan.activeTreatments<=0)?'<span class="mx-ana-stockplan-badge">📦 INVENTARIO</span>':'',
       `<span class="mx-ana-stockplan-badge">📅 BASE: ${esc(refText)}</span>`
     ].filter(Boolean).join('');
     const risk=plan.deficit>0?'bad':(plan.free<=Math.max(1,plan.avgDaily*3)?'warn':'');
-    const activeNote=hasRecent?`${fmtNum(plan.activeTreatments)} colectivo(s) con solicitud ${plan.referenceLabel.toLowerCase()}`:'No hay colectivos activos con solicitud hoy ni ayer';
-    const oldNote=plan.staleExcluded>0?` · ${fmtNum(plan.staleExcluded)} tratamiento(s) anterior(es) excluido(s)` : '';
+    const activeNote=hasRecent?`${fmtNum(plan.activeTreatments)} tratamiento(s) abierto(s) con movimiento en los últimos 3 días`:'No hay colectivos abiertos con movimiento en los últimos 3 días';
+    const oldNote=plan.staleExcluded>0?` · ${fmtNum(plan.staleExcluded)} abierto(s) antiguos no apartan existencia` : '';
     const demandRange=plan.demandFrom&&plan.demandTo?`${fmtDate(plan.demandFrom)} al ${fmtDate(plan.demandTo)}`:'últimos 30 días';
     box.innerHTML=`<div class="mx-ana-stockplan-head"><div><b>📦 Planeación de abasto · ${esc(p.clave||'SIN CLAVE')}</b><small>${esc(p.desc||'Sin descripción')}</small></div><div class="mx-ana-stockplan-badges">${badge}<span class="mx-ana-stockplan-badge">${fmtNum(plan.lots)} lote(s)</span></div></div>
       <div class="mx-ana-stockplan-grid">
@@ -23331,12 +23499,12 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
         <div class="mx-ana-stockmetric"><span>Demanda promedio diaria · 30 d</span><strong>${plan.avgDaily?plan.avgDaily.toLocaleString('es-MX',{maximumFractionDigits:2}):'0'}</strong><small>${fmtNum(plan.demandRequested30)} pzs solicitadas · ${esc(demandRange)}</small></div>
         <div class="mx-ana-stockmetric"><span>Días de abasto</span><strong>${mxAnaFmtDays(plan.daysSupply)}</strong><small>Existencia ÷ demanda solicitada diaria</small></div>
         <div class="mx-ana-stockmetric"><span>Promedio por folio · 30 d</span><strong>${plan.avgPerFolio30?plan.avgPerFolio30.toLocaleString('es-MX',{maximumFractionDigits:2}):'0'}</strong><small>Mediana ${plan.medianPerFolio30?plan.medianPerFolio30.toLocaleString('es-MX',{maximumFractionDigits:2}):'0'} · ${fmtNum(plan.demandFolioCount)} folio(s)</small></div>
-        <div class="mx-ana-stockmetric ${plan.reserved>0?'warn':''}"><span>Apartado tratamientos activos</span><strong>${fmtNum(plan.reserved)}</strong><small>${esc(activeNote)}${esc(oldNote)}</small></div>
-        <div class="mx-ana-stockmetric ${risk}"><span>Disponible para nuevos</span><strong>${fmtNum(plan.free)}</strong><small>${plan.deficit>0?`Faltan ${fmtNum(plan.deficit)} pzs para cubrir apartados recientes`:'Después de cubrir colectivos activos recientes'}</small></div>
+        <div class="mx-ana-stockmetric ${plan.reserved>0?'warn':''}"><span>Apartado comprometido · últimos 3 días</span><strong>${fmtNum(plan.reserved)}</strong><small>${esc(activeNote)}${esc(oldNote)}</small></div>
+        <div class="mx-ana-stockmetric ${risk}"><span>Disponible para nuevos</span><strong>${fmtNum(plan.free)}</strong><small>${plan.deficit>0?`Faltan ${fmtNum(plan.deficit)} pzs para cubrir apartados recientes`:'Después de cubrir compromisos de los últimos 3 días'}</small></div>
         <div class="mx-ana-stockmetric"><span>Días libres de abasto</span><strong>${mxAnaFmtDays(plan.daysFree)}</strong><small>Disponible ÷ demanda solicitada diaria</small></div>
         <div class="mx-ana-stockmetric"><span>Nuevos tratamientos est.</span><strong>${plan.newTreatments==null?'—':fmtNum(plan.newTreatments)}</strong><small>${plan.avgTreatment?`Base típica ${plan.avgTreatment.toLocaleString('es-MX',{maximumFractionDigits:1})} pzs/folio · 30 días`:'Sin folios solicitados en los últimos 30 días'}</small></div>
       </div>
-      <div class="mx-ana-stockplan-foot"><b>Demanda para abasto:</b> se calcula con las piezas <b>solicitadas</b> en una ventana móvil de <b>30 días</b>, no con las piezas surtidas. En colectivos justificados cada tratamiento/folio se cuenta una sola vez y se toma su total solicitado; esto evita que una falta de existencia reduzca artificialmente el promedio. La <b>mediana por folio</b> se muestra junto al promedio porque representa mejor el tratamiento típico cuando existen pedidos atípicos. El apartado de tratamientos activos continúa usando solicitudes de hoy o, si no existen, las de ayer.</div>`;
+      <div class="mx-ana-stockplan-foot"><b>Demanda para abasto:</b> se calcula con las piezas <b>solicitadas</b> en una ventana móvil de <b>30 días</b>, no con las piezas surtidas. <b>Para antibióticos la demanda de 30 días usa solo Colectivo justificado</b>; Colectivo ordinario y los demás tipos quedan fuera. El <b>apartado comprometido</b> se calcula aparte y solo reserva la dosis pendiente de tratamientos abiertos con movimiento en los <b>últimos 3 días</b>. Los colectivos abiertos más antiguos siguen en historial, pero ya no apartan existencia hasta que tengan un movimiento nuevo. La mediana por folio se muestra junto al promedio para representar mejor el tratamiento típico.</div>`;
   }
 
   async function computeAnalysis(force=false){
@@ -23344,12 +23512,13 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     const rows=await loadSalidas(force);const idx=serviceIndex();updateFilterOptions(rows,idx);
     const desde=txt(document.getElementById('anaDesde')?.value)||today().slice(0,7)+'-01';const hasta=txt(document.getElementById('anaHasta')?.value)||today();const serviceFilter=txt(document.getElementById('anaServicio')?.value);const typeFilter=txt(document.getElementById('anaTipoDoc')?.value);const q=norm(document.getElementById('anaProducto')?.value);
     const from=desde<=hasta?desde:hasta,to=desde<=hasta?hasta:desde;
-    const productPlanPromise=q?mxAnaBuildProductPlan(q,rows,from,to,force):Promise.resolve(null);
+    const productPlan=q?await mxAnaBuildProductPlan(q,rows,from,to,force):null,antibioticJustifiedOnly=!!(productPlan&&!productPlan.notFound&&!productPlan.ambiguous&&productPlan.justifiedOnly);
     const services=new Map(),products=new Map(),days=new Map(),weekdays=[0,0,0,0,0,0,0],docTypes=new Map(),docs=new Set();let total=0,sinServicio=0,matched=0;
     const dayNames=['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'];
     for(let i=0;i<rows.length;i++){
       const r=typeof mxNormalizeSalidaRow==='function'?mxNormalizeSalidaRow(rows[i]):rows[i];const f=dateOnly(r?.fecha);if(!f||f<from||f>to)continue;
       const p=num(r?.pzs);if(p<=0)continue;const s=resolveService(r,idx);const t=txt(r?.tipo_doc||r?.tipoDocumento||'Sin tipo');
+      if(antibioticJustifiedOnly&&!mxAnaIsJustified(r))continue;
       if(serviceFilter&&s.key!==serviceFilter)continue;if(typeFilter&&norm(t)!==typeFilter)continue;
       const clave=txt(r?.clave||r?.codigo_barras||'SIN CLAVE'),desc=txt(r?.descripcion||r?.nombre||'Sin descripción');if(q&&!norm(clave+' '+desc).includes(q))continue;
       matched++;total+=p;if(s.key==='__sin_servicio__')sinServicio++;
@@ -23364,8 +23533,7 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     }
     const serviceRows=[...services.values()].map(s=>{const top=[...s.products.values()].sort((a,b)=>b.pzs-a.pzs)[0];const peak=[...s.days].sort((a,b)=>b[1]-a[1])[0];return {...s,docCount:s.docs.size,productCount:s.products.size,avg:s.docs.size?s.pzs/s.docs.size:0,topProduct:top?`${top.desc} (${fmtNum(top.pzs)} pzs)`:'—',peakDay:peak?`${fmtDate(peak[0])} (${fmtNum(peak[1])} pzs)`:'—'};}).sort((a,b)=>b.pzs-a.pzs);
     const productRows=[...products.values()].sort((a,b)=>b.pzs-a.pzs);const dayRows=[...days].map(([fecha,pzs])=>({fecha,pzs})).sort((a,b)=>b.pzs-a.pzs);const topService=serviceRows[0],topProduct=productRows[0],topDay=dayRows[0];const top5=productRows.slice(0,5).reduce((a,x)=>a+x.pzs,0);const concentration=total?top5/total*100:0;
-    const productPlan=await productPlanPromise;
-    const result={from,to,total,docs:docs.size,services:serviceRows,products:productRows,days:dayRows,weekdays,dayNames,docTypes:[...docTypes].sort((a,b)=>b[1]-a[1]),sinServicio,matched,topService,topProduct,topDay,concentration,productPlan};lastAnalysis=result;return result;
+    const result={from,to,total,docs:docs.size,services:serviceRows,products:productRows,days:dayRows,weekdays,dayNames,docTypes:[...docTypes].sort((a,b)=>b[1]-a[1]),sinServicio,matched,topService,topProduct,topDay,concentration,productPlan,antibioticJustifiedOnly};lastAnalysis=result;return result;
   }
 
   function paintAnalysis(r){
@@ -23373,8 +23541,8 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     const demandPlan=r.productPlan&&!r.productPlan.notFound&&!r.productPlan.ambiguous?r.productPlan:null;
     const setKpiLabel=(id,label)=>{const el=document.getElementById(id),span=el?.parentElement?.querySelector('span');if(span)span.textContent=label;};
     if(demandPlan){
-      setKpiLabel('anaKpiPzs','Piezas solicitadas · 30 días');set('anaKpiPzs',fmtNum(demandPlan.demandRequested30));set('anaKpiPzsSub',`${fmtDate(demandPlan.demandFrom)} al ${fmtDate(demandPlan.demandTo)} · demanda`);
-      setKpiLabel('anaKpiDocs','Folios / pedidos · 30 días');set('anaKpiDocs',fmtNum(demandPlan.demandFolioCount));
+      setKpiLabel('anaKpiPzs',demandPlan.justifiedOnly?'Piezas comprometidas · últimos 3 días':'Piezas solicitadas · 30 días');set('anaKpiPzs',fmtNum(demandPlan.justifiedOnly?demandPlan.reserved:demandPlan.demandRequested30));set('anaKpiPzsSub',demandPlan.justifiedOnly?`${fmtDate(demandPlan.commitmentFrom)} al ${fmtDate(demandPlan.commitmentTo)} · compromiso abierto`:`${fmtDate(demandPlan.demandFrom)} al ${fmtDate(demandPlan.demandTo)} · demanda`);
+      setKpiLabel('anaKpiDocs',demandPlan.justifiedOnly?'Tratamientos abiertos · últimos 3 días':'Folios / pedidos · 30 días');set('anaKpiDocs',fmtNum(demandPlan.justifiedOnly?demandPlan.activeTreatments:demandPlan.demandFolioCount));
       setKpiLabel('anaKpiPromedio','Promedio solicitado por folio');set('anaKpiPromedio',demandPlan.avgPerFolio30?demandPlan.avgPerFolio30.toLocaleString('es-MX',{maximumFractionDigits:2}):'0');
     }else{
       setKpiLabel('anaKpiPzs','Piezas consumidas');set('anaKpiPzs',fmtNum(r.total));set('anaKpiPzsSub',`${fmtDate(r.from)} al ${fmtDate(r.to)}`);
@@ -23383,7 +23551,7 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     }
     set('anaKpiServicios',fmtNum(r.services.length));set('anaKpiProductos',fmtNum(new Set(r.products.map(x=>norm(x.clave))).size));set('anaKpiSinServicio',fmtNum(r.sinServicio));
     set('anaInsightServicio',r.topService?`${r.topService.label} (${r.topService.code}) concentró ${fmtNum(r.topService.pzs)} pzs.`:'Sin consumo en el periodo.');set('anaInsightProducto',r.topProduct?`${r.topProduct.desc} — ${fmtNum(r.topProduct.pzs)} pzs en ${r.topProduct.docs.size} folio(s).`:'Sin consumo en el periodo.');set('anaInsightDia',r.topDay?`${fmtDate(r.topDay.fecha)} registró ${fmtNum(r.topDay.pzs)} pzs.`:'Sin consumo en el periodo.');set('anaInsightConcentracion',r.total?`Los 5 productos principales representan ${r.concentration.toFixed(1)}% del consumo total.`:'Sin información suficiente.');
-    const status=document.getElementById('anaStatus');if(status){if(demandPlan){status.className=demandPlan.demandFolioCount?'mx-ana-status ok':'mx-ana-status warn';status.textContent=demandPlan.demandFolioCount?`Demanda del producto: ${fmtNum(demandPlan.demandRequested30)} pzs solicitadas en ${fmtNum(demandPlan.demandFolioCount)} folio(s) durante 30 días. Promedio ${demandPlan.avgPerFolio30.toLocaleString('es-MX',{maximumFractionDigits:2})} pzs/folio; mediana ${demandPlan.medianPerFolio30.toLocaleString('es-MX',{maximumFractionDigits:2})}.`:`No se encontraron solicitudes del producto en la ventana de 30 días (${fmtDate(demandPlan.demandFrom)} al ${fmtDate(demandPlan.demandTo)}).`;}else{status.className=r.total?'mx-ana-status ok':'mx-ana-status warn';status.textContent=r.total?`Análisis listo: ${r.matched.toLocaleString('es-MX')} renglones evaluados del ${fmtDate(r.from)} al ${fmtDate(r.to)}.`:`No se encontró consumo para los filtros seleccionados entre ${fmtDate(r.from)} y ${fmtDate(r.to)}.`;}}
+    const status=document.getElementById('anaStatus');if(status){if(demandPlan){status.className=demandPlan.demandFolioCount?'mx-ana-status ok':'mx-ana-status warn';status.textContent=demandPlan.demandFolioCount?`${demandPlan.justifiedOnly?`Compromiso reciente del antibiótico: ${fmtNum(demandPlan.reserved)} pzs pendientes en ${fmtNum(demandPlan.activeTreatments)} tratamiento(s) abierto(s) con movimiento en los últimos 3 días. Demanda histórica CJ 30 días: ${fmtNum(demandPlan.demandRequested30)} pzs en ${fmtNum(demandPlan.demandFolioCount)} folio(s).`:`Demanda del producto: ${fmtNum(demandPlan.demandRequested30)} pzs solicitadas en ${fmtNum(demandPlan.demandFolioCount)} folio(s) durante 30 días. Promedio ${demandPlan.avgPerFolio30.toLocaleString('es-MX',{maximumFractionDigits:2})} pzs/folio; mediana ${demandPlan.medianPerFolio30.toLocaleString('es-MX',{maximumFractionDigits:2})}.`}`:`No se encontraron solicitudes ${demandPlan.justifiedOnly?'de Colectivo justificado ':''}del producto en la ventana de 30 días (${fmtDate(demandPlan.demandFrom)} al ${fmtDate(demandPlan.demandTo)}).`;}else{status.className=r.total?'mx-ana-status ok':'mx-ana-status warn';status.textContent=r.total?`Análisis listo: ${r.matched.toLocaleString('es-MX')} renglones evaluados del ${fmtDate(r.from)} al ${fmtDate(r.to)}.`:`No se encontró consumo para los filtros seleccionados entre ${fmtDate(r.from)} y ${fmtDate(r.to)}.`;}}
     paintProductPlan(r.productPlan||null);
     set('anaResumenServicios',`${r.services.length} servicio(s)`);set('anaResumenProductos',`${r.products.length} registro(s) servicio-producto`);
     const tbS=document.querySelector('#tblAnaServicios tbody');if(tbS)tbS.innerHTML=r.services.map(s=>`<tr><td><span class="mx-ana-service-pill">${esc(s.label)}</span>${s.ambiguous?'<br><small class="mx-ana-muted">Inicial compartida; edítala en Configuración.</small>':''}</td><td><b>${esc(s.code)}</b></td><td><b>${fmtNum(s.pzs)}</b></td><td>${fmtNum(s.docCount)}</td><td>${fmtNum(s.productCount)}</td><td>${s.avg.toLocaleString('es-MX',{maximumFractionDigits:2})}</td><td>${esc(s.topProduct)}</td><td>${esc(s.peakDay)}</td></tr>`).join('')||'<tr><td colspan="8" style="text-align:center;padding:18px;">Sin datos para el periodo seleccionado.</td></tr>';
@@ -23602,8 +23770,8 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
 
 /* ===== MACROXEL CANONICAL SOURCE: mx104-heavy-backup-restore-script ===== */
 (function(){
-  if(window.__mxHeavyRestoreV105Installed) return;
-  window.__mxHeavyRestoreV105Installed=true;
+  if(window.__mxHeavyRestoreV106Installed) return;
+  window.__mxHeavyRestoreV106Installed=true;
 
   const REQUIRED_STORES=['inventory','salidas','entradas','antibioticos'];
   let activeWorker=null;
@@ -23820,6 +23988,26 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
               const keyed=rows.filter(x=>x&&typeof x==='object'&&Object.prototype.hasOwnProperty.call(x,'__mxKey'));
               if(rows.length&&!keyed.length){notes.push('El respaldo antiguo no conserva claves KV; se mantendrá la configuración KV actual.');continue;}
               rows=keyed;
+            }else{
+              // Compatibilidad con respaldos históricos: algunos archivos antiguos
+              // contienen _id repetidos (por ejemplo en CPM). Un put() con la misma
+              // clave sobrescribe la fila anterior y hacía que la verificación final
+              // reportara menos registros. Conservamos la primera clave y dejamos
+              // que IndexedDB asigne una nueva a cada repetida, sin perder datos.
+              const seenIds=new Set();
+              let repairedIds=0;
+              rows=rows.map(raw=>{
+                if(!raw||typeof raw!=='object'||Array.isArray(raw))return raw;
+                const row=Object.assign({},raw);
+                const id=row._id;
+                if(id!==undefined&&id!==null&&id!==''){
+                  const key=(typeof id)+':'+String(id);
+                  if(seenIds.has(key)){delete row._id;repairedIds++;}
+                  else seenIds.add(key);
+                }
+                return row;
+              });
+              if(repairedIds)notes.push(`${name}: se repararon ${repairedIds.toLocaleString('es-MX')} ID repetidos de un respaldo antiguo para evitar sobrescrituras.`);
             }
             entries.push([name,rows]);
           }
@@ -23896,9 +24084,13 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
       const expected=Number(expectedByStore[name]||0);
       const skipped=Number(skippedByStore[name]||0);
       const minimum=Math.max(0,expected-skipped);
-      if(count<minimum)failures.push(`${name}: se esperaban al menos ${minimum.toLocaleString('es-MX')} y se verificaron ${count.toLocaleString('es-MX')}`);
+      if(count<minimum){
+        const msg=`${name}: se esperaban al menos ${minimum.toLocaleString('es-MX')} y se verificaron ${count.toLocaleString('es-MX')}`;
+        if(REQUIRED_STORES.includes(name))failures.push(msg);
+        else notices.push(`Aviso de compatibilidad: ${msg}. El módulo auxiliar no bloqueará la restauración.`);
+      }
     }
-    if(failures.length)throw new Error('La verificación final detectó módulos incompletos:\n'+failures.join('\n'));
+    if(failures.length)throw new Error('La verificación final detectó módulos principales incompletos:\n'+failures.join('\n'));
     return actual;
   }
   async function finalizeSuccess(payload,button,input){
@@ -23933,7 +24125,8 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     window.removeEventListener('beforeunload',beforeUnload);
     if(button)button.disabled=false;if(input)input.disabled=false;
     const lines=Object.entries(actual).map(([n,c])=>`${n}: ${Number(c).toLocaleString('es-MX')}`).join('\n');
-    uiUpdate('Respaldo restaurado y verificado. Reiniciando el sistema…',100,`Los datos fueron comprobados directamente en IndexedDB:\n${lines}\n\nEl sistema se recargará para reconstruir índices y mostrar la información.`,'done');
+    const restoreNotes=notices.length?`\n\nCompatibilidad aplicada:\n${[...new Set(notices)].join('\n')}`:'';
+    uiUpdate('Respaldo restaurado y verificado. Reiniciando el sistema…',100,`Los datos fueron comprobados directamente en IndexedDB:\n${lines}${restoreNotes}\n\nEl sistema se recargará para reconstruir índices y mostrar la información.`,'done');
     setTimeout(()=>location.reload(),1600);
   }
   async function startRestore(file,button,input){
@@ -24396,8 +24589,8 @@ if(window.__mxViewerLicenseAdminV107)return;window.__mxViewerLicenseAdminV107=tr
 const PATH='/viewer_licenses',LOCAL_BRANCH='mx_viewer_license_admin_branch_v1',VOICE_KEY='mx_vla_voice_seen_v1',LEGACY_BRANCHES=['HGAM'],RECOVERY_TTL=300000;
 const $=id=>document.getElementById(id),txt=v=>String(v==null?'':v).trim(),esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let records=[],voiceBusy=false,recoveryCache=[],recoveryAt=0,recoveryBusy=null;
 function norm(v){return txt(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/[\s_-]+/g,'_')}
-function code(v){const n=norm(v);if(n.includes('FARMACIA')&&n.includes('AJUSCO'))return'FARMACIA_AJUSCO_MEDIO';if(n.includes('ADMINISTRADOR')&&n.includes('ECOSISTEMA'))return'ADMINISTRADOR_ECOSISTEMA';if(n.includes('SURTIDO')&&n.includes('COLECTIVO'))return'TRANSFERENCIAS';if(n.includes('TRANSFER'))return'TRANSFERENCIAS';if(n.includes('EXISTENCIA'))return'EXISTENCIAS';if(n.includes('FARMACOVIGILANCIA'))return'FARMACOVIGILANCIA';if(n.includes('CENSO')&&n.includes('HOSPITAL'))return'CENSO_HOSPITALARIO';if(n.includes('COLECTIVO'))return'COLECTIVOS';if(n.includes('RECETA'))return'RECETAS';if(n.includes('CADUC')||n.includes('ANALISIS')||n.includes('ANALITICA'))return'TRANSFERENCIAS';if(n.includes('ADMINISTRADOR'))return'ADMINISTRADOR';return n||'VISOR'}
-function appLabel(v){const c=code(v);return{FARMACIA_AJUSCO_MEDIO:'Farmacia Ajusco Medio',TRANSFERENCIAS:'Transferencias',EXISTENCIAS:'Existencias',COLECTIVOS:'Colectivos',FARMACOVIGILANCIA:'Farmacovigilancia',SURTIDO_COLECTIVOS:'Surtido Colectivos',ANALISIS_SISTEMA:'Análisis Sistema',RECETAS:'Recetas',CENSO_HOSPITALARIO:'Censo hospitalario',ADMINISTRADOR:'Administrador',ADMINISTRADOR_ECOSISTEMA:'Administrador del Ecosistema'}[c]||txt(v)||'Visor'}
+function code(v){const n=norm(v);if(n.includes('FARMACIA')&&n.includes('AJUSCO'))return'FARMACIA_AJUSCO_MEDIO';if(n.includes('ADMINISTRADOR')&&n.includes('ECOSISTEMA'))return'ADMINISTRADOR_ECOSISTEMA';if(n.includes('SURTIDO')&&n.includes('COLECTIVO'))return'TRANSFERENCIAS';if(n.includes('TRANSFER'))return'TRANSFERENCIAS';if(n.includes('EXISTENCIA'))return'EXISTENCIAS';if(n.includes('FARMACOVIGILANCIA'))return'FARMACOVIGILANCIA';if(n.includes('QUIROFANO')&&n.includes('STOCK'))return'QUIROFANO_STOCK';if(n.includes('CENSO')&&n.includes('HOSPITAL'))return'CENSO_HOSPITALARIO';if(n.includes('COLECTIVO'))return'COLECTIVOS';if(n.includes('RECETA'))return'RECETAS';if(n.includes('CADUC')||n.includes('ANALISIS')||n.includes('ANALITICA'))return'TRANSFERENCIAS';if(n.includes('ADMINISTRADOR'))return'ADMINISTRADOR';return n||'VISOR'}
+function appLabel(v){const c=code(v);return{FARMACIA_AJUSCO_MEDIO:'Farmacia Ajusco Medio',TRANSFERENCIAS:'Transferencias',EXISTENCIAS:'Existencias',COLECTIVOS:'Colectivos',FARMACOVIGILANCIA:'Farmacovigilancia',QUIROFANO_STOCK:'Quirófano · Stock antibióticos',SURTIDO_COLECTIVOS:'Surtido Colectivos',ANALISIS_SISTEMA:'Análisis Sistema',RECETAS:'Recetas',CENSO_HOSPITALARIO:'Censo hospitalario',ADMINISTRADOR:'Administrador',ADMINISTRADOR_ECOSISTEMA:'Administrador del Ecosistema'}[c]||txt(v)||'Visor'}
 function currentUser(){return txt(window.currentUser||window.__currentUser||window.__mxCurrentUser||document.getElementById('who')?.textContent||'admin')||'admin'}
 function defaultBranch(){try{return txt(window.mxGetSucursalFromLicense?.()||'').toUpperCase()||txt(localStorage.getItem(LOCAL_BRANCH)||'').toUpperCase()||'HGAM'}catch(_e){return'HGAM'}}
 function branch(){return txt($('vlaBranch')?.value||defaultBranch()).toUpperCase()||'HGAM'}
@@ -25711,7 +25904,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   }
 
   function exactSameLot(r, clave, lote, cad){
-    return txt(r?.clave) === clave && txt(r?.lote).toUpperCase() === lote.toUpperCase() && cadKey(r?.caducidad ?? r?.cad) === cadKey(cad);
+    return txt(r?.clave).toUpperCase() === txt(clave).toUpperCase() && txt(r?.lote).toUpperCase() === txt(lote).toUpperCase() && cadKey(r?.caducidad ?? r?.cad) === cadKey(cad);
   }
 
   async function findInventoryCandidates(clave,lote,cad){
@@ -25866,6 +26059,22 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     setMemoryInventory(rows);
   }
 
+
+  async function webPutPairAtomic(inv,row){
+    if(typeof db==='undefined'||!db||typeof db.transaction!=='function')throw new Error('IndexedDB no está disponible. No se guardó ninguna Entrada.');
+    return new Promise((resolve,reject)=>{
+      let keys=[],failure=null;
+      const tx=db.transaction(['inventory','entradas'],'readwrite');
+      tx.oncomplete=()=>resolve(keys);
+      tx.onabort=()=>reject(tx.error||failure||new Error('Se canceló la transacción de Entrada e Inventario.'));
+      tx.onerror=()=>{failure=tx.error;};
+      const req1=tx.objectStore('inventory').put(clone(inv));
+      req1.onsuccess=()=>{keys[0]=req1.result;};
+      const req2=tx.objectStore('entradas').put(clone(row));
+      req2.onsuccess=()=>{keys[1]=req2.result;};
+    });
+  }
+
   async function persist(input){
     if(saving) throw new Error('Ya se está guardando una entrada. Espera un momento.');
     saving = true;
@@ -25881,10 +26090,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       }else if(typeof idbPut === 'function'){
         // Fallback web: mantiene el mismo orden y una sola ejecución.
         if(typeof mxSetInventoryHardDeleted === 'function') mxSetInventoryHardDeleted(false);
-        inv._id = await idbPut('inventory', inv);
-        row._id = await idbPut('entradas', row);
-        try{ await window.__mxFlushSqlWrites?.(); }catch(_e){}
-        ids = [inv._id, row._id];
+        ids=await webPutPairAtomic(inv,row);
       }else{
         throw new Error('La base de datos no está disponible.');
       }
@@ -25893,7 +26099,19 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
         if(ids[0]) inv._id = ids[0];
         if(ids[1]) row._id = ids[1];
       }
-      try{ window.__mxClearSqlCache?.('inventory'); window.__mxClearSqlCache?.('entradas'); }catch(_e){}
+      try{ window.__mxClearSqlCache?.('inventory'); window.__mxClearSqlCache?.('entradas');window.__mxInvalidateInventoryCache?.(); }catch(_e){}
+      // Verificar ambas filas reales antes de anunciar éxito. Si falla la lectura,
+      // NO repetir el movimiento porque podría duplicar las piezas.
+      if(inv._id!=null && row._id!=null){
+        const [savedInv,savedRow]=window.electronSql?.isElectron && window.electronSql.get
+          ?await Promise.all([window.electronSql.get('inventory',inv._id),window.electronSql.get('entradas',row._id)])
+          :await Promise.all(['inventory','entradas'].map((store,i)=>new Promise((resolve,reject)=>{
+            const tx=db.transaction(store,'readonly'),rq=tx.objectStore(store).get(i===0?inv._id:row._id);
+            rq.onsuccess=()=>resolve(rq.result);rq.onerror=()=>reject(rq.error);
+          })));
+        if(!savedInv||!savedRow||num(savedInv.existencia)!==num(inv.existencia))
+          throw new Error('La Entrada se procesó, pero no fue posible verificar Inventario e Historial. No la captures otra vez; revisa los registros.');
+      }
       try{ if(typeof mxSetInventoryHardDeleted === 'function') mxSetInventoryHardDeleted(false); }catch(_e){}
       updateMemory(inv);
       try{ await window.mxCatalogEnsureFromEntradas?.([row]); }catch(_e){}
@@ -26138,9 +26356,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
           ]);
         }else if(typeof idbPut==='function'){
           if(typeof mxSetInventoryHardDeleted==='function')mxSetInventoryHardDeleted(false);
-          inv._id=await idbPut('inventory',inv);
-          row._id=await idbPut('entradas',row);
-          ids=[inv._id,row._id];
+          ids=await webPutPairAtomic(inv,row);
         }else throw new Error('La base de datos no está disponible.');
         if(Array.isArray(ids)){if(ids[0])inv._id=ids[0];if(ids[1])row._id=ids[1];}
         updateMemory(inv);saved.push(row);touched.add(row.clave);
@@ -26149,7 +26365,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       }
       try{await window.mxCatalogEnsureFromEntradas?.(saved);}catch(_e){}
       try{await window.__mxFlushSqlWrites?.();}catch(_e){}
-      try{window.__mxClearSqlCache?.('inventory');window.__mxClearSqlCache?.('entradas');}catch(_e){}
+      try{window.__mxClearSqlCache?.('inventory');window.__mxClearSqlCache?.('entradas');window.__mxInvalidateInventoryCache?.();}catch(_e){}
       try{if(typeof mxSetInventoryHardDeleted==='function')mxSetInventoryHardDeleted(false);}catch(_e){}
       try{if(typeof drawEntradas==='function')await drawEntradas({exactFolio:false});}catch(_e){}
       try{const view=document.getElementById('view-inventario');if(view&&!view.classList.contains('hidden')&&typeof drawInventario==='function')await drawInventario();}catch(_e){}
@@ -27230,12 +27446,32 @@ function mxOrderPdfSafeText(v){
     .replace(/\s+/g,' ')
     .trim();
 }
-const MX_ORDER_PDF_LOGOS={left:'../img/formatos/logo_izquierdo.png',right:'../img/formatos/logo_derecho.png',collective:'../img/formatos/logo_colectivo.png',footer:'../img/formatos/logo_footer.png'};
+const MX_ORDER_PDF_LOGOS={left:'img/formatos/logo_izquierdo.png',right:'img/formatos/logo_derecho.png',collective:'img/formatos/logo_colectivo.png',footer:'img/formatos/logo_footer.png'};
 const MX_ORDER_PDF_IMAGE_CACHE=new Map(),MX_ORDER_PDF_SPLIT_CACHE=new Map();
-function mxOrderPdfCurrentAssets(){let saved={};try{saved=JSON.parse(localStorage.getItem('mx_collective_pdf_assets_principal_v1')||'{}')||{}}catch(_e){}return{left:txt(saved.left)||MX_ORDER_PDF_LOGOS.left,right:txt(saved.right)||MX_ORDER_PDF_LOGOS.right,collective:txt(saved.collective)||MX_ORDER_PDF_LOGOS.collective,footer:txt(saved.footer)||MX_ORDER_PDF_LOGOS.footer}}
-function mxOrderPdfLoadImage(src){if(!src)return Promise.resolve('');if(MX_ORDER_PDF_IMAGE_CACHE.has(src))return Promise.resolve(MX_ORDER_PDF_IMAGE_CACHE.get(src));return new Promise(resolve=>{try{const im=new Image();im.onload=()=>{try{const c=document.createElement('canvas');c.width=im.naturalWidth||im.width;c.height=im.naturalHeight||im.height;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.drawImage(im,0,0);const d=c.toDataURL('image/png');MX_ORDER_PDF_IMAGE_CACHE.set(src,d);resolve(d)}catch(_e){resolve('')}};im.onerror=()=>resolve('');im.src=src}catch(_e){resolve('')}})}
+function mxOrderPdfCurrentAssets(){let saved={};try{saved=JSON.parse(localStorage.getItem('mx_collective_pdf_assets_principal_v1')||'{}')||{}}catch(_e){}return Object.fromEntries(['left','right','collective','footer'].map(k=>[k,typeof saved[k]==='string'?saved[k].trim():'']))}
+function mxOrderPdfLoadImage(src){if(!src)return Promise.resolve('');if(MX_ORDER_PDF_IMAGE_CACHE.has(src))return Promise.resolve(MX_ORDER_PDF_IMAGE_CACHE.get(src));return new Promise(resolve=>{try{const im=new Image();if(!/^data:|^blob:/i.test(String(src)))im.crossOrigin='anonymous';im.onload=()=>{try{const c=document.createElement('canvas');c.width=im.naturalWidth||im.width;c.height=im.naturalHeight||im.height;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.drawImage(im,0,0);const d=c.toDataURL('image/png');MX_ORDER_PDF_IMAGE_CACHE.set(src,d);resolve(d)}catch(_e){resolve('')}};im.onerror=()=>resolve('');im.src=src}catch(_e){resolve('')}})}
 function mxOrderPdfSplitCollectiveHeader(src){if(!src)return Promise.resolve({left:'',right:''});if(MX_ORDER_PDF_SPLIT_CACHE.has(src))return Promise.resolve(MX_ORDER_PDF_SPLIT_CACHE.get(src));return new Promise(resolve=>{try{const im=new Image();im.onload=()=>{try{const w=im.naturalWidth||im.width,h=im.naturalHeight||im.height;if(w<2||h<2){resolve({left:'',right:''});return}const leftEnd=Math.max(1,Math.round(w*.55)),rightStart=Math.min(w-1,Math.round(w*.56)),crop=(x0,x1)=>{const c=document.createElement('canvas');c.width=Math.max(1,x1-x0);c.height=h;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.drawImage(im,x0,0,c.width,h,0,0,c.width,h);return c.toDataURL('image/png')},out={left:crop(0,leftEnd),right:crop(rightStart,w)};MX_ORDER_PDF_SPLIT_CACHE.set(src,out);resolve(out)}catch(_e){resolve({left:'',right:''})}};im.onerror=()=>resolve({left:'',right:''});im.src=src}catch(_e){resolve({left:'',right:''})}})}
-async function mxOrderPdfLogos(){if(typeof window.mxQxPdfConfiguredLogos==='function')return await window.mxQxPdfConfiguredLogos();let cfg=null;try{if(typeof window.mxGetCollectivePdfAssets==='function')cfg=await window.mxGetCollectivePdfAssets()}catch(_e){}if(!cfg)cfg=mxOrderPdfCurrentAssets();const [left,right,collective,footer]=await Promise.all([mxOrderPdfLoadImage(cfg.left),mxOrderPdfLoadImage(cfg.right),mxOrderPdfLoadImage(cfg.collective),mxOrderPdfLoadImage(cfg.footer)]),split=await mxOrderPdfSplitCollectiveHeader(collective);return{left,right,collective,footer,collectiveLeft:split.left,collectiveRight:split.right}}
+async function mxOrderPdfLogos(){
+  // La fuente única para web y escritorio es Configuración > Imágenes y logos.
+  // La lectura remota se realiza con la sucursal y Firebase configurados, nunca con URLs fijas.
+  let cfg=null;
+  try{if(typeof window.mxGetCollectivePdfAssets==='function')cfg=await window.mxGetCollectivePdfAssets()}catch(e){console.warn('[PDF LOGOS] No se pudo leer Configuración',e)}
+  const local=mxOrderPdfCurrentAssets(),source={...local,...(cfg||{})};
+  const keys=['left','right','collective','footer'];
+  const resolved=await Promise.all(keys.map(async key=>{
+    const src=typeof source[key]==='string'?source[key].trim():'';
+    return src?await mxOrderPdfLoadImage(src):'';
+  }));
+  let [left,right,collective,footer]=resolved;
+  const split=collective?await mxOrderPdfSplitCollectiveHeader(collective):{left:'',right:''};
+  let rawSaved={};try{rawSaved=JSON.parse(localStorage.getItem('mx_collective_pdf_assets_principal_v1')||'{}')||{}}catch(_e){}
+  const savedLeftRemoved=(Object.prototype.hasOwnProperty.call(cfg||{},'left')&&cfg.left==='')||(Object.prototype.hasOwnProperty.call(rawSaved,'left')&&local.left==='');
+  const savedRightRemoved=(Object.prototype.hasOwnProperty.call(cfg||{},'right')&&cfg.right==='')||(Object.prototype.hasOwnProperty.call(rawSaved,'right')&&local.right==='');
+  if(!left&&!savedLeftRemoved)left=split.left;
+  if(!right&&!savedRightRemoved)right=split.right;
+  if(!left||!right)console.warn('[PDF LOGOS] Configura las imágenes del encabezado en Configuración > Imágenes y logos; no se usarán logos fijos.');
+  return{left,right,collective,footer,collectiveLeft:split.left,collectiveRight:split.right};
+}
 function mxOrderPdfDate(v){try{const d=new Date(v||Date.now());return Number.isNaN(d.getTime())?mxOrderPdfSafeText(v):d.toLocaleDateString('es-MX')}catch(_e){return mxOrderPdfSafeText(v)}}
 function mxOrderPdfLine(doc,x1,y1,x2,y2,w=.25){doc.setDrawColor(0,0,0);doc.setLineWidth(w);doc.line(x1,y1,x2,y2)}
 function mxOrderPdfText(doc,text,x,y,size=7,style='normal',align='left',maxW=0){doc.setTextColor(0,0,0);doc.setFont('helvetica',style);doc.setFontSize(size);const clean=mxOrderPdfSafeText(text||'');if(maxW){const lines=doc.splitTextToSize(clean,maxW);doc.text(lines,x,y,{align});return lines.length}doc.text(clean,x,y,{align});return 1}
@@ -28863,6 +29099,14 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     return mergedControl(type, state.documents?.[key] || {}, null);
   }
 
+  // Ruta rápida para una salida que YA fue validada antes de guardarse. En ese punto
+  // el control en memoria es suficiente para avanzar el consecutivo y no hace falta
+  // despertar otra vez al worker SQL únicamente para volver a leer el mismo número.
+  function readControlFastLocal(type) {
+    const key = type.key || controlKey(type.label, type.module || 'salidas');
+    return mergedControl(type, state.documents?.[key] || {}, null);
+  }
+
   const RECIPE_CONTROL_KEYS = new Set(['RC','RMC','RO','RA']);
   const isRecipeControlType = type => RECIPE_CONTROL_KEYS.has(typeKey(type));
   const RECIPE_REMOTE_FRESH_TTL = 1500;
@@ -29346,7 +29590,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       // Esta salida acaba de ser confirmada localmente; no necesita esperar otra
       // consulta Firebase para avanzar su propio control. La sincronización remota
       // de writeControl se mantiene en segundo plano.
-      const control = await readControl(type);
+      const control = readControlFastLocal(type);
       const previousCurrent = integer(control.current);
       let advanced = false;
       // El consecutivo solo avanza cuando se confirma el primer producto.
@@ -29375,18 +29619,26 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       const sameActiveFolio = !!(activeInput && norm(activeInput.value) === norm(data.rawFolio));
       if (sameActiveFolio) activeInput.dataset.mxFolioPending = '';
       if (type.module === 'salidas' && advanced) {
-        // La validación previa decía “último confirmado N-1”. Al confirmar el primer
-        // producto ese dato ya es obsoleto; eliminarlo evita que el aviso verde y
-        // el control superior muestren consecutivos distintos.
+        // La validación previa decía “último confirmado N-1”. Después de confirmar,
+        // conservar en caché el MISMO folio como reutilizable evita volver a consultar
+        // historial/SQL cuando se agregan más productos a la misma receta.
         clearSalidaFolioValidationCache();
-        if (sameActiveFolio && typeof window.mxSetSalFolioHint === 'function') {
-          window.mxSetSalFolioHint(`Folio ${data.rawFolio} confirmado para ${type.label}. Puedes seguir agregando productos con este folio; el siguiente nuevo es ${String(number + 1).padStart(4, '0')}.`, 'info');
+        if (sameActiveFolio) {
+          const signature = salidaFolioValidationSignature(activeInput, document.getElementById('salTipo'));
+          if (signature) rememberSalidaFolioValidation(signature, {
+            ok: true, alerta: false, reutilizado: true, current: number, expected: number + 1, number
+          });
+          if (typeof window.mxSetSalFolioHint === 'function') window.mxSetSalFolioHint('');
+        }
+
+        // “Control de Folios” ya contiene toda la información útil. Actualizarlo con
+        // el número que acabamos de confirmar, sin lanzar otra lectura SQL/Firebase.
+        const currentType = configuredType(text(document.getElementById('salTipo')?.value), 'salidas');
+        if (currentType?.key === type.key && typeof window.mxSetSalTipoFolioInfo === 'function') {
+          window.mxSetSalTipoFolioInfo(`Control de Folios: último confirmado ${String(number).padStart(4, '0')} | siguiente sugerido ${String(number + 1).padStart(4, '0')}.`, 'info');
         }
       }
       if (type.module === 'entradas') await refreshEntryFolioHint();
-      if (type.module === 'salidas' && typeof window.mxRefreshUltimoYSiguienteFolioSalida === 'function') {
-        await window.mxRefreshUltimoYSiguienteFolioSalida();
-      }
       return true;
     } catch (error) {
       console.warn('[Folios confirmación por movimiento]', error);
@@ -29831,9 +30083,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
           input.dataset.mxFolioPreparedValue = entry.folio;
           input.dispatchEvent(new Event('input', { bubbles: true }));
           input.dispatchEvent(new Event('change', { bubbles: true }));
-          if (typeof window.mxSetSalFolioHint === 'function') {
-            window.mxSetSalFolioHint(`Folio ${entry.folio} preparado. Se confirmará al registrar el primer producto.`, 'ok');
-          }
+          if (typeof window.mxSetSalFolioHint === 'function') window.mxSetSalFolioHint('');
           input.focus();
           input.select?.();
         } finally {
@@ -29851,7 +30101,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
           input.dataset.mxFolioControl = '';
           input.dataset.mxFolioPending = '';
           input.dataset.mxFolioPreparedValue = '';
-          if (typeof window.mxSetSalFolioHint === 'function') window.mxSetSalFolioHint('Folio capturado manualmente. Se validará al salir del campo.', 'info');
+          if (typeof window.mxSetSalFolioHint === 'function') window.mxSetSalFolioHint('');
         }
         input.dataset.mxFolioTypeAccepted = '';
         input.dataset.mxFolioStrictInvalid = '';
@@ -29859,14 +30109,10 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
         input.dataset.mxFolioLastAlert = '';
         input.removeAttribute('aria-invalid');
         clearSalidaFolioValidationCache();
-        // Prevalidación silenciosa mientras el usuario termina de capturar el folio.
-        // Así, al elegir producto/cantidad, la validación normalmente ya está resuelta.
+        // No consultar SQL/Firebase mientras se escribe. La validación silenciosa se
+        // programa al abandonar Folio y, si el usuario registra antes, validarSalidasCampos
+        // la ejecuta de inmediato. Así ninguna tecla compite con consultas administrativas.
         clearTimeout(input.__mxFolioPrevalidateTimer);
-        if(text(input.value) && text(select?.value)){
-          input.__mxFolioPrevalidateTimer=setTimeout(()=>{
-            Promise.resolve(window.mxSmartCheckSalidaFolio?.({interactive:false,promptMismatch:false,promptConsecutive:false})).catch(()=>{});
-          },220);
-        }
       });
       // Validar al salir sin frenar ni robar el foco del siguiente campo.
       // La misma promesa queda disponible para la confirmación de cantidad, por lo
@@ -29874,13 +30120,24 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       input.addEventListener('blur', () => {
         const signature = salidaFolioValidationSignature(input, select);
         input.__mxFolioBlurSignature = signature;
-        input.__mxFolioBlurPromise = new Promise(resolve => {
-          setTimeout(() => {
-            Promise.resolve(window.mxSmartCheckSalidaFolio?.({
-              interactive: false, promptMismatch: false, promptConsecutive: false
-            })).then(resolve).catch(() => resolve(null));
-          }, 0);
-        });
+        input.__mxFolioBlurPromise = null;
+        clearTimeout(input.__mxFolioBlurTimer);
+        // Dar prioridad absoluta a la primera tecla del campo siguiente. Si en 280 ms
+        // el folio sigue igual, validar en segundo plano. Si el usuario registra antes,
+        // validarSalidasCampos no espera este temporizador: valida directamente.
+        const validateWhenQuiet=()=>{
+          if(salidaFolioValidationSignature(input, select)!==signature) return;
+          const last=Number(window.__mxSalLastInteractionAt||0);
+          if(last && Date.now()-last<320){
+            input.__mxFolioBlurTimer=setTimeout(validateWhenQuiet,180);
+            return;
+          }
+          const promise=Promise.resolve(window.mxSmartCheckSalidaFolio?.({
+            interactive:false,promptMismatch:false,promptConsecutive:false
+          })).catch(()=>null);
+          input.__mxFolioBlurPromise=promise;
+        };
+        input.__mxFolioBlurTimer=setTimeout(validateWhenQuiet,280);
       });
     }
 
@@ -29900,11 +30157,9 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
         input.dataset.mxFolioLastAlert = '';
         input.removeAttribute('aria-invalid');
         clearSalidaFolioValidationCache();
-        if (text(input.value)) {
-          setTimeout(() => {
-            Promise.resolve(window.mxSmartCheckSalidaFolio?.({ interactive: false })).catch(()=>{});
-          }, 0);
-        }
+        // El cambio de tipo solo actualiza UI/control. La validación del folio se hace
+        // al salir de Folio o al registrar, no en el mismo instante en que el usuario
+        // intenta pasar al siguiente campo.
       });
     }
     updateButtonMode();
@@ -30303,9 +30558,7 @@ Pedido: ${orderId}` : ''}
     if (relation?.matched && relation.matched.key === selectedType.key) {
       setSalidaFolioValidity(input, true);
       input.dataset.mxFolioLastAlert = '';
-      if (typeof window.mxSetSalFolioHint === 'function') {
-        window.mxSetSalFolioHint(`Folio ${folio} ya registrado en ${relation.matched.label}: puedes seguir agregando productos sin avanzar el consecutivo.`, 'info');
-      }
+      if (typeof window.mxSetSalFolioHint === 'function') window.mxSetSalFolioHint('');
       return { ok: true, alerta: false, reutilizado: true };
     }
 
@@ -30344,9 +30597,7 @@ Pedido: ${orderId}` : ''}
     if (number <= current) {
       setSalidaFolioValidity(input, true);
       input.dataset.mxFolioLastAlert = '';
-      if (typeof window.mxSetSalFolioHint === 'function') {
-        window.mxSetSalFolioHint(`Folio anterior ${String(number).padStart(4, '0')} permitido para ${selectedType.label}. El siguiente folio nuevo continúa en ${String(expected).padStart(4, '0')}.`, 'info');
-      }
+      if (typeof window.mxSetSalFolioHint === 'function') window.mxSetSalFolioHint('');
       return { ok: true, alerta: false, anterior: true, current, expected, number };
     }
 
@@ -30379,9 +30630,7 @@ Pedido: ${orderId}` : ''}
 
     setSalidaFolioValidity(input, true);
     input.dataset.mxFolioLastAlert = '';
-    if (typeof window.mxSetSalFolioHint === 'function') {
-      window.mxSetSalFolioHint(`Consecutivo correcto para ${selectedType.label}: ${String(number).padStart(4, '0')}. Último confirmado: ${String(current).padStart(4, '0')}.`, 'ok');
-    }
+    if (typeof window.mxSetSalFolioHint === 'function') window.mxSetSalFolioHint('');
     return { ok: true, alerta: false, current, expected, number };
   };
 
@@ -30448,10 +30697,21 @@ Pedido: ${orderId}` : ''}
   };
 
   const originalSaveSalida = window.saveSalida;
+  let salidaFolioAdvanceQueue = Promise.resolve();
+  function queueSalidaFolioAdvance(row) {
+    // El movimiento principal ya quedó guardado y validado. El avance del control de
+    // folios se serializa inmediatamente después, pero fuera de la ruta crítica para
+    // que teclado, flechas y siguiente captura queden disponibles sin esperar este trabajo.
+    setTimeout(() => {
+      salidaFolioAdvanceQueue = salidaFolioAdvanceQueue
+        .then(() => advanceFromRecord(row, 'salidas'))
+        .catch(error => { console.warn('[Folios avance diferido de salida]', error); return false; });
+    }, 0);
+  }
   if (typeof originalSaveSalida === 'function' && !originalSaveSalida.__mxFoliosDirect) {
     const wrappedSaveSalida = async function wrappedSaveSalida(row) {
       const result = await originalSaveSalida.apply(this, arguments);
-      await advanceFromRecord(result && typeof result === 'object' ? result : row, 'salidas');
+      queueSalidaFolioAdvance(result && typeof result === 'object' ? result : row);
       return result;
     };
     wrappedSaveSalida.__mxFolios = true;
@@ -32017,7 +32277,7 @@ if(document.readyState === 'loading'){
 /* ===== MACROXEL CANONICAL SOURCE: mx-collective-pdf-assets-principal-v2 ===== */
 (()=>{
   const KEY='mx_collective_pdf_assets_principal_v1',ROOT='/collective_pdf_assets';
-  const DEFAULTS={collective:'../img/formatos/logo_colectivo.png',left:'../img/formatos/logo_izquierdo.png',right:'../img/formatos/logo_derecho.png',footer:'../img/formatos/logo_footer.png'};
+  const DEFAULTS={collective:'img/formatos/logo_colectivo.png',left:'img/formatos/logo_izquierdo.png',right:'img/formatos/logo_derecho.png',footer:'img/formatos/logo_footer.png'};
   let bound=false,publishing=false,pulling=false,memoryAssets={};
   const $=id=>document.getElementById(id);
   function branch(){try{return String(window.mxGetSucursalFromLicense?.()||'HGAM').trim().toUpperCase()||'HGAM'}catch(_e){return'HGAM'}}
@@ -32030,11 +32290,11 @@ if(document.readyState === 'loading'){
   function fileToData(file){return new Promise((resolve,reject)=>{try{const fr=new FileReader();fr.onload=()=>normalize(String(fr.result||'')).then(resolve,reject);fr.onerror=()=>reject(new Error('No se pudo leer el archivo.'));fr.readAsDataURL(file)}catch(e){reject(e)}})}
   function normalize(src){return new Promise((resolve,reject)=>{try{const im=new Image();im.onload=()=>{try{const maxW=1600,maxH=650,scale=Math.min(1,maxW/(im.naturalWidth||im.width),maxH/(im.naturalHeight||im.height)),w=Math.max(1,Math.round((im.naturalWidth||im.width)*scale)),h=Math.max(1,Math.round((im.naturalHeight||im.height)*scale)),c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,w,h);x.drawImage(im,0,0,w,h);resolve(c.toDataURL('image/png'))}catch(e){reject(e)}};im.onerror=()=>reject(new Error('Imagen no válida.'));im.src=src}catch(e){reject(e)}})}
   async function defaultData(key){try{const url=new URL(DEFAULTS[key],location.href).href;return await normalize(url)}catch(_e){return''}}
-  async function resolved(seed=null){const saved={...(seed||read())},out={};for(const key of ['collective','left','right','footer']){if(saved[key])out[key]=saved[key];else out[key]=await defaultData(key)}return out}
-  function previewOne(key,id){const saved=read(),el=$(id);if(!el)return;el.src=saved[key]||new URL(DEFAULTS[key],location.href).href}
+  async function resolved(seed=null){const saved={...(seed||read())},out={};for(const key of ['collective','left','right','footer']){if(Object.prototype.hasOwnProperty.call(saved,key))out[key]=String(saved[key]||'');else out[key]=await defaultData(key)}return out}
+  function previewOne(key,id){const saved=read(),el=$(id);if(!el)return;const asset=Object.prototype.hasOwnProperty.call(saved,key)?saved[key]:new URL(DEFAULTS[key],location.href).href;if(asset){el.src=asset;el.style.display='';}else{el.removeAttribute('src');el.style.display='none';}}
   function render(){previewOne('collective','mxColImgCollectivePreview');previewOne('left','mxColImgLeftPreview');previewOne('right','mxColImgRightPreview');previewOne('footer','mxColImgFooterPreview')}
-  function renderAssets(a){if(!a)return render();const map={collective:'mxColImgCollectivePreview',left:'mxColImgLeftPreview',right:'mxColImgRightPreview',footer:'mxColImgFooterPreview'};for(const [k,id] of Object.entries(map)){const el=$(id);if(el&&a[k])el.src=a[k]}}
-  function previewFile(inputId,previewId,key){const f=$(inputId)?.files?.[0],img=$(previewId);if(!img)return;if(!f){previewOne(key,previewId);return}const u=URL.createObjectURL(f);img.src=u;setTimeout(()=>URL.revokeObjectURL(u),30000)}
+  function renderAssets(a){if(!a)return render();const map={collective:'mxColImgCollectivePreview',left:'mxColImgLeftPreview',right:'mxColImgRightPreview',footer:'mxColImgFooterPreview'};for(const [k,id] of Object.entries(map)){const el=$(id);if(el&&Object.prototype.hasOwnProperty.call(a,k)){if(a[k]){el.src=a[k];el.style.display='';}else{el.removeAttribute('src');el.style.display='none';}}}}
+  function previewFile(inputId,previewId,key){const f=$(inputId)?.files?.[0],img=$(previewId);if(!img)return;if(!f){previewOne(key,previewId);return}const u=URL.createObjectURL(f);img.src=u;img.style.display='';setTimeout(()=>URL.revokeObjectURL(u),30000)}
   async function publish(forceAssets=null){
     if(publishing)return false;publishing=true;
     try{
@@ -32055,7 +32315,7 @@ if(document.readyState === 'loading'){
       const remote=await window.mxGetJson(`${ROOT}/${encodeURIComponent(branch())}`).catch(()=>null);
       if(!remote||typeof remote!=='object')return null;
       const current=read(),next={...current};let found=0;
-      for(const key of ['collective','left','right','footer']){if(typeof remote[key]==='string'&&remote[key].trim()){next[key]=remote[key];found++}}
+      for(const key of ['collective','left','right','footer']){if(typeof remote[key]==='string'){next[key]=remote[key];found++}}
       if(!found)return null;
       write(next);clearPdfCaches();renderAssets(next);if(!quiet)status(`✅ Imágenes cargadas desde Configuración · ${new Date().toLocaleString('es-MX')}`);return next;
     }catch(e){if(!quiet)status('⚠️ No se pudieron cargar las imágenes configuradas: '+(e?.message||e),false);return null}finally{pulling=false}
@@ -32064,11 +32324,19 @@ if(document.readyState === 'loading'){
     const map=[['mxColImgCollective','collective'],['mxColImgLeft','left'],['mxColImgRight','right'],['mxColImgFooter','footer']],next=read();let changed=false;
     try{for(const [id,key] of map){const f=$(id)?.files?.[0];if(f){next[key]=await fileToData(f);changed=true}}if(!changed){status('Selecciona al menos una imagen nueva o usa “Sincronizar ahora”.',false);return}write(next);clearPdfCaches();renderAssets(next);for(const [id] of map){if($(id))$(id).value=''}await publish(await resolved(next))}catch(e){status('No se pudieron guardar las imágenes: '+(e?.message||e),false)}
   }
+async function removeImage(key){
+  if(!['collective','left','right','footer'].includes(key))return;
+  const label={collective:'encabezado de colectivo ordinario',left:'logo izquierdo',right:'logo derecho',footer:'imagen inferior'}[key];
+  if(!await window.mxConfirm?.(`¿Eliminar ${label}? No se restaurará automáticamente ni se mostrará en los PDF.`))return;
+  const next={...read(),[key]:''};write(next);clearPdfCaches();render();
+  const statusOk=await publish(await resolved(next));
+  if(!statusOk)status('Imagen eliminada de este equipo; falta sincronizar el borrado con Firebase.',false);
+}
   async function reset(){if(!(await window.mxConfirm?.('¿Restaurar las imágenes predeterminadas de colectivos y sincronizarlas?') ?? confirm('¿Restaurar las imágenes predeterminadas de colectivos y sincronizarlas?')))return;memoryAssets={};try{localStorage.removeItem(KEY)}catch(_e){}clearPdfCaches();render();await publish(await resolved({}))}
   async function syncNow(){const remote=await pullRemote({quiet:false});if(remote)return true;status('No se encontraron imágenes remotas; publicando las configuradas en este equipo…');return publish(await resolved())}
   async function ensureConfigured(){const remote=await pullRemote({quiet:true});if(remote)return true;try{const local=read();if(local.left||local.right||local.footer||local.collective)await publish(await resolved(local))}catch(_e){}return false}
-  function bind(){if(bound)return;const sec=$('mxCollectiveImagesSection');if(!sec)return;bound=true;render();[['mxColImgCollective','mxColImgCollectivePreview','collective'],['mxColImgLeft','mxColImgLeftPreview','left'],['mxColImgRight','mxColImgRightPreview','right'],['mxColImgFooter','mxColImgFooterPreview','footer']].forEach(([i,p,k])=>$(i)?.addEventListener('change',()=>previewFile(i,p,k)));$('mxColImgSave')?.addEventListener('click',save);$('mxColImgSync')?.addEventListener('click',syncNow);$('mxColImgReset')?.addEventListener('click',reset);setTimeout(ensureConfigured,500)}
-  window.mxGetCollectivePdfAssets=async()=>{const remote=await pullRemote({quiet:true});return remote||await resolved(read())};
+  function bind(){if(bound)return;const sec=$('mxCollectiveImagesSection');if(!sec)return;bound=true;render();[['mxColImgCollective','mxColImgCollectivePreview','collective'],['mxColImgLeft','mxColImgLeftPreview','left'],['mxColImgRight','mxColImgRightPreview','right'],['mxColImgFooter','mxColImgFooterPreview','footer']].forEach(([i,p,k])=>$(i)?.addEventListener('change',()=>previewFile(i,p,k)));$('mxColImgSave')?.addEventListener('click',save);$('mxColImgSync')?.addEventListener('click',syncNow);$('mxColImgReset')?.addEventListener('click',reset);sec.querySelectorAll('[data-mx-colimg-remove]').forEach(b=>b.addEventListener('click',()=>removeImage(b.dataset.mxColimgRemove)));setTimeout(ensureConfigured,500)}
+  window.mxGetCollectivePdfAssets=async()=>{const remote=await pullRemote({quiet:true});return remote||read()};
   window.mxSyncCollectivePdfAssetsFromConfig=()=>pullRemote({quiet:false});
   window.mxRenderCollectiveImagesConfig=()=>{bind();render();setTimeout(()=>pullRemote({quiet:true}),30);return true};
   document.addEventListener('click',e=>{if(e.target.closest?.('[data-view="configuracion"]'))setTimeout(()=>window.mxRenderCollectiveImagesConfig(),120)});
@@ -32467,7 +32735,15 @@ async function savePatient(){
     lastPatientSig=sig;
   }catch(e){console.warn('[PACIENTE][AUTOGUARDADO]',e)}finally{patientBusy=false}
 }
-function schedulePatient(){clearTimeout(patientTimer);patientTimer=setTimeout(savePatient,350)}
+function schedulePatient(){
+  clearTimeout(patientTimer);
+  const run=()=>{
+    const last=Number(window.__mxSalLastInteractionAt||0);
+    if(last&&Date.now()-last<650){patientTimer=setTimeout(run,260);return;}
+    Promise.resolve(savePatient()).catch(()=>{});
+  };
+  patientTimer=setTimeout(run,900)
+}
 let mxCensusPatients=[],mxCensusLoadedAt=0,mxCensusLoadBusy=null;
 async function loadCensusPatients(force=false){
   if(mxCensusLoadBusy)return mxCensusLoadBusy;if(!force&&mxCensusLoadedAt&&Date.now()-mxCensusLoadedAt<45000)return mxCensusPatients;
@@ -32485,15 +32761,26 @@ function ensureCensusStatus(){let e=document.getElementById('mxCensusPatientStat
 function setCensusStatus(p,name=''){const e=ensureCensusStatus();if(!e)return;if(!txt(name)){e.textContent='CENSO: —';e.style.background='';e.style.color='';return}if(!mxCensusLoadedAt){e.textContent='CENSO: CONSULTANDO';e.style.background='#fff7ed';e.style.color='#9a3412';return}if(p){e.textContent='✓ EN CENSO';e.style.background='#dcfce7';e.style.color='#166534'}else{e.textContent='⚠ NO ESTÁ EN CENSO';e.style.background='#fee2e2';e.style.color='#991b1b'}}
 function setFieldValue(id,value){const el=document.getElementById(id);if(!el||value==null||txt(value)==='')return;let v=String(value);if(el.tagName==='SELECT'&&![...el.options].some(o=>o.value===v)){const op=document.createElement('option');op.value=v;op.textContent=v;el.appendChild(op)}if(txt(el.value)!==v){el.value=v;el.dispatchEvent(new Event('change',{bubbles:true}))}}
 function applyCensusPatient(p){if(!p)return false;setFieldValue('salExpedienteJ',p.expediente);setFieldValue('salEdadJ',p.edad);setFieldValue('salSexoJ',p.sexo||p.genero);setFieldValue('salDiagnosticoJ',p.diagnostico);setFieldValue('salCamaJ',p.numeroCama||p.cama);setFieldValue('salServicioJ',p.ultimoServicio||p.servicio||(Array.isArray(p.servicios)?p.servicios[0]:''));setCensusStatus(p,p.nombre);schedulePatient();return true}
-async function censusPatientInput(){const name=val('salPacienteJ');if(!mxCensusLoadedAt)await loadCensusPatients().catch(()=>[]);const p=censusPatientMatch(name);setCensusStatus(p,name);if(p)applyCensusPatient(p)}
+async function censusPatientInput(){
+  const name=val('salPacienteJ');
+  if(!name){setCensusStatus(null,'');return;}
+  if(!mxCensusLoadedAt){
+    setCensusStatus(null,name);
+    // No disparar lectura remota en la misma ventana de tiempo en que el usuario
+    // acaba de cambiar de campo. Cargar después y aplicar solo si el nombre no cambió.
+    setTimeout(()=>{Promise.resolve(loadCensusPatients()).then(()=>{if(val('salPacienteJ')!==name)return;const p=censusPatientMatch(name);setCensusStatus(p,name);if(p)applyCensusPatient(p)}).catch(()=>{});},320);
+    return;
+  }
+  const p=censusPatientMatch(name);setCensusStatus(p,name);if(p)applyCensusPatient(p)
+}
 function bindPatient(){
   const ids=['salPacienteJ','salExpedienteJ','salEdadJ','salSexoJ','salDiagnosticoJ','salCamaJ','salServicioJ','salDosisJ','salUnidadDosisJ','salCadaHorasJ','salDiasTratamientoJ','salMedicoJ','salCedulaJ'];
-  ids.forEach(id=>{const el=document.getElementById(id);if(!el||el.dataset.mxAutoPatient==='1')return;el.dataset.mxAutoPatient='1';el.addEventListener('change',schedulePatient);el.addEventListener('blur',schedulePatient)});
+  ids.forEach(id=>{const el=document.getElementById(id);if(!el||el.dataset.mxAutoPatient==='1')return;el.dataset.mxAutoPatient='1';el.addEventListener('change',schedulePatient)});
   const p=document.getElementById('salPacienteJ');
   if(p&&p.dataset.mxCensusBind!=='1'){
     p.dataset.mxCensusBind='1';
     p.addEventListener('input',()=>{const m=censusPatientMatch(p.value);setCensusStatus(m,p.value)});
-    p.addEventListener('change',censusPatientInput);p.addEventListener('blur',censusPatientInput)
+    p.addEventListener('change',censusPatientInput)
   }
   ensureCensusStatus();
 }
@@ -32957,13 +33244,46 @@ function mergedPatch(selectors,service,by,source,now){const first=selectors[0]||
 async function updateCatalog({patientName,expediente,selectors,service,by,source,now}){const br=branch(),all=await get(`/patient_catalog/${encodeURIComponent(br)}`).catch(()=>null);let profiles=0,treatments=0;if(!all||typeof all!=='object')return{profiles,treatments};for(const[key,p0]of Object.entries(all)){if(!p0||typeof p0!=='object'||!samePatient(p0,patientName,expediente))continue;let changed=false;let raw=p0.tratamientos;let patched=raw;if(Array.isArray(raw)){patched=raw.map(t=>{const s=selectors.find(x=>selectorMatches(t,x));if(!s)return t;changed=true;treatments++;return{...t,...patchFor(s,service,by,source,now),ultimaActualizacion:now}})}else if(raw&&typeof raw==='object'){patched={};for(const[tk,t]of Object.entries(raw)){const s=selectors.find(x=>selectorMatches(t,x));if(s){changed=true;treatments++;patched[tk]={...t,...patchFor(s,service,by,source,now),ultimaActualizacion:now}}else patched[tk]=t}}if(!changed)continue;profiles++;const profilePatch={tratamientos:patched,cierreServicioUltimo:{...mergedPatch(selectors,service,by,source,now),selectors:selectors.map(s=>({folio:txt(folioOf(s)),clave:txt(s?.clave),medicamento:txt(s?.medicamento||s?.descripcion)}))},patientDataUpdatedAt:now,updatedAt:now};await put(`/patient_catalog/${encodeURIComponent(br)}/${encodeURIComponent(key)}`,profilePatch,'PATCH')}return{profiles,treatments}}
 function patchItemContainer(container,selectors,service,by,source,now,fallbackFolio=''){const match=(t,s)=>selectorMatches({...t,folioPacienteAsignado:folioOf(t)||fallbackFolio},s);if(Array.isArray(container)){let changed=0;const value=container.map(t=>{const s=selectors.find(x=>match(t,x));if(!s)return t;changed++;return{...t,...patchFor(s,service,by,source,now)}});return{value,changed}}if(container&&typeof container==='object'){let changed=0,value={};for(const[k,t]of Object.entries(container)){const s=selectors.find(x=>match(t,x));if(s){changed++;value[k]={...t,...patchFor(s,service,by,source,now)}}else value[k]=t}return{value,changed}}return{value:container,changed:0}}
 async function updateOrdersRoot(root,{patientName,expediente,selectors,service,by,source,now}){const br=branch(),data=await get(`/${root}/${encodeURIComponent(br)}`).catch(()=>null);let count=0;if(!data||typeof data!=='object')return count;for(const[id,o0]of Object.entries(data)){if(!o0||typeof o0!=='object'||!samePatient(o0,patientName,expediente)||(!isJustified(o0)&&root==='service_orders'))continue;const matched=selectors.filter(s=>orderMatchesSelector(o0,s));if(!matched.length)continue;const base=mergedPatch(matched,service,by,source,now),of=folioOf(o0),ip=patchItemContainer(o0.items,matched,service,by,source,now,of),ap=patchItemContainer(o0.approvedItems,matched,service,by,source,now,of),allItems=[...(Array.isArray(o0.items)?o0.items:Object.values(o0.items||{})),...(Array.isArray(o0.approvedItems)?o0.approvedItems:Object.values(o0.approvedItems||{}))].filter(Boolean),allMatched=!allItems.length||allItems.every(it=>matched.some(s=>selectorMatches({...it,folioPacienteAsignado:folioOf(it)||of},s))),payload=allMatched?{...base}:{updatedAt:now,cierreServicioTratamientos:matched.map(s=>({...patchFor(s,service,by,source,now)}))};if(ip.changed)payload.items=ip.value;if(ap.changed)payload.approvedItems=ap.value;await put(`/${root}/${encodeURIComponent(br)}/${encodeURIComponent(id)}`,payload,'PATCH').catch(()=>{});count++}return count}
-async function updateLocalStore(store,{patientName,expediente,selectors,service,by,source,now}){if(typeof window.idbAll!=='function'||typeof window.idbPut!=='function')return 0;const rows=await window.idbAll(store).catch(()=>[]),pn=norm(patientName),pe=norm(expediente);let count=0;for(const r of rows||[]){if(!r||!isJustified(r)||norm(r.paciente||r.nombrePaciente)!==pn)continue;const re=norm(r.expediente);if(pe&&re&&pe!==re)continue;const s=selectors.find(x=>selectorMatches(r,x));if(!s)continue;const close=patchFor(s,service,by,source,now),previous=norm(r.observaciones||r.observacion)==='CERRADO'?txt(r.observaciones_previas_cierre):txt(r.observaciones_previas_cierre||r.observaciones||r.observacion),u={...r,...close,observaciones_previas_cierre:previous,observaciones:'CERRADO',observacion:'CERRADO',estado_colectivo:'CERRADO',cierre_servicio:true,cierre_servicio_estado:'CERRADO',estado_cierre_servicio:'CERRADO_SERVICIO',estado_tratamiento:'CERRADO',tratamiento_activo:false,servicio_cierre_nombre:service,servicio_cerrado_por:by,servicio_cerrado_at:now,cierre_servicio_por:by,cierre_servicio_at:now,cierre_servicio_folio:txt(folioOf(s)),cierre_servicio_medicamento:txt(s?.clave||s?.medicamento||s?.descripcion),observacion_pdf_servicio:close.observacionPdfServicio,mx_cierre_sync_at:now,updatedAt:now};await window.idbPut(store,u).catch(()=>{});if(store==='salidas')try{window.mxPushSalidaHistCache?.(u)}catch(_e){}count++}return count}
+async function updateLocalStore(store,{patientName,expediente,selectors,service,by,source,now}){if(typeof window.idbAll!=='function'||typeof window.idbPut!=='function')return 0;const rows=await window.idbAll(store).catch(()=>[]),pn=norm(patientName),pe=norm(expediente),pending=[];for(const r of rows||[]){if(!r||!isJustified(r)||norm(r.paciente||r.nombrePaciente)!==pn)continue;const re=norm(r.expediente);if(pe&&re&&pe!==re)continue;const s=selectors.find(x=>selectorMatches(r,x));if(!s)continue;const close=patchFor(s,service,by,source,now),previous=norm(r.observaciones||r.observacion)==='CERRADO'?txt(r.observaciones_previas_cierre):txt(r.observaciones_previas_cierre||r.observaciones||r.observacion),u={...r,...close,observaciones_previas_cierre:previous,observaciones:'CERRADO',observacion:'CERRADO',estado_colectivo:'CERRADO',cierre_servicio:true,cierre_servicio_estado:'CERRADO',estado_cierre_servicio:'CERRADO_SERVICIO',estado_tratamiento:'CERRADO',tratamiento_activo:false,servicio_cierre_nombre:service,servicio_cerrado_por:by,servicio_cerrado_at:now,cierre_servicio_por:by,cierre_servicio_at:now,cierre_servicio_folio:txt(folioOf(s)),cierre_servicio_medicamento:txt(s?.clave||s?.medicamento||s?.descripcion),observacion_pdf_servicio:close.observacionPdfServicio,mx_cierre_sync_at:now,updatedAt:now};pending.push(u)}for(let i=0;i<pending.length;i+=24){const batch=pending.slice(i,i+24);await Promise.allSettled(batch.map(u=>window.idbPut(store,u)));if(store==='salidas')for(const u of batch)try{window.mxPushSalidaHistCache?.(u)}catch(_e){}await new Promise(resolve=>setTimeout(resolve,0));}return pending.length}
 async function updatePublished({patientName,expediente,selectors,service,by,source,now}){const br=branch(),base=`/antibiotic_patient_list/${encodeURIComponent(br)}`,node=await get(base).catch(()=>null),patients=Array.isArray(node?.patients)?node.patients:[];let count=0;for(let pi=0;pi<patients.length;pi++){const p=patients[pi];if(!samePatient(p,patientName,expediente))continue;let patientCount=0;const ts=Array.isArray(p?.tratamientos)?p.tratamientos:[];for(let ti=0;ti<ts.length;ti++){const s=selectors.find(x=>selectorMatches(ts[ti],x));if(!s)continue;await put(`${base}/patients/${pi}/tratamientos/${ti}`,patchFor(s,service,by,source,now),'PATCH').catch(()=>{});count++;patientCount++}if(patientCount)await put(`${base}/patients/${pi}`,{updatedAt:now},'PATCH').catch(()=>{})}return count}
 async function updatePublishedHistory({patientName,expediente,selectors,service,by,source,now}){const br=branch(),base=`/antibiotic_patient_history/${encodeURIComponent(br)}`,node=await get(base).catch(()=>null),patients=node?.patients&&typeof node.patients==='object'?node.patients:{};let count=0;for(const[pk,p]of Object.entries(patients)){if(!samePatient(p,patientName,expediente))continue;const items=Array.isArray(p?.items)?p.items:[];for(let i=0;i<items.length;i++){const s=selectors.find(x=>selectorMatches(items[i],x));if(!s)continue;const close=patchFor(s,service,by,source,now);await put(`${base}/patients/${encodeURIComponent(pk)}/items/${i}`,{...close,observaciones:'CERRADO',observacion:'CERRADO'},'PATCH').catch(()=>{});count++}}return count}
 async function bumpVersions(source,now){const br=branch(),v=Date.now();await Promise.allSettled([put(`/sync_versions/${encodeURIComponent(br)}/patients`,{v,updatedAt:now,source},'PUT'),put(`/sync_versions/${encodeURIComponent(br)}/orders`,{v:v+1,updatedAt:now,source},'PUT'),put(`/sync_versions/${encodeURIComponent(br)}/pharmacovigilance`,{v:v+2,updatedAt:now,source},'PUT')]);try{window.dispatchEvent(new CustomEvent('mx-operational-sync',{detail:{changed:['patients','orders','pharmacovigilance'],source,at:v}}))}catch(_e){}}
 function legacyClosed(r={}){const st=norm(r.cierreServicioEstado||r.cierre_servicio_estado||r.estadoCierreServicio||r.estado_cierre_servicio||r.estadoTratamiento||r.estado_tratamiento);return r.cierreServicio===true||r.cierre_servicio===true||r.tratamientoActivo===false||r.tratamiento_activo===false||['CERRADO','CERRADO_SERVICIO','CERRADO POR SERVICIO','CLOSED','CLOSED_SERVICE'].includes(st)}
 async function repairExistingPrincipalClosures(){if(typeof window.idbAll!=='function'||typeof window.idbPut!=='function')return 0;const now=new Date().toISOString();let changed=0;for(const store of ['salidas','antibioticos']){const rows=await window.idbAll(store).catch(()=>[]);for(const r of rows||[]){if(!r||!isJustified(r)||!legacyClosed(r)||norm(r.observaciones||r.observacion)==='CERRADO')continue;const previous=txt(r.observaciones_previas_cierre||r.observaciones||r.observacion),u={...r,observaciones_previas_cierre:previous,observaciones:'CERRADO',observacion:'CERRADO',estado_colectivo:'CERRADO',updatedAt:txt(r.updatedAt)||now};await window.idbPut(store,u).catch(()=>{});if(store==='salidas')try{window.mxPushSalidaHistCache?.(u)}catch(_e){}changed++}}if(changed){try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true}catch(_e){}try{await window.__mxPersistAllNow?.()}catch(_e){}try{if(typeof window.mxSincronizarVisorFirebase==='function')await window.mxSincronizarVisorFirebase()}catch(_e){}await bumpVersions('MIGRACION_CIERRE_PRINCIPAL_V157',now);try{await window.drawSalidas?.()}catch(_e){}}return changed}
-window.mxPrincipalCloseJustifiedTreatments=async opts=>{const patientName=txt(opts?.patientName),expediente=txt(opts?.expediente),selectors=(Array.isArray(opts?.selectors)?opts.selectors:[]).filter(s=>txt(folioOf(s))||medKeys(s).size);if(!patientName)throw Error('Falta el nombre del paciente.');if(!selectors.length)throw Error('No se identificó el colectivo o medicamento a cerrar.');const now=new Date().toISOString(),service=txt(opts?.service||'FARMACIA').toUpperCase()||'FARMACIA',by=currentUser(),source=txt(opts?.source||'SISTEMA_PRINCIPAL_CIERRE');const [catalog,orders,responses,localSalidas,localAntibioticos]=await Promise.all([updateCatalog({patientName,expediente,selectors,service,by,source,now}),updateOrdersRoot('service_orders',{patientName,expediente,selectors,service,by,source,now}),updateOrdersRoot('service_order_responses',{patientName,expediente,selectors,service,by,source,now}),updateLocalStore('salidas',{patientName,expediente,selectors,service,by,source,now}),updateLocalStore('antibioticos',{patientName,expediente,selectors,service,by,source,now})]);try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true}catch(_e){}try{await window.__mxPersistAllNow?.()}catch(_e){}/* El Principal vuelve a publicar su snapshot ya corregido y después se refuerza el estado remoto. */try{if(typeof window.mxSincronizarVisorFirebase==='function')await window.mxSincronizarVisorFirebase()}catch(e){console.warn('[CJ CIERRE] publicación pacientes',e?.message||e)}const [published,history]=await Promise.all([updatePublished({patientName,expediente,selectors,service,by,source,now}).catch(()=>0),updatePublishedHistory({patientName,expediente,selectors,service,by,source,now}).catch(()=>0)]);await bumpVersions(source,now);try{window.dispatchEvent(new CustomEvent('mx-salidas-history-updated',{detail:{patientName,expediente,selectors,estado:'CERRADO',service,by,source,at:now}}))}catch(_e){}return{ok:true,treatmentsClosed:catalog.treatments,profilesUpdated:catalog.profiles,ordersUpdated:orders,responsesUpdated:responses,localRowsUpdated:localSalidas,localAntibioticosUpdated:localAntibioticos,publishedUpdated:published,historyUpdated:history,service,by,at:now,patch:mergedPatch(selectors,service,by,source,now)}};
+async function closeBulkGroupsV230(groups=[],opts={}){
+  const valid=(Array.isArray(groups)?groups:[]).map(g=>({patientName:txt(g?.patientName),expediente:txt(g?.expediente),selectors:(Array.isArray(g?.selectors)?g.selectors:[]).filter(s=>txt(folioOf(s))||medKeys(s).size)})).filter(g=>g.patientName&&g.selectors.length);
+  if(!valid.length)return{ok:true,treatmentsClosed:0,patients:0};
+  const now=new Date().toISOString(),service=txt(opts?.service||'FARMACIA').toUpperCase()||'FARMACIA',by=currentUser(),source=txt(opts?.source||'SISTEMA_PRINCIPAL_CIERRE_MASIVO_V230'),br=branch();
+  const patientGroups=new Map();for(const g of valid){const k=norm(g.patientName),a=patientGroups.get(k)||[];a.push(g);patientGroups.set(k,a)}
+  const matchGroup=r=>{const list=patientGroups.get(norm(r?.paciente||r?.nombrePaciente||r?.nombre||r?.patient))||[];return list.find(g=>samePatient(r,g.patientName,g.expediente))||null};
+  const [catalog,orders,responses,salidas,antibioticos]=await Promise.all([
+    get(`/patient_catalog/${encodeURIComponent(br)}`).catch(()=>({})),
+    get(`/service_orders/${encodeURIComponent(br)}`).catch(()=>({})),
+    get(`/service_order_responses/${encodeURIComponent(br)}`).catch(()=>({})),
+    typeof window.idbAll==='function'?window.idbAll('salidas').catch(()=>[]):Promise.resolve([]),
+    typeof window.idbAll==='function'?window.idbAll('antibioticos').catch(()=>[]):Promise.resolve([])
+  ]);
+  const catalogPatch={},orderPatch={},responsePatch={},localSal=[],localAb=[];let treatments=0,profiles=0,ordersN=0,responsesN=0;
+  for(const[key,p0]of Object.entries(catalog||{})){
+    if(!p0||typeof p0!=='object')continue;const g=matchGroup(p0);if(!g)continue;let changed=false,raw=p0.tratamientos,patched=raw;
+    if(Array.isArray(raw)){patched=raw.map(t=>{const s=g.selectors.find(x=>selectorMatches(t,x));if(!s)return t;changed=true;treatments++;return{...t,...patchFor(s,service,by,source,now),ultimaActualizacion:now}})}
+    else if(raw&&typeof raw==='object'){patched={};for(const[tk,t]of Object.entries(raw)){const s=g.selectors.find(x=>selectorMatches(t,x));if(s){changed=true;treatments++;patched[tk]={...t,...patchFor(s,service,by,source,now),ultimaActualizacion:now}}else patched[tk]=t}}
+    if(!changed)continue;profiles++;catalogPatch[key]={...p0,tratamientos:patched,cierreServicioUltimo:{...mergedPatch(g.selectors,service,by,source,now),selectors:g.selectors.map(s=>({folio:txt(folioOf(s)),clave:txt(s?.clave),medicamento:txt(s?.medicamento||s?.descripcion)}))},patientDataUpdatedAt:now,updatedAt:now};
+  }
+  const patchOrders=(data,out,isOrders)=>{for(const[id,o0]of Object.entries(data||{})){if(!o0||typeof o0!=='object')continue;const g=matchGroup(o0);if(!g|| (isOrders&&!isJustified(o0)))continue;const matched=g.selectors.filter(s=>orderMatchesSelector(o0,s));if(!matched.length)continue;const base=mergedPatch(matched,service,by,source,now),of=folioOf(o0),ip=patchItemContainer(o0.items,matched,service,by,source,now,of),ap=patchItemContainer(o0.approvedItems,matched,service,by,source,now,of),allItems=[...(Array.isArray(o0.items)?o0.items:Object.values(o0.items||{})),...(Array.isArray(o0.approvedItems)?o0.approvedItems:Object.values(o0.approvedItems||{}))].filter(Boolean),allMatched=!allItems.length||allItems.every(it=>matched.some(s=>selectorMatches({...it,folioPacienteAsignado:folioOf(it)||of},s))),payload=allMatched?{...o0,...base}:{...o0,updatedAt:now,cierreServicioTratamientos:matched.map(s=>({...patchFor(s,service,by,source,now)}))};if(ip.changed)payload.items=ip.value;if(ap.changed)payload.approvedItems=ap.value;out[id]=payload;if(isOrders)ordersN++;else responsesN++}}
+  patchOrders(orders,orderPatch,true);patchOrders(responses,responsePatch,false);
+  const patchLocal=(rows,out)=>{for(const r of rows||[]){if(!r||!isJustified(r))continue;const g=matchGroup(r);if(!g)continue;const s=g.selectors.find(x=>selectorMatches(r,x));if(!s)continue;const close=patchFor(s,service,by,source,now),previous=norm(r.observaciones||r.observacion)==='CERRADO'?txt(r.observaciones_previas_cierre):txt(r.observaciones_previas_cierre||r.observaciones||r.observacion);out.push({...r,...close,observaciones_previas_cierre:previous,observaciones:'CERRADO',observacion:'CERRADO',estado_colectivo:'CERRADO',cierre_servicio:true,cierre_servicio_estado:'CERRADO',estado_cierre_servicio:'CERRADO_SERVICIO',estado_tratamiento:'CERRADO',tratamiento_activo:false,servicio_cierre_nombre:service,servicio_cerrado_por:by,servicio_cerrado_at:now,cierre_servicio_por:by,cierre_servicio_at:now,cierre_servicio_folio:txt(folioOf(s)),cierre_servicio_medicamento:txt(s?.clave||s?.medicamento||s?.descripcion),observacion_pdf_servicio:close.observacionPdfServicio,mx_cierre_sync_at:now,updatedAt:now})}}
+  patchLocal(salidas,localSal);patchLocal(antibioticos,localAb);
+  const chunks=(obj,size=24)=>{const e=Object.entries(obj||{}),out=[];for(let i=0;i<e.length;i+=size)out.push(Object.fromEntries(e.slice(i,i+size)));return out};
+  for(const [path,obj] of [[`/patient_catalog/${encodeURIComponent(br)}`,catalogPatch],[`/service_orders/${encodeURIComponent(br)}`,orderPatch],[`/service_order_responses/${encodeURIComponent(br)}`,responsePatch]])for(const part of chunks(obj,24)){await put(path,part,'PATCH');await new Promise(r=>setTimeout(r,0))}
+  if(typeof window.idbPut==='function')for(const [store,list] of [['salidas',localSal],['antibioticos',localAb]])for(let i=0;i<list.length;i+=48){const batch=list.slice(i,i+48);await Promise.allSettled(batch.map(u=>window.idbPut(store,u)));if(store==='salidas')for(const u of batch)try{window.mxPushSalidaHistCache?.(u)}catch(_e){}await new Promise(r=>setTimeout(r,0))}
+  try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true}catch(_e){}
+  return{ok:true,treatmentsClosed:Math.max(treatments,valid.reduce((n,g)=>n+g.selectors.length,0)),profilesUpdated:profiles,ordersUpdated:ordersN,responsesUpdated:responsesN,localRowsUpdated:localSal.length,localAntibioticosUpdated:localAb.length,patients:valid.length,service,by,at:now,source};
+}
+window.mxPrincipalCloseJustifiedTreatmentsBulkV230=async opts=>closeBulkGroupsV230(opts?.groups||[],opts||{});
+
+window.mxPrincipalCloseJustifiedTreatments=async opts=>{const patientName=txt(opts?.patientName),expediente=txt(opts?.expediente),selectors=(Array.isArray(opts?.selectors)?opts.selectors:[]).filter(s=>txt(folioOf(s))||medKeys(s).size),deferHeavySync=opts?.deferHeavySync===true;if(!patientName)throw Error('Falta el nombre del paciente.');if(!selectors.length)throw Error('No se identificó el colectivo o medicamento a cerrar.');const now=new Date().toISOString(),service=txt(opts?.service||'FARMACIA').toUpperCase()||'FARMACIA',by=currentUser(),source=txt(opts?.source||'SISTEMA_PRINCIPAL_CIERRE');const [catalog,orders,responses,localSalidas,localAntibioticos]=await Promise.all([updateCatalog({patientName,expediente,selectors,service,by,source,now}),updateOrdersRoot('service_orders',{patientName,expediente,selectors,service,by,source,now}),updateOrdersRoot('service_order_responses',{patientName,expediente,selectors,service,by,source,now}),updateLocalStore('salidas',{patientName,expediente,selectors,service,by,source,now}),updateLocalStore('antibioticos',{patientName,expediente,selectors,service,by,source,now})]);try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true}catch(_e){}let published=0,history=0;if(!deferHeavySync){try{await window.__mxPersistAllNow?.()}catch(_e){}try{if(typeof window.mxSincronizarVisorFirebase==='function')await window.mxSincronizarVisorFirebase()}catch(e){console.warn('[CJ CIERRE] publicación pacientes',e?.message||e)}[published,history]=await Promise.all([updatePublished({patientName,expediente,selectors,service,by,source,now}).catch(()=>0),updatePublishedHistory({patientName,expediente,selectors,service,by,source,now}).catch(()=>0)]);await bumpVersions(source,now);try{window.dispatchEvent(new CustomEvent('mx-salidas-history-updated',{detail:{patientName,expediente,selectors,estado:'CERRADO',service,by,source,at:now}}))}catch(_e){}}return{ok:true,treatmentsClosed:catalog.treatments,profilesUpdated:catalog.profiles,ordersUpdated:orders,responsesUpdated:responses,localRowsUpdated:localSalidas,localAntibioticosUpdated:localAntibioticos,publishedUpdated:published,historyUpdated:history,service,by,at:now,deferHeavySync,patch:mergedPatch(selectors,service,by,source,now)}};
+window.mxPrincipalFinalizeJustifiedClosures=async(source='SISTEMA_PRINCIPAL_CIERRE_MASIVO')=>{const now=new Date().toISOString();try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true}catch(_e){}/* No bloquear la interfaz esperando una publicación completa. Los cierres ya quedaron en IDB/Firebase; la consolidación pesada continúa en segundo plano. */setTimeout(()=>{Promise.resolve(window.__mxPersistAllNow?.()).catch(()=>{});setTimeout(()=>{Promise.resolve(window.mxSincronizarVisorFirebase?.()).catch(e=>console.warn('[CJ CIERRE MASIVO] publicación diferida',e?.message||e))},120)},0);await bumpVersions(source,now);try{window.dispatchEvent(new CustomEvent('mx-salidas-history-updated',{detail:{estado:'CERRADO',source,at:now,bulk:true}}))}catch(_e){}return{ok:true,at:now,backgroundSync:true}};
 window.mxRepairExistingPrincipalClosuresV157=repairExistingPrincipalClosures;setTimeout(()=>repairExistingPrincipalClosures().catch(e=>console.warn('[CJ CIERRE v157] reparación previa',e?.message||e)),5200);
 })();
 (()=>{'use strict';
@@ -33392,33 +33712,7 @@ window.MX_VALE_PDF_DEFAULT_ASSETS={"collective":"data:image/png;base64,iVBORw0KG
       }
       const pack = await lastValeRows();
       const logos = typeof mxOrderPdfLogos==='function' ? await mxOrderPdfLogos() : {};
-      try{
-        const embedded=window.MX_VALE_PDF_DEFAULT_ASSETS||{};
-        if(!logos.collective&&embedded.collective)logos.collective=embedded.collective;
-        if(!logos.left&&embedded.left)logos.left=embedded.left;
-        if(!logos.right&&embedded.right)logos.right=embedded.right;
-        if(!logos.footer&&embedded.footer)logos.footer=embedded.footer;
-        const defaults = (typeof MX_ORDER_PDF_LOGOS!=='undefined' && MX_ORDER_PDF_LOGOS) ? MX_ORDER_PDF_LOGOS : {left:'../img/formatos/logo_izquierdo.png',right:'../img/formatos/logo_derecho.png',collective:'../img/formatos/logo_colectivo.png',footer:'../img/formatos/logo_footer.png'};
-        if((!logos.left || !logos.right || !logos.footer) && typeof mxOrderPdfLoadImage==='function'){
-          if(!logos.left) logos.left = await mxOrderPdfLoadImage(defaults.left);
-          if(!logos.right) logos.right = await mxOrderPdfLoadImage(defaults.right);
-          if(!logos.footer) logos.footer = await mxOrderPdfLoadImage(defaults.footer);
-        }
-        if((!logos.collectiveLeft || !logos.collectiveRight) && logos.collective && typeof mxOrderPdfSplitCollectiveHeader==='function'){
-          const split = await mxOrderPdfSplitCollectiveHeader(logos.collective);
-          logos.collectiveLeft = logos.collectiveLeft || split.left || '';
-          logos.collectiveRight = logos.collectiveRight || split.right || '';
-        }
-        if((!logos.left || !logos.right) && typeof mxOrderPdfLoadImage==='function'){
-          const collective = logos.collective || await mxOrderPdfLoadImage(defaults.collective);
-          logos.collective = collective || logos.collective || '';
-          if(collective && typeof mxOrderPdfSplitCollectiveHeader==='function'){
-            const split = await mxOrderPdfSplitCollectiveHeader(collective);
-            logos.left = logos.left || split.left || '';
-            logos.right = logos.right || split.right || '';
-          }
-        }
-      }catch(_e){}
+      // Logos ya leídos de Configuración por mxOrderPdfLogos; no insertar archivos fijos.
       const {jsPDF}=window.jspdf;
       const doc=new jsPDF({orientation:'portrait',unit:'mm',format:'letter'});
       drawValeCopy(doc,pack,logos,8);
@@ -33467,7 +33761,7 @@ const NORM=v=>TXT(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase
 const ESC=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const BRANCH=()=>{try{return TXT(window.mxGetSucursalFromLicense?.()||'HGAM').toUpperCase()||'HGAM'}catch(_e){return'HGAM'}};
 const USER=()=>{try{return TXT(window.getLoggedUserLabel?.()||window.currentUser?.fullName||window.currentUser?.username||'ADMIN')||'ADMIN'}catch(_e){return'ADMIN'}};
-let previewRows=[],previewMeta=null,busy=false;
+let previewRows=[],previewMeta=null,busy=false,scanSourceCache={at:0,branch:'',published:null,salidas:[]};
 function localDateKey(d=new Date()){const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');return`${y}-${m}-${day}`}
 function parseStamp(v){if(v==null||v==='')return 0;if(v instanceof Date)return Number.isFinite(v.getTime())?v.getTime():0;if(typeof v==='number'){if(v>1e12)return v;if(v>1e9)return v*1000}const s=TXT(v);if(!s)return 0;let n=Date.parse(s);if(Number.isFinite(n))return n;let m=s.match(/^(\d{1,2})[\/-](\d{1,2})[\/-](\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);if(m){n=new Date(Number(m[3]),Number(m[2])-1,Number(m[1]),Number(m[4]||0),Number(m[5]||0),Number(m[6]||0)).getTime();return Number.isFinite(n)?n:0}return 0}
 function fmtStamp(ms){if(!ms)return'SIN REGISTRO';try{return new Date(ms).toLocaleString('es-MX',{dateStyle:'short',timeStyle:'short'})}catch(_e){return new Date(ms).toLocaleString()}}
@@ -33484,15 +33778,16 @@ function mapGet(map,patient,folio,med){let best=0;for(const k of keys(patient,fo
 async function READ(path){if(typeof window.mxGetJson!=='function')throw Error('Firebase no disponible.');return await window.mxGetJson(path)}
 async function WRITE(path,data){if(typeof window.mxPublishJson!=='function')return false;return await window.mxPublishJson(path,data,'PUT')}
 async function localSalidas(){if(typeof window.idbAll!=='function')return[];try{return await window.idbAll('salidas')||[]}catch(_e){return[]}}
+async function scanSources(br,force=false){const now=Date.now();if(!force&&scanSourceCache.branch===br&&now-scanSourceCache.at<20000)return scanSourceCache;const[published,salidas]=await Promise.all([READ(`/antibiotic_patient_list/${encodeURIComponent(br)}`).catch(()=>null),localSalidas()]);scanSourceCache={at:now,branch:br,published,salidas:Array.isArray(salidas)?salidas:[]};return scanSourceCache}
 function orderActivity(raw={}){const m=new Map();for(const o of Object.values(raw||{})){if(!o||typeof o!=='object'||!sameJustified(o))continue;const patient=TXT(o.paciente||o.nombrePaciente),folio=folioOf(o),items=Array.isArray(o.items)?o.items:Object.values(o.items||{});for(const it of items.length?items:[{}]){const med=medOf(it)||medOf(o),ms=orderStamp(o,it);mapPut(m,patient,folio,med,ms)}}return m}
 function dispenseActivity(rows=[]){const m=new Map();for(const r of rows||[]){if(!r||typeof r!=='object'||!sameJustified(r))continue;const patient=TXT(r.paciente||r.nombrePaciente),folio=folioOf(r),med=medOf(r),ms=dispenseStamp(r);mapPut(m,patient,folio,med,ms)}return m}
 function extractTreatments(p={}){return Array.isArray(p.tratamientos)?p.tratamientos:(p.tratamientos&&typeof p.tratamientos==='object'?Object.values(p.tratamientos):[])}
 async function scan(criteria){
   if(busy)throw Error('Ya hay una revisión en curso.');busy=true;setStatus('Consultando colectivos abiertos…','info');
   try{
-    const br=BRANCH(),[catalog,orders,salidas]=await Promise.all([READ(`/patient_catalog/${encodeURIComponent(br)}`),READ(`/service_orders/${encodeURIComponent(br)}`).catch(()=>null),localSalidas()]);
-    const om=orderActivity(orders&&typeof orders==='object'?orders:{}),dm=dispenseActivity(salidas),group=new Map();
-    for(const [profileKey,p] of Object.entries(catalog&&typeof catalog==='object'?catalog:{})){
+    const br=BRANCH(),src=await scanSources(br,false),published=src.published,salidas=src.salidas;
+    let entries=[],orders=null;if(Array.isArray(published?.patients)&&published.patients.length){entries=published.patients.map((p,i)=>[`PUB_${i}`,p]);setStatus(`Revisando ${entries.length} pacientes publicados…`,'info');}else{setStatus('La lista compacta no está disponible; usando catálogo completo…','info');const[catalog,fallbackOrders]=await Promise.all([READ(`/patient_catalog/${encodeURIComponent(br)}`).catch(()=>null),READ(`/service_orders/${encodeURIComponent(br)}`).catch(()=>null)]);entries=Object.entries(catalog&&typeof catalog==='object'?catalog:{});orders=fallbackOrders;}const om=orders&&typeof orders==='object'?orderActivity(orders):new Map(),dm=dispenseActivity(salidas),group=new Map();let scanIndex=0;
+    for(const [profileKey,p] of entries){if((++scanIndex)%80===0)await new Promise(resolve=>setTimeout(resolve,0));
       if(!p||typeof p!=='object')continue;const patient=TXT(p.nombre||p.paciente),exp=TXT(p.expediente);if(!patient)continue;
       for(const t of extractTreatments(p)){if(!t||typeof t!=='object'||isClosed(t))continue;const folio=folioOf(t),med=medOf(t);if(!folio&&!med)continue;const lastDisp=mapGet(dm,patient,folio,med),lastReq=Math.max(treatmentStamp(t),mapGet(om,patient,folio,med));let candidate=false,reference=0;
         if(criteria.mode==='today'){candidate=lastDisp<criteria.cutoffMs;reference=lastDisp||lastReq}
@@ -33517,7 +33812,17 @@ function mount(){style();const host=document.getElementById('mxOperationalContro
 function alertMsg(msg){try{return typeof window.mxAlert==='function'?window.mxAlert(msg):window.alert(msg)}catch(_e){}}
 async function confirmMsg(msg){try{return typeof window.mxConfirm==='function'?await window.mxConfirm(msg):window.confirm(msg)}catch(_e){return false}}
 function showPreview(rows){document.getElementById('mxCjCleanModal')?.remove();if(!rows.length)return alertMsg('No hay colectivos justificados abiertos que cumplan el criterio seleccionado.');const modal=document.createElement('div');modal.id='mxCjCleanModal';modal.className='mx-cj-clean-modal';modal.innerHTML=`<div class="mx-cj-clean-card"><div class="mx-cj-clean-head"><h3>🔒 Vista previa · cierre de colectivos justificados</h3><p>${ESC(previewMeta?.label||'')} · ${rows.length} tratamiento(s) abierto(s). Desmarca cualquier registro que quieras conservar abierto.</p></div><div class="mx-cj-clean-toolbar"><button class="btn" id="mxCjSelectAll" type="button">✓ Seleccionar todos</button><button class="btn" id="mxCjSelectNone" type="button">Quitar selección</button><span class="badge" id="mxCjSelectedCount">${rows.length} seleccionados</span></div><div class="mx-cj-clean-list">${rows.map((r,i)=>`<label class="mx-cj-clean-row"><input type="checkbox" data-mx-cj-clean-index="${i}" checked><div><b>${ESC(r.patient)}</b><br><small>Exp: ${ESC(r.expediente||'—')}</small></div><div><b>Folio</b><br>${ESC(r.folio||'SIN FOLIO')}</div><div><b>${ESC(r.clave||'SIN CLAVE')}</b><br><small>${ESC(r.medicamento||'Medicamento')}</small></div><div><b>Último surtido</b><br>${ESC(fmtStamp(r.lastDispenseMs))}<br><small>Última solicitud: ${ESC(fmtStamp(r.lastRequestMs))}</small></div></label>`).join('')}</div><div class="mx-cj-clean-foot"><div class="mx-cj-clean-progress" id="mxCjCleanProgress">No se ha realizado ningún cambio.</div><div style="display:flex;gap:8px"><button class="btn" id="mxCjCleanCancel" type="button">Cancelar</button><button class="btn danger" id="mxCjCleanConfirm" type="button">🔒 Cerrar seleccionados</button></div></div></div>`;document.body.appendChild(modal);const checks=()=>[...modal.querySelectorAll('[data-mx-cj-clean-index]')],upd=()=>{const n=checks().filter(x=>x.checked).length;modal.querySelector('#mxCjSelectedCount').textContent=`${n} seleccionado${n===1?'':'s'}`;modal.querySelector('#mxCjCleanConfirm').textContent=`🔒 Cerrar seleccionados (${n})`;modal.querySelector('#mxCjCleanConfirm').disabled=n===0||busy};checks().forEach(x=>x.addEventListener('change',upd));modal.querySelector('#mxCjSelectAll').onclick=()=>{checks().forEach(x=>x.checked=true);upd()};modal.querySelector('#mxCjSelectNone').onclick=()=>{checks().forEach(x=>x.checked=false);upd()};modal.querySelector('#mxCjCleanCancel').onclick=()=>{if(!busy)modal.remove()};modal.onclick=e=>{if(e.target===modal&&!busy)modal.remove()};modal.querySelector('#mxCjCleanConfirm').onclick=()=>closeSelected(modal);upd()}
-async function closeSelected(modal){if(busy)return;const selected=[...modal.querySelectorAll('[data-mx-cj-clean-index]:checked')].map(x=>previewRows[Number(x.dataset.mxCjCleanIndex)]).filter(Boolean);if(!selected.length)return;const patients=new Map();for(const r of selected){const k=`${NORM(r.patient)}|${NORM(r.expediente)}`,g=patients.get(k)||{patientName:r.patient,expediente:r.expediente,profileKeys:[],selectors:[]};g.profileKeys.push(...(r.profileKeys||[]));g.selectors.push({clave:r.clave,medicamento:r.medicamento,folio:r.folio});patients.set(k,g)}const ok=await confirmMsg(`¿Cerrar ${selected.length} colectivo(s) justificado(s)?\n\nCriterio: ${previewMeta?.label||''}\nPacientes afectados: ${patients.size}\n\nSe marcarán como CERRADO POR EL SERVICIO FARMACIA. No se eliminarán las Salidas ni el historial.`);if(!ok)return;busy=true;const btn=modal.querySelector('#mxCjCleanConfirm'),cancel=modal.querySelector('#mxCjCleanCancel'),progress=modal.querySelector('#mxCjCleanProgress');btn.disabled=true;cancel.disabled=true;let done=0,failed=0,closed=0;const errors=[];try{if(typeof window.mxPrincipalCloseJustifiedTreatments!=='function')throw Error('El módulo central de cierre no está disponible.');for(const g of patients.values()){progress.textContent=`Cerrando paciente ${done+1} de ${patients.size}: ${g.patientName}…`;try{const r=await window.mxPrincipalCloseJustifiedTreatments({patientName:g.patientName,expediente:g.expediente,profileKeys:[...new Set(g.profileKeys)],selectors:g.selectors,service:'FARMACIA',source:previewMeta?.mode==='today'?'SISTEMA_PRINCIPAL_CONFIG_CIERRE_NO_REGISTRADOS_HOY':'SISTEMA_PRINCIPAL_CONFIG_CIERRE_HASTA_FECHA'});closed+=Number(r?.treatmentsClosed||g.selectors.length)||0}catch(e){failed++;errors.push(`${g.patientName}: ${e?.message||e}`)}done++}const now=new Date().toISOString(),audit={at:now,branch:BRANCH(),by:USER(),criteria:previewMeta?.mode||'',label:previewMeta?.label||'',cutoffMs:previewMeta?.cutoffMs||0,date:previewMeta?.date||'',selected:selected.length,patients:patients.size,closed,failed,errors:errors.slice(0,25),source:'CONFIG_CONTROLES_CIERRE_CJ_V134'};await WRITE(`/collective_closure_admin_audit/${encodeURIComponent(BRANCH())}/${Date.now()}`,audit).catch(()=>{});try{window.mxRefreshCensoRegistro?.()}catch(_e){}try{window.dispatchEvent(new CustomEvent('mx-viewer-refresh-now',{detail:{reason:'CIERRE_CJ_CONFIG_V134',force:true}}))}catch(_e){}setStatus(`Cierre terminado: ${closed} colectivo(s) cerrados${failed?` · ${failed} paciente(s) con error`:''}.`,failed?'warn':'ok');modal.remove();alertMsg(`✅ Cierre terminado.\n\nColectivos cerrados: ${closed}\nPacientes procesados: ${done}\nErrores: ${failed}${errors.length?`\n\n${errors.slice(0,5).join('\n')}`:''}`)}catch(e){progress.textContent='Error: '+(e?.message||e);setStatus('No se pudo completar el cierre: '+(e?.message||e),'bad');btn.disabled=false;cancel.disabled=false}finally{busy=false}}
+async function closeSelected(modal){if(busy)return;const selected=[...modal.querySelectorAll('[data-mx-cj-clean-index]:checked')].map(x=>previewRows[Number(x.dataset.mxCjCleanIndex)]).filter(Boolean);if(!selected.length)return;const patients=new Map();for(const r of selected){const k=`${NORM(r.patient)}|${NORM(r.expediente)}`,g=patients.get(k)||{patientName:r.patient,expediente:r.expediente,profileKeys:[],selectors:[]};g.profileKeys.push(...(r.profileKeys||[]));g.selectors.push({clave:r.clave,medicamento:r.medicamento,folio:r.folio});patients.set(k,g)}const ok=await confirmMsg(`¿Cerrar ${selected.length} colectivo(s) justificado(s)?
+
+Criterio: ${previewMeta?.label||''}
+Pacientes afectados: ${patients.size}
+
+Se marcarán como CERRADO POR EL SERVICIO FARMACIA. No se eliminarán las Salidas ni el historial.`);if(!ok)return;busy=true;const btn=modal.querySelector('#mxCjCleanConfirm'),cancel=modal.querySelector('#mxCjCleanCancel'),progress=modal.querySelector('#mxCjCleanProgress');btn.disabled=true;cancel.disabled=true;let failed=0,closed=0;const errors=[],source=previewMeta?.mode==='today'?'SISTEMA_PRINCIPAL_CONFIG_CIERRE_NO_REGISTRADOS_HOY':'SISTEMA_PRINCIPAL_CONFIG_CIERRE_HASTA_FECHA';try{if(typeof window.mxPrincipalCloseJustifiedTreatmentsBulkV230!=='function')throw Error('El cierre masivo optimizado no está disponible.');progress.textContent=`Aplicando ${selected.length} cierre(s) en un solo lote…`;await new Promise(resolve=>setTimeout(resolve,0));const result=await window.mxPrincipalCloseJustifiedTreatmentsBulkV230({groups:[...patients.values()].map(g=>({...g,profileKeys:[...new Set(g.profileKeys)]})),service:'FARMACIA',source});closed=Number(result?.treatmentsClosed||selected.length)||0;progress.textContent='Cierres guardados. Actualizando versiones; la publicación pesada seguirá en segundo plano…';await window.mxPrincipalFinalizeJustifiedClosures?.(source);scanSourceCache={at:0,branch:'',published:null,salidas:[]};const now=new Date().toISOString(),audit={at:now,branch:BRANCH(),by:USER(),criteria:previewMeta?.mode||'',label:previewMeta?.label||'',cutoffMs:previewMeta?.cutoffMs||0,date:previewMeta?.date||'',selected:selected.length,patients:patients.size,closed,failed,errors,source:'CONFIG_CONTROLES_CIERRE_CJ_V230'};WRITE(`/collective_closure_admin_audit/${encodeURIComponent(BRANCH())}/${Date.now()}`,audit).catch(()=>{});try{window.mxRefreshCensoRegistro?.()}catch(_e){}try{window.dispatchEvent(new CustomEvent('mx-viewer-refresh-now',{detail:{reason:'CIERRE_CJ_CONFIG_V230',force:true}}))}catch(_e){}setStatus(`Cierre terminado: ${closed} colectivo(s) cerrados. La sincronización completa continúa en segundo plano.`,'ok');modal.remove();alertMsg(`✅ Cierre terminado.
+
+Colectivos cerrados: ${closed}
+Pacientes procesados: ${patients.size}
+
+Puedes seguir usando el sistema; la actualización completa de visores continúa en segundo plano.`)}catch(e){failed=1;errors.push(e?.message||String(e));progress.textContent='Error: '+(e?.message||e);setStatus('No se pudo completar el cierre: '+(e?.message||e),'bad');btn.disabled=false;cancel.disabled=false}finally{busy=false}}
 function boot(){if(mount())return;const root=document.body||document.documentElement;if(!root)return;const mo=new MutationObserver(()=>{if(mount())mo.disconnect()});mo.observe(root,{childList:true,subtree:true});setTimeout(()=>{try{mount()}catch(_e){}},900)}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
@@ -33553,13 +33858,18 @@ function qFinanceOf(r={}){
 let kitRows = [];
 let kitEditId = null;
 let kitDraftProducts = [];
+let kitDraftRenderSequenceV261=0;
+let serviceRenderSequenceV261=0;
+let kitDoctorsCatalogV261=[];
+let kitDoctorsFetchedAtV261=0;
+let kitCpmV261=[],kitCpmFetchedAtV261=0,kitCpmPendingV261=null;
 let invCacheV148 = [];
 let invCacheAtV148 = 0;
 let invCatalogV148 = [];
 let invCatalogAtV148 = 0;
 let kitSearchSeqV148 = 0;
 let serviceBusy = false;
-let serviceState = {folio:'', selectedKits:[], doctorId:null, serviceName:'', serviceInitials:''};
+let serviceState = {folio:'', selectedKits:[], doctorId:null, anestId:null, anestCedula:'', serviceName:'', serviceInitials:''};
 let doctorCache = [];
 let doctorCacheAt = 0;
 let serviceHistoryGroups = [];
@@ -33596,6 +33906,7 @@ async function qInventory(force=false){
       try{ if(typeof window.__mxLoadInventory==='function') rows=await window.__mxLoadInventory({force:false,requireRows:false}); }catch(_e){}
     }
   }
+  if(!Array.isArray(rows)){try{rows=await idbAll('inventory');}catch(_e){rows=[];}}
   invCacheV148=Array.isArray(rows)?rows:[];invCacheAtV148=Date.now();
   return invCacheV148.slice();
 }
@@ -33631,7 +33942,7 @@ async function qInventoryCatalog(force=false){
   invCatalogAtV148=Date.now();
   return invCatalogV148;
 }
-async function qAvailabilityMap(){ const rows=await qInventoryCatalog(false),m=new Map(); rows.forEach(r=>m.set(qProdKey(r),r)); return m; }
+async function qAvailabilityMap(force=false){ const rows=await qInventoryCatalog(force),m=new Map(); rows.forEach(r=>m.set(qProdKey(r),r)); return m; }
 
 function injectStyles(){
   if($q('mx-qx-v147-style'))return;
@@ -33646,6 +33957,26 @@ function injectStyles(){
   .mx-qx-picker{position:relative;margin-top:10px}.mx-qx-drop{display:none;position:absolute;left:0;right:0;top:calc(100% + 5px);z-index:500;background:#fff;border:1px solid #cbd5e1;border-radius:12px;box-shadow:0 14px 30px rgba(15,23,42,.18);max-height:260px;overflow:auto}
   .mx-qx-drop-item{padding:9px 10px;border-bottom:1px solid #eef2f7;cursor:pointer}.mx-qx-drop-item:last-child{border-bottom:0}.mx-qx-drop-item:hover{background:#eff6ff}.mx-qx-drop-item b{font-size:12px}.mx-qx-drop-item small{display:block;color:#64748b;margin-top:2px}
   .mx-qx-kit-table{width:100%;border-collapse:collapse;margin-top:10px;font-size:11px}.mx-qx-kit-table th,.mx-qx-kit-table td{border:1px solid #dbe5f3;padding:6px;vertical-align:middle}.mx-qx-kit-table th{background:#eef5ff;text-align:left}.mx-qx-kit-table input{min-width:70px;width:90px}
+  .mx-qx-srv-unified-table .mx-qx-kit-stock-none{background:#fee2e2!important;color:#881337}
+  .mx-qx-srv-unified-table .mx-qx-kit-stock-low{background:#fef3c7!important;color:#92400e}
+  .mx-qx-srv-unified-table .mx-qx-stock-badge{display:inline-block;padding:3px 6px;border:1px solid currentColor;border-radius:7px;font-size:10px;font-weight:900}
+  .mx-qx-srv-stock-notice{margin-top:10px;border:1px solid #fdba74;border-radius:10px;padding:10px 12px;background:#fff7ed;color:#9a3412;font-size:12px;font-weight:800}
+  #mxSurgicalKitsSection .mx-qx-kit-stock-none{background:#fee2e2!important;color:#881337}#mxSurgicalKitsSection .mx-qx-kit-stock-low{background:#fef3c7!important;color:#92400e}
+  #mxSurgicalKitsSection .mx-qx-stock-badge{display:inline-block;font-size:10px;font-weight:900;padding:3px 6px;border:1px solid currentColor;border-radius:7px;white-space:nowrap}
+  #mxSurgicalKitsSection .mx-qx-stock-notice{margin-top:9px;padding:10px 12px;background:#ecfdf5;color:#166534;border:1px solid #bbf7d0;border-radius:10px;font-size:12px;font-weight:800}
+  #mxSurgicalKitsSection .mx-qx-stock-notice.warn{background:#fff7ed;border-color:#fdba74;color:#9a3412}#mxSurgicalKitsSection .mx-qx-stock-notice.bad{background:#fef2f2;border-color:#fca5a5;color:#991b1b}
+  #mxSurgicalKitsSection .mx-qx-kit-manual{margin-top:9px;border:1px dashed #94a3b8;border-radius:10px;padding:8px 10px;font-size:11px;color:#334155}
+  #mxSurgicalKitsSection .mx-qx-kit-manual summary{cursor:pointer;font-weight:800}#mxSurgicalKitsSection .mx-qx-kit-manual small{color:#64748b}
+  #mxSurgicalKitsSection .mx-qx-kit-manual-fields{display:grid;grid-template-columns:minmax(100px,1fr) minmax(180px,1.6fr) auto;gap:7px;align-items:center;margin:8px 0}
+  @media(max-width:850px){#mxSurgicalKitsSection .mx-qx-kit-manual-fields{grid-template-columns:1fr}}
+  #mxSurgicalKitsSection .mx-qx-kit-source-row{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-top:12px}
+  #mxSurgicalKitsSection .mx-qx-kit-source-row label{font-size:11px;font-weight:900}
+  #mxSurgicalKitsSection .mx-qx-kit-source-row select{width:auto;min-width:185px;max-width:100%}
+  #mxSurgicalKitsSection .mx-qx-kit-source-row small{font-size:10px;color:#64748b;flex:1 1 240px}
+  #mxSurgicalKitsSection .mx-qx-kit-extra{display:grid;grid-template-columns:minmax(230px,1fr) minmax(240px,1.4fr);gap:9px;align-items:end;margin-top:9px}
+  #mxSurgicalKitsSection #mxQxKitAnest{width:100%;min-width:0}#mxSurgicalKitsSection .mx-qx-kit-helper{font-size:10px;color:#64748b;margin-top:3px}
+  @media(max-width:850px){#mxSurgicalKitsSection .mx-qx-kit-extra{grid-template-columns:1fr}}
+
   .mx-qx-financial-only{display:none}.mx-financial-on .mx-qx-financial-only{display:table-cell}.mx-qx-fin-summary{display:none;margin-top:8px;padding:8px 10px;border:1px solid #bfdbfe;border-radius:10px;background:#eff6ff;color:#0f4c81;font-weight:900;text-align:right}.mx-financial-on .mx-qx-fin-summary{display:block}.mx-qx-money{white-space:nowrap;font-weight:900;color:#0f4c81}
   .mx-qx-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center}
   #view-salidasrapidas .mx-qx-sr-titlebar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:8px}#view-salidasrapidas .mx-qx-sr-titlebar h3{margin:0}
@@ -33655,9 +33986,10 @@ function injectStyles(){
   .mx-qx-service-card{width:min(1380px,98vw);height:94vh;max-height:94vh;background:#f8fafc;border-radius:18px;box-shadow:0 28px 80px rgba(2,6,23,.32);display:flex;flex-direction:column;overflow:hidden;border:1px solid rgba(255,255,255,.45)}
   .mx-qx-service-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:15px 18px;background:linear-gradient(135deg,#0b4f7d,#123b68);color:#fff}.mx-qx-service-head h3{margin:0;font-size:18px;color:#fff}.mx-qx-service-head small{display:block;margin-top:3px;opacity:.88;color:rgba(255,255,255,.92)}.mx-qx-x{width:42px;height:42px;border:0;border-radius:12px;background:rgba(255,255,255,.16);color:#fff;font-size:25px;font-weight:900;cursor:pointer}
   .mx-qx-service-body{padding:10px 12px;overflow:hidden;display:flex;flex-direction:column;flex:1;min-height:0}.mx-qx-service-sec{background:#fff;border:1px solid #dbe5f3;border-radius:14px;padding:10px 12px;margin-bottom:7px;transition:padding .14s ease,background .14s ease}.mx-qx-service-sec.mx-qx-service-compact{padding:9px 12px}.mx-qx-service-sec h4{margin:0;font-size:13px;color:#0f172a}.mx-qx-sec-head{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;min-height:28px;cursor:pointer;user-select:none}.mx-qx-sec-summary{min-width:0;text-align:right;color:#64748b;font-size:11px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mx-qx-sec-chevron{font-size:15px;font-weight:950;color:#2563eb;transition:transform .15s ease}.mx-qx-service-sec.is-collapsed{padding:7px 12px;background:#fbfdff}.mx-qx-service-sec.is-collapsed .mx-qx-sec-content{display:none}.mx-qx-service-sec.is-collapsed .mx-qx-sec-chevron{transform:rotate(-90deg)}.mx-qx-service-sec:not(.is-collapsed) .mx-qx-sec-content{margin-top:8px}#mxQxSecKits{display:flex;flex-direction:column;flex:1;min-height:300px;margin-bottom:0;overflow:hidden;background:#fff}#mxQxSecKits .mx-qx-sec-head{cursor:default}#mxQxSecKits .mx-qx-sec-content{display:flex;flex-direction:column;flex:1;min-height:0;margin-top:7px}#mxQxSrvSelected{flex:1;min-height:250px;overflow:auto;padding-right:2px;padding-bottom:4px}
-  .mx-qx-doctor-grid{display:grid;grid-template-columns:minmax(220px,1.15fr) 135px 145px minmax(220px,1.15fr) auto;gap:8px;align-items:end}.mx-qx-patient-grid{display:grid;grid-template-columns:minmax(220px,1.5fr) 100px 140px 150px 170px;gap:8px}.mx-qx-relative{position:relative}
+  .mx-qx-doctor-grid{display:grid;grid-template-columns:minmax(220px,1.15fr) 135px 145px minmax(220px,1.15fr) auto;gap:8px;align-items:end}
+  .mx-qx-anesthesiologist-field{grid-column:1 / 3;min-width:210px}.mx-qx-anesthesiologist-field input{width:100%}.mx-qx-anesthesiologist-field small{display:block;color:#64748b;font-size:10px;margin-top:3px}@media(max-width:900px){.mx-qx-doctor-grid .mx-qx-anesthesiologist-field{grid-column:1/-1;min-width:0}}.mx-qx-patient-grid{display:grid;grid-template-columns:minmax(220px,1.5fr) 100px 140px 150px 170px;gap:8px}.mx-qx-relative{position:relative}
   .mx-qx-kit-add{display:grid;grid-template-columns:minmax(230px,380px) auto minmax(0,1fr);gap:8px;align-items:center;flex:0 0 auto}.mx-qx-selected{display:flex;flex-direction:column;gap:9px;margin-top:8px}
-  .mx-qx-selected-card{border:1px solid #bfd7f4;border-radius:13px;background:#fbfdff;overflow:hidden}.mx-qx-selected-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px;background:#eef6ff}.mx-qx-selected-head b{font-size:12px}.mx-qx-selected-head small{color:#475569}
+  .mx-qx-srv-unified-scroll{width:100%;max-width:100%;overflow-x:auto;overflow-y:visible}.mx-qx-srv-unified-table{min-width:790px;width:100%;table-layout:auto}.mx-qx-srv-unified-table td,.mx-qx-srv-unified-table th{white-space:normal;overflow-wrap:anywhere}.mx-qx-kit-divider>td{padding:0!important;background:#e7f0fb!important;border-top:3px solid #8eb3dd!important;border-bottom:1px solid #bcd3ed!important}.mx-qx-kit-divider-content{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 12px;min-width:0}.mx-qx-kit-divider-content b{font-size:12px;color:#13406d}.mx-qx-kit-divider-content small{display:block;margin-top:3px;color:#475569}.mx-qx-kit-product-row:nth-of-type(even){background:#f8fbff}.mx-qx-selected-card{border:1px solid #bfd7f4;border-radius:13px;background:#fbfdff;overflow:hidden}.mx-qx-selected-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 11px;background:#eef6ff}.mx-qx-selected-head b{font-size:12px}.mx-qx-selected-head small{color:#475569}
   .mx-qx-srv-table{width:100%;border-collapse:collapse;font-size:11px}.mx-qx-srv-table th,.mx-qx-srv-table td{border-top:1px solid #e2e8f0;padding:5px 8px;text-align:left;vertical-align:middle}.mx-qx-srv-table th{background:#f8fafc}.mx-qx-srv-table input{width:84px;min-width:70px}
   .mx-qx-service-foot{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:12px 16px;background:#fff;border-top:1px solid #dbe5f3}.mx-qx-service-foot .mx-qx-foot-actions{display:flex;gap:8px;flex-wrap:wrap}.mx-qx-service-summary{font-weight:900;color:#0f4c81}.mx-qx-loan-btn{background:#f59e0b!important;border-color:#f59e0b!important;color:#fff!important}.mx-qx-status-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:999px;font-size:10px;font-weight:900;margin-top:6px}.mx-qx-status-chip.ok{background:#dcfce7;color:#166534}.mx-qx-status-chip.warn{background:#fef3c7;color:#92400e}.mx-qx-status-chip.info{background:#dbeafe;color:#1d4ed8}.mx-qx-adjust-card{width:min(1040px,96vw);max-height:92vh;background:#fff;border-radius:17px;box-shadow:0 28px 80px rgba(2,6,23,.32);display:flex;flex-direction:column;overflow:hidden}.mx-qx-adjust-body{padding:14px;overflow:auto}.mx-qx-adjust-table{width:100%;border-collapse:collapse;font-size:11px}.mx-qx-adjust-table th,.mx-qx-adjust-table td{padding:8px;border:1px solid #dbe5f3;vertical-align:middle}.mx-qx-adjust-table th{background:#eef6ff;color:#123b68}.mx-qx-adjust-table input{width:92px;min-width:78px}.mx-qx-adjust-note{margin-bottom:10px;padding:10px 12px;border:1px solid #fde68a;background:#fffbeb;border-radius:12px;color:#92400e}.mx-qx-loan-scan{max-width:235px!important;border-color:#f59e0b!important;background:#fffbeb!important;font-weight:800}.mx-qx-ean-text{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-weight:950;letter-spacing:.7px;color:#0f4c81}.mx-qx-label-card{width:min(720px,96vw);max-height:94vh;background:#fff;border-radius:18px;box-shadow:0 28px 80px rgba(2,6,23,.34);display:flex;flex-direction:column;overflow:hidden}.mx-qx-label-body{padding:16px;overflow:auto;background:#f8fafc}.mx-qx-label-preview{width:min(460px,100%);margin:auto;background:#fff;border:1px solid #94a3b8;border-radius:10px;padding:14px;text-align:center}.mx-qx-label-preview svg{display:block;max-width:100%;height:auto;margin:8px auto}.mx-qx-label-name{font-size:18px;font-weight:950;color:#0f172a;margin:5px 0}.mx-qx-label-meta{font-size:12px;line-height:1.55;color:#334155}.mx-qx-loan-lookup{width:min(920px,96vw);max-height:94vh;background:#fff;border-radius:18px;box-shadow:0 28px 80px rgba(2,6,23,.34);display:flex;flex-direction:column;overflow:hidden}.mx-qx-loan-person{display:grid;grid-template-columns:1.5fr .55fr .7fr .7fr .9fr;gap:9px;margin-bottom:12px}.mx-qx-loan-person>div{padding:9px 10px;border:1px solid #dbe5f3;border-radius:11px;background:#f8fafc}.mx-qx-loan-person small{display:block;color:#64748b;font-size:10px;font-weight:800;margin-bottom:3px}.mx-qx-loan-person b{font-size:12px;color:#0f172a}.mx-qx-loan-lookup-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.mx-qx-ean-badge{display:inline-flex;align-items:center;padding:4px 8px;border-radius:8px;background:#eff6ff;border:1px solid #bfdbfe;margin-top:5px}
   .mx-qx-med-drop{display:none;position:absolute;left:0;right:0;top:calc(100% + 4px);z-index:100500;background:#fff;border:1px solid #cbd5e1;border-radius:11px;box-shadow:0 14px 30px rgba(15,23,42,.18);max-height:230px;overflow:auto;color:#0f172a}.mx-qx-med-item{padding:9px 10px;border-bottom:1px solid #eef2f7;cursor:pointer}.mx-qx-med-item:hover{background:#eff6ff}.mx-qx-med-item small{display:block;color:#64748b;margin-top:2px}
@@ -33674,54 +34006,130 @@ async function loadKits(){
   return kitRows;
 }
 window.mxReloadSurgicalKits=loadKits;
-function kitSummary(k){const p=Array.isArray(k?.productos)?k.productos:[],qty=p.reduce((s,x)=>s+qInt(x.cantidad),0);return `${p.length} producto${p.length===1?'':'s'} · ${qty} pzs estándar`;}
+function kitSummary(k){const p=Array.isArray(k?.productos)?k.productos:[],qty=p.reduce((s,x)=>s+qInt(x.cantidad),0);return `${p.length} producto${p.length===1?'':'s'} · ${qty} pzs estándar${qTxt(k?.anestesiologo)?' · Anestesiólogo: '+qTxt(k.anestesiologo):''}`;}
 function renderKitList(){
   const host=$q('mxQxKitList');if(!host)return;
   host.innerHTML=kitRows.length?kitRows.map(k=>`<div class="mx-qx-kit-row ${String(kitEditId)===String(k._id)?'active':''}"><div><strong>${qEsc(k.nombre||'Kit sin nombre')}</strong><small>${qEsc(kitSummary(k))}</small></div><button class="btn" type="button" data-qx-kit-edit="${qEsc(k._id)}">Editar</button></div>`).join(''):'<div class="badge">Aún no hay kits configurados.</div>';
   host.querySelectorAll('[data-qx-kit-edit]').forEach(b=>b.onclick=()=>editKit(b.dataset.qxKitEdit));
 }
-function newKit(){kitEditId=null;kitDraftProducts=[];if($q('mxQxKitName'))$q('mxQxKitName').value='';if($q('mxQxKitDesc'))$q('mxQxKitDesc').value='';if($q('mxQxKitProductSearch'))$q('mxQxKitProductSearch').value='';const del=$q('mxQxKitDelete');if(del)del.disabled=true;const title=$q('mxQxKitEditorTitle');if(title)title.textContent='Nuevo kit';renderKitList();renderKitDraft();setTimeout(()=>$q('mxQxKitName')?.focus(),30);}
+async function loadKitAnestesiologosV261(force=false){
+  const now=Date.now();if(!force&&kitDoctorsFetchedAtV261&&now-kitDoctorsFetchedAtV261<60000)return kitDoctorsCatalogV261;
+  try{const doctors=await idbAll('medicos');kitDoctorsCatalogV261=(Array.isArray(doctors)?doctors:[]).filter(m=>qTxt(m?.nombre)).sort((a,b)=>qTxt(a.nombre).localeCompare(qTxt(b.nombre),'es',{sensitivity:'base'}));kitDoctorsFetchedAtV261=Date.now();}
+  catch(e){console.warn('[Kits · Médicos]',e);}
+  const list=$q('mxQxKitAnestList');if(list)list.innerHTML=kitDoctorsCatalogV261.map(m=>`<option value="${qEsc(m.nombre)}" label="Cédula: ${qEsc(m.cedula||'Sin cédula')}"></option>`).join('');
+  return kitDoctorsCatalogV261;
+}
+function clearKitInventoryCacheV261(){invCacheAtV148=0;invCatalogAtV148=0;invCacheV148=[];invCatalogV148=[];kitCpmFetchedAtV261=0;}
+function kitStockDeficitV261(products=[],stock=new Map()){
+  let noStock=0,partial=0,missingPieces=0;const details=[];
+  for(const p of products){const qty=Math.max(1,qInt(p.cantidad)||1),avail=Math.max(0,qInt(stock.get(qProdKey(p))?.disponible));if(avail>=qty)continue;
+    if(avail===0)noStock++;else partial++;
+    missingPieces+=qty-avail;details.push(`${qTxt(p.clave||p.descripcion)||'Producto'}: ${avail}/${qty} disponibles`);
+  }
+  return{noStock,partial,missingPieces,details};
+}
+function newKit(){kitEditId=null;kitDraftProducts=[];if($q('mxQxKitName'))$q('mxQxKitName').value='';if($q('mxQxKitDesc'))$q('mxQxKitDesc').value='';if($q('mxQxKitAnest'))$q('mxQxKitAnest').value='';if($q('mxQxKitProductSearch'))$q('mxQxKitProductSearch').value='';const del=$q('mxQxKitDelete');if(del)del.disabled=true;const title=$q('mxQxKitEditorTitle');if(title)title.textContent='Nuevo kit';renderKitList();renderKitDraft();setTimeout(()=>$q('mxQxKitName')?.focus(),30);}
 function editKit(id){
   const row=kitRows.find(k=>String(k._id)===String(id));if(!row)return;
   kitEditId=row._id;kitDraftProducts=qClone(Array.isArray(row.productos)?row.productos:[])||[];
-  $q('mxQxKitName').value=qTxt(row.nombre);$q('mxQxKitDesc').value=qTxt(row.descripcion);$q('mxQxKitDelete').disabled=false;$q('mxQxKitEditorTitle').textContent=`Editar · ${qTxt(row.nombre)}`;renderKitList();renderKitDraft();
+  $q('mxQxKitName').value=qTxt(row.nombre);$q('mxQxKitDesc').value=qTxt(row.descripcion);if($q('mxQxKitAnest'))$q('mxQxKitAnest').value=qTxt(row.anestesiologo);loadKitAnestesiologosV261().catch(()=>{});$q('mxQxKitDelete').disabled=false;$q('mxQxKitEditorTitle').textContent=`Editar · ${qTxt(row.nombre)}`;renderKitList();renderKitDraft();
 }
-async function renderKitDraft(){
+async function renderKitDraft(forceInventory=false){
   const body=$q('mxQxKitProductsBody');if(!body)return;
+  const token=++kitDraftRenderSequenceV261,notice=$q('mxQxKitStockNotice');
   if(!kitDraftProducts.length){
-    body.innerHTML='<tr><td colspan="10" style="text-align:center;padding:16px;color:#64748b">Agrega productos del inventario a este kit.</td></tr>';
+    body.innerHTML='<tr><td colspan="10" style="text-align:center;padding:16px;color:#64748b">Agrega productos del inventario o del catálogo a este kit.</td></tr>';
+    if(notice){notice.className='mx-qx-stock-notice';notice.textContent='Todavía no hay productos seleccionados.';}
     const sum=$q('mxQxKitFinanceSummary');if(sum)sum.textContent='Costo del kit: $0.00 · Venta referencial: $0.00';
     return;
   }
-  // Consulta disponibilidad y valorización solamente cuando hay productos que mostrar.
-  const av=await qAvailabilityMap().catch(()=>new Map());
+  let av=null;
+  try{av=await qAvailabilityMap(!!forceInventory);}catch(e){console.warn('[Kits · Existencia]',e);}
+  if(token!==kitDraftRenderSequenceV261||!body.isConnected)return;
   let kitCost=0,kitSale=0;
   body.innerHTML=kitDraftProducts.map((p,i)=>{
-    const a=av.get(qProdKey(p)),ex=a?String(qInt(a.disponible)):'—';
+    const a=av?.get(qProdKey(p)),stock=av?Math.max(0,qInt(a?.disponible)):null;
     const cost=Math.max(0,qNum(a?.costo_unitario ?? p.costo_unitario)),price=Math.max(0,qNum(a?.precio_venta ?? p.precio_venta)),qty=Math.max(1,qInt(p.cantidad)||1);
+    const shortage=stock===null?null:Math.max(0,qty-stock),status=stock===null?'Sin confirmar':stock===0?'SIN EXISTENCIA':shortage>0?'INSUFICIENTE':'DISPONIBLE';
+    const cls=stock===0?'mx-qx-kit-stock-none':shortage>0?'mx-qx-kit-stock-low':'';
     kitCost+=cost*qty;kitSale+=price*qty;
     p.costo_unitario=cost;p.precio_venta=price;
-    return `<tr><td><b>${qEsc(p.clave||p.codigo_barras||'')}</b></td><td>${qEsc(p.descripcion||'')}</td><td>${qEsc(p.unidad||'PIEZA')}</td><td style="text-align:center;font-weight:900">${ex}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price)}</td><td><input class="input" type="number" min="1" step="1" value="${qty}" data-qx-kit-qty="${i}"></td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost*qty)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price*qty)}</td><td><button class="btn danger" type="button" data-qx-kit-prod-del="${i}">🗑️</button></td></tr>`
+    return `<tr class="${cls}"><td><b>${qEsc(p.clave||p.codigo_barras||'')}</b></td><td>${qEsc(p.descripcion||'')}<div><small>${qTxt(p.fuente)==='CATALOGO'?'Origen: Catálogo CPM · ':''}</small><span class="mx-qx-stock-badge">${status}</span>${shortage>0?` <small>Faltan ${shortage} pzs</small>`:''}</div></td><td>${qEsc(p.unidad||'PIEZA')}</td><td style="text-align:center;font-weight:900">${stock===null?'—':stock}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price)}</td><td><input class="input" type="number" min="1" step="1" value="${qty}" data-qx-kit-qty="${i}"></td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost*qty)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price*qty)}</td><td><button class="btn danger" type="button" data-qx-kit-prod-del="${i}">🗑️</button></td></tr>`;
   }).join('');
+  const stats=av?kitStockDeficitV261(kitDraftProducts,av):null;
+  if(notice){
+    notice.className='mx-qx-stock-notice'+(!stats?' warn':stats.noStock?' bad':stats.partial?' warn':'');
+    notice.textContent=!stats?'No fue posible comprobar la existencia en este momento. El kit se puede guardar.':(stats.noStock||stats.partial)?`⚠️ ${stats.noStock} producto(s) sin existencia, ${stats.partial} con existencia insuficiente. Faltan ${stats.missingPieces} piezas. Puedes guardar el kit y completarlo cuando lleguen los productos.`:'✅ Todos los productos del kit cuentan con existencia suficiente.';
+  }
   const sum=$q('mxQxKitFinanceSummary');if(sum)sum.textContent=`Costo del kit: ${qMoney(kitCost)} · Venta referencial: ${qMoney(kitSale)} · Diferencia: ${qMoney(kitSale-kitCost)}`;
   body.querySelectorAll('[data-qx-kit-qty]').forEach(inp=>inp.onchange=()=>{const i=Number(inp.dataset.qxKitQty);if(!kitDraftProducts[i])return;kitDraftProducts[i].cantidad=Math.max(1,qInt(inp.value)||1);inp.value=kitDraftProducts[i].cantidad;renderKitDraft();});
   body.querySelectorAll('[data-qx-kit-prod-del]').forEach(btn=>btn.onclick=()=>{const i=Number(btn.dataset.qxKitProdDel);kitDraftProducts.splice(i,1);renderKitDraft();});
 }
 
-async function searchKitProduct(term){
-  const t=qNorm(term);if(t.length<2)return[];const rows=await qInventoryCatalog(false);
-  return rows.filter(r=>qNorm([r.clave,r.codigo_barras,r.descripcion].join(' ')).includes(t)).sort((a,b)=>{const aa=qNorm(a.clave)===t||qNorm(a.codigo_barras)===t?0:qNorm(a.descripcion).startsWith(t)?1:2;const bb=qNorm(b.clave)===t||qNorm(b.codigo_barras)===t?0:qNorm(b.descripcion).startsWith(t)?1:2;return aa-bb;}).slice(0,25);
+async function kitCpmSearchRowsV261(){
+  if(kitCpmFetchedAtV261&&Date.now()-kitCpmFetchedAtV261<60000)return kitCpmV261;
+  if(kitCpmPendingV261)return kitCpmPendingV261;
+  kitCpmPendingV261=(async()=>{
+    try{const data=await idbAll('cpm');kitCpmV261=Array.isArray(data)?data:[];kitCpmFetchedAtV261=Date.now();return kitCpmV261;}
+    catch(e){console.warn('[Kits · Catálogo]',e);return kitCpmV261;}
+    finally{kitCpmPendingV261=null;}
+  })();
+  return kitCpmPendingV261;
+}
+async function searchKitProduct(term,origin='auto'){
+  const t=qNorm(term);if(t.length<2)return[];
+  const mode=['inventario','catalogo'].includes(origin)?origin:'auto',byKey=new Map();
+  let inv=[];
+  try{inv=await qInventoryCatalog(false);}catch(e){console.warn('[Kits · Inventario no disponible]',e);}
+  const available=new Map((Array.isArray(inv)?inv:[]).filter(r=>qProdKey(r)).map(r=>[qProdKey(r),r]));
+  if(mode!=='catalogo')for(const [key,r] of available)byKey.set(key,{...r,fuente:'INVENTARIO'});
+  if(mode!=='inventario'){
+    try{
+      const catalog=await kitCpmSearchRowsV261();
+      for(const r of Array.isArray(catalog)?catalog:[]){
+        const p={clave:qTxt(r.csg||r.clave),codigo_barras:qTxt(r.codigo_barras||r.codigoBarras),descripcion:qTxt(r.descripcion||r.nombre),unidad:qTxt(r.unidad)||'PIEZA',disponible:0,lotes:0,productoPendiente:true,fuente:'CATALOGO',costo_unitario:Math.max(0,qNum(r.costo??r.costo_unitario)),precio_venta:Math.max(0,qNum(r.precio_venta))};
+        if(!p.clave&&!p.descripcion)continue;
+        const k=qProdKey(p);if(!k)continue;
+        // Si está en ambos, usar inventario para la disponibilidad y catálogo como origen solicitado.
+        const stocked=available.get(k);
+        if(mode==='catalogo')byKey.set(k,stocked?{...stocked,fuente:'CATALOGO',productoPendiente:false}:{...p});
+        else if(!byKey.has(k))byKey.set(k,p);
+      }
+    }catch(e){console.warn('[Kits · Catálogo no disponible]',e);}
+  }
+  return [...byKey.values()].filter(r=>qNorm([r.clave,r.codigo_barras,r.descripcion].join(' ')).includes(t)).sort((a,b)=>{
+    const rank=r=>qNorm(r.clave)===t||qNorm(r.codigo_barras)===t?0:qNorm(r.descripcion).startsWith(t)?1:2;
+    return rank(a)-rank(b)||qTxt(a.descripcion).localeCompare(qTxt(b.descripcion),'es',{sensitivity:'base'});
+  }).slice(0,40);
 }
 function renderKitSearchDrop(rows=[]){
-  const drop=$q('mxQxKitProductDrop');if(!drop)return;if(!rows.length){drop.style.display='none';drop.innerHTML='';return;}
-  drop.innerHTML=rows.map((r,i)=>`<div class="mx-qx-drop-item" data-qx-prod-pick="${i}"><b>${qEsc(r.clave||r.codigo_barras||'SIN CLAVE')}</b> — ${qEsc(r.descripcion||'Producto')}<small>${qEsc(r.unidad||'PIEZA')} · Existencia actual: ${qInt(r.disponible)} · ${qInt(r.lotes)} lote(s)${qFinancialOn()?` · Costo ${qMoney(r.costo_unitario)} · Precio ${qMoney(r.precio_venta)}`:''}</small></div>`).join('');drop.style.display='block';
-  drop.querySelectorAll('[data-qx-prod-pick]').forEach(el=>el.onmousedown=e=>{e.preventDefault();const r=rows[Number(el.dataset.qxProdPick)];if(!r)return;const key=qProdKey(r),hit=kitDraftProducts.find(x=>qProdKey(x)===key);if(hit)hit.cantidad=Math.max(1,qInt(hit.cantidad)||1)+1;else kitDraftProducts.push({clave:qTxt(r.clave),codigo_barras:qTxt(r.codigo_barras),descripcion:qTxt(r.descripcion),unidad:qTxt(r.unidad)||'PIEZA',cantidad:1,costo_unitario:qNum(r.costo_unitario),precio_venta:qNum(r.precio_venta)});$q('mxQxKitProductSearch').value='';renderKitSearchDrop([]);renderKitDraft();});
+  const drop=$q('mxQxKitProductDrop');if(!drop)return;
+  if(!rows.length){drop.style.display='none';drop.innerHTML='';return;}
+  drop.innerHTML=rows.map((r,i)=>`<div class="mx-qx-drop-item" role="button" tabindex="0" data-qx-prod-pick="${i}"><b>${qEsc(r.clave||r.codigo_barras||'SIN CLAVE')}</b> — ${qEsc(r.descripcion||'Producto')}<small><b>${r.fuente==='CATALOGO'?'CATÁLOGO CPM':'INVENTARIO'}</b> · ${qEsc(r.unidad||'PIEZA')} · ${qInt(r.disponible)===0?'⚠️ SIN EXISTENCIA (0 pzs)':'Existencia: '+qInt(r.disponible)}${qFinancialOn()?` · Costo ${qMoney(r.costo_unitario)} · Precio ${qMoney(r.precio_venta)}`:''}</small></div>`).join('');drop.style.display='block';
+  drop.querySelectorAll('[data-qx-prod-pick]').forEach(el=>{
+    const pick=e=>{e.preventDefault();const r=rows[Number(el.dataset.qxProdPick)];if(!r)return;
+      const key=qProdKey(r),hit=kitDraftProducts.find(x=>qProdKey(x)===key);
+      if(hit)hit.cantidad=Math.max(1,qInt(hit.cantidad)||1)+1;
+      else kitDraftProducts.push({clave:qTxt(r.clave),codigo_barras:qTxt(r.codigo_barras),descripcion:qTxt(r.descripcion),unidad:qTxt(r.unidad)||'PIEZA',cantidad:1,fuente:qTxt(r.fuente)||'INVENTARIO',productoPendiente:!!r.productoPendiente,costo_unitario:qNum(r.costo_unitario),precio_venta:qNum(r.precio_venta)});
+      $q('mxQxKitProductSearch').value='';renderKitSearchDrop([]);renderKitDraft();
+    };
+    el.onclick=pick;el.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();pick(e);}};
+  });
 }
 async function saveKit(){
   const nombre=qTxt($q('mxQxKitName')?.value),descripcion=qTxt($q('mxQxKitDesc')?.value);if(!nombre)return qAlert('Captura el nombre del kit.');if(!kitDraftProducts.length)return qAlert('Agrega al menos un producto al kit.');
   const duplicate=kitRows.find(k=>qNorm(k.nombre)===qNorm(nombre)&&String(k._id)!==String(kitEditId||''));if(duplicate)return qAlert('Ya existe otro kit con ese nombre.');
-  const old=kitRows.find(k=>String(k._id)===String(kitEditId||''));const row={tipo_doc:KIT_TYPE,nombre,descripcion,productos:kitDraftProducts.map(p=>({clave:qTxt(p.clave),codigo_barras:qTxt(p.codigo_barras),descripcion:qTxt(p.descripcion),unidad:qTxt(p.unidad)||'PIEZA',cantidad:Math.max(1,qInt(p.cantidad)||1),costo_unitario:Math.max(0,qNum(p.costo_unitario)),precio_venta:Math.max(0,qNum(p.precio_venta))})),createdAt:qTxt(old?.createdAt)||new Date().toISOString(),updatedAt:new Date().toISOString(),usuario:getLoggedUserLabel?.()||'',remoteKitId:qTxt(old?.remoteKitId),source:qTxt(old?.source)||'SISTEMA_PRINCIPAL_KITS',createdByApp:qTxt(old?.createdByApp)};if(kitEditId)row._id=Number(kitEditId)||kitEditId;
-  try{const id=await idbPut('settings',row);kitEditId=row._id||id;await loadKits();try{window.mxScheduleAntibioticStockKitsPublish?.(120)}catch(_e){}const saved=kitRows.find(k=>String(k._id)===String(kitEditId));if(saved)editKit(saved._id);qAlert('✅ Kit guardado.');}catch(e){console.error('[KITS QUIRURGICOS]',e);qAlert('No se pudo guardar el kit: '+(e?.message||e));}
+  const anestesiologo=qTxt($q('mxQxKitAnest')?.value),doctors=anestesiologo?await loadKitAnestesiologosV261(true):[];
+  const m=anestesiologo?doctors.find(d=>qNorm(d.nombre)===qNorm(anestesiologo)):null;
+  if(anestesiologo&&!m)return qAlert('Selecciona un anestesiólogo registrado en Médicos. Si falta, agrégalo primero al catálogo.');
+  const old=kitRows.find(k=>String(k._id)===String(kitEditId||''));const row={tipo_doc:KIT_TYPE,nombre,descripcion,anestesiologo:qTxt(m?.nombre),anestesiologo_id:m?._id??'',anestesiologo_cedula:qTxt(m?.cedula),productos:kitDraftProducts.map(p=>({clave:qTxt(p.clave),codigo_barras:qTxt(p.codigo_barras),descripcion:qTxt(p.descripcion),unidad:qTxt(p.unidad)||'PIEZA',cantidad:Math.max(1,qInt(p.cantidad)||1),fuente:qTxt(p.fuente),productoPendiente:!!p.productoPendiente,costo_unitario:Math.max(0,qNum(p.costo_unitario)),precio_venta:Math.max(0,qNum(p.precio_venta))})),createdAt:qTxt(old?.createdAt)||new Date().toISOString(),updatedAt:new Date().toISOString(),usuario:getLoggedUserLabel?.()||'',remoteKitId:qTxt(old?.remoteKitId),source:qTxt(old?.source)||'SISTEMA_PRINCIPAL_KITS',createdByApp:qTxt(old?.createdByApp)};if(kitEditId)row._id=Number(kitEditId)||kitEditId;
+  try{
+    const id=await idbPut('settings',row);kitEditId=row._id||id;await loadKits();try{window.mxScheduleAntibioticStockKitsPublish?.(120)}catch(_e){}
+    const saved=kitRows.find(k=>String(k._id)===String(kitEditId));if(saved)editKit(saved._id);
+    let stock=null;try{stock=await qAvailabilityMap(true);}catch(e){console.warn('[Kits guardar · Existencias]',e);}
+    const missing=stock?kitStockDeficitV261(kitDraftProducts,stock):null;
+    qAlert('✅ Kit guardado.'+(missing&&(missing.noStock||missing.partial)?`\n⚠️ ${missing.noStock} producto(s) sin existencia, ${missing.partial} insuficiente(s). Faltan ${missing.missingPieces} pzs. El kit sigue disponible para preparar.`:''));
+  }catch(e){console.error('[KITS QUIRURGICOS]',e);qAlert('No se pudo guardar el kit: '+(e?.message||e));}
 }
 async function deleteKit(){
   if(!kitEditId)return;if(!await qConfirm('¿Eliminar este kit? Las salidas ya registradas no se modifican.'))return;
@@ -33729,13 +34137,30 @@ async function deleteKit(){
 }
 function buildConfigSection(){
   const view=$q('view-configuracion');if(!view||$q('mxSurgicalKitsSection'))return;
-  const sec=document.createElement('div');sec.className='cfg-section';sec.id='mxSurgicalKitsSection';sec.innerHTML=`<h4 class="cfg-title">🧰 Kits</h4><p class="cfg-help">Crea combinaciones frecuentes usando productos reales del inventario. Aquí defines el kit maestro; al usarlo en Salidas internas podrás retirar kits, productos o cambiar cantidades sin modificar la plantilla.</p><div class="mx-qx-kit-layout"><div class="mx-qx-box"><div class="mx-qx-head"><b>Kits configurados</b><button class="btn" id="mxQxKitNew" type="button">＋ Nuevo kit</button></div><div class="mx-qx-kit-list" id="mxQxKitList"></div></div><div class="mx-qx-box"><div class="mx-qx-head"><b id="mxQxKitEditorTitle">Nuevo kit</b><span class="badge">Productos vinculados al inventario</span></div><div class="mx-qx-formgrid"><div class="mx-qx-field"><label>Nombre del kit</label><input class="input" id="mxQxKitName" placeholder="Ej. Cirugía general básica"></div><div class="mx-qx-field"><label>Descripción / uso</label><input class="input" id="mxQxKitDesc" placeholder="Opcional"></div></div><div class="mx-qx-picker"><input class="input" id="mxQxKitProductSearch" placeholder="🔎 Buscar producto del inventario por clave, código o nombre"><div class="mx-qx-drop" id="mxQxKitProductDrop"></div></div><div style="overflow:auto"><table class="mx-qx-kit-table"><thead><tr><th>Clave</th><th>Producto</th><th>Unidad</th><th>Existencia</th><th class="mx-qx-financial-only">Costo unit.</th><th class="mx-qx-financial-only">Precio venta</th><th>Cantidad del kit</th><th class="mx-qx-financial-only">Costo kit</th><th class="mx-qx-financial-only">Venta ref.</th><th></th></tr></thead><tbody id="mxQxKitProductsBody"></tbody></table></div><div class="mx-qx-fin-summary" id="mxQxKitFinanceSummary">Costo del kit: $0.00 · Venta referencial: $0.00</div><div class="mx-qx-actions"><button class="btn ok" id="mxQxKitSave" type="button">💾 Guardar kit</button><button class="btn danger" id="mxQxKitDelete" type="button" disabled>🗑️ Eliminar kit</button><span class="badge">Las cantidades pueden ajustarse nuevamente al armar un pedido.</span></div></div></div>`;
+  const sec=document.createElement('div');sec.className='cfg-section';sec.id='mxSurgicalKitsSection';sec.innerHTML=`<h4 class="cfg-title">🧰 Kits</h4><p class="cfg-help">Crea tus kits usando productos de Inventario o de Catálogo (CPM), aunque todavía no exista stock. Aquí defines el kit maestro; al usarlo en Salidas internas podrás retirar kits, productos o cambiar cantidades sin modificar la plantilla.</p><div class="mx-qx-kit-layout"><div class="mx-qx-box"><div class="mx-qx-head"><b>Kits configurados</b><button class="btn" id="mxQxKitNew" type="button">＋ Nuevo kit</button></div><div class="mx-qx-kit-list" id="mxQxKitList"></div></div><div class="mx-qx-box"><div class="mx-qx-head"><b id="mxQxKitEditorTitle">Nuevo kit</b><span class="badge">Inventario + Catálogo (CPM)</span></div><div class="mx-qx-formgrid"><div class="mx-qx-field"><label>Nombre del kit</label><input class="input" id="mxQxKitName" placeholder="Ej. Cirugía general básica"></div><div class="mx-qx-field"><label>Descripción / uso</label><input class="input" id="mxQxKitDesc" placeholder="Opcional"></div></div><div class="mx-qx-kit-extra"><div class="mx-qx-field"><label for="mxQxKitAnest">Anestesiólogo (catálogo de Médicos)</label><input class="input" id="mxQxKitAnest" list="mxQxKitAnestList" autocomplete="off" placeholder="Buscar anestesiólogo por nombre"><datalist id="mxQxKitAnestList"></datalist><small class="mx-qx-kit-helper">Opcional · Selecciona un médico registrado; no cambia el médico solicitante.</small></div><div class="mx-qx-field"><label>Consultar existencias</label><button class="btn" id="mxQxKitRefreshStock" type="button">↻ Actualizar existencias</button></div></div><div class="mx-qx-kit-source-row"><label for="mxQxKitProductSource">Buscar en</label><select class="input" id="mxQxKitProductSource" aria-label="Origen de productos del kit"><option value="auto">Inventario y Catálogo</option><option value="inventario">Solo Inventario</option><option value="catalogo">Solo Catálogo (CPM)</option></select><small>Si no existe en Inventario, puedes seleccionarlo directamente de Catálogo; la existencia se mantiene en cero hasta su ingreso.</small></div><div class="mx-qx-picker"><input class="input" id="mxQxKitProductSearch" placeholder="🔎 Buscar en Inventario o Catálogo por clave, código o descripción"><div class="mx-qx-drop" id="mxQxKitProductDrop"></div></div><details class="mx-qx-kit-manual"><summary>＋ Agregar producto pendiente de ingreso (sin existencia)</summary><div class="mx-qx-kit-manual-fields"><input class="input" id="mxQxKitManualKey" placeholder="Clave exacta del producto" aria-label="Clave del producto pendiente"><input class="input" id="mxQxKitManualName" placeholder="Descripción del producto" aria-label="Descripción del producto pendiente"><button class="btn" type="button" id="mxQxKitManualAdd">＋ Agregar al kit</button></div><small>Este producto se incorpora al kit con existencia 0. No crea ni modifica movimientos de Inventario.</small></details><div style="overflow:auto"><table class="mx-qx-kit-table"><thead><tr><th>Clave</th><th>Producto</th><th>Unidad</th><th>Existencia</th><th class="mx-qx-financial-only">Costo unit.</th><th class="mx-qx-financial-only">Precio venta</th><th>Cantidad del kit</th><th class="mx-qx-financial-only">Costo kit</th><th class="mx-qx-financial-only">Venta ref.</th><th></th></tr></thead><tbody id="mxQxKitProductsBody"></tbody></table></div><div id="mxQxKitStockNotice" class="mx-qx-stock-notice" role="status" aria-live="polite">Consulta de existencias disponible.</div><div class="mx-qx-fin-summary" id="mxQxKitFinanceSummary">Costo del kit: $0.00 · Venta referencial: $0.00</div><div class="mx-qx-actions"><button class="btn ok" id="mxQxKitSave" type="button">💾 Guardar kit</button><button class="btn danger" id="mxQxKitDelete" type="button" disabled>🗑️ Eliminar kit</button><span class="badge">Las cantidades pueden ajustarse nuevamente al armar un pedido.</span></div></div></div>`;
   const anchor=$q('mxCollectiveImagesSection')||view.querySelector(':scope > .cfg-section');if(anchor)anchor.insertAdjacentElement('afterend',sec);else view.appendChild(sec);
   $q('mxQxKitNew').onclick=newKit;$q('mxQxKitSave').onclick=saveKit;$q('mxQxKitDelete').onclick=deleteKit;
-  let timer=0;$q('mxQxKitProductSearch').addEventListener('input',()=>{
+  $q('mxQxKitManualAdd')?.addEventListener('click',()=>{
+    const clave=qTxt($q('mxQxKitManualKey')?.value),descripcion=qTxt($q('mxQxKitManualName')?.value);
+    if(!clave||!descripcion)return qAlert('Captura la clave exacta y la descripción del producto pendiente.');
+    if(kitDraftProducts.some(p=>qProdKey(p)===qNorm(clave)))return qAlert('El producto ya está en el kit; ajusta su cantidad.');
+    kitDraftProducts.push({clave,descripcion,unidad:'PIEZA',cantidad:1,productoPendiente:true,costo_unitario:0,precio_venta:0});
+    $q('mxQxKitManualKey').value='';$q('mxQxKitManualName').value='';renderKitDraft();
+  });
+  $q('mxQxKitAnest')?.addEventListener('focus',()=>loadKitAnestesiologosV261().catch(()=>{}));
+  $q('mxQxKitRefreshStock')?.addEventListener('click',async()=>{clearKitInventoryCacheV261();await renderKitDraft(true);});
+  loadKitAnestesiologosV261().catch(()=>{});
+  let timer=0;
+  $q('mxQxKitProductSource')?.addEventListener('change',()=>{
+    const term=$q('mxQxKitProductSearch')?.value||'';kitSearchSeqV148++;
+    if(qNorm(term).length<2){renderKitSearchDrop([]);return;}
+    const seq=++kitSearchSeqV148;
+    searchKitProduct(term,$q('mxQxKitProductSource')?.value).then(rows=>{if(seq===kitSearchSeqV148)renderKitSearchDrop(rows);}).catch(e=>console.warn('[Kit buscar]',e));
+  });
+  $q('mxQxKitProductSearch').addEventListener('input',()=>{
     clearTimeout(timer);const input=$q('mxQxKitProductSearch'),term=input?.value||'',seq=++kitSearchSeqV148;
     if(qNorm(term).length<2){renderKitSearchDrop([]);return;}
-    timer=setTimeout(async()=>{const rows=await searchKitProduct(term);if(seq===kitSearchSeqV148)renderKitSearchDrop(rows);},300);
+    timer=setTimeout(async()=>{try{const rows=await searchKitProduct(term,$q('mxQxKitProductSource')?.value);if(seq===kitSearchSeqV148)renderKitSearchDrop(rows);}catch(e){console.warn('[Kit buscar]',e);if(seq===kitSearchSeqV148)renderKitSearchDrop([]);}},300);
   });
   document.addEventListener('click',e=>{const d=$q('mxQxKitProductDrop'),i=$q('mxQxKitProductSearch');if(d&&i&&!d.contains(e.target)&&e.target!==i)d.style.display='none';});
   try{window.mxInitConfigAccordions?.();}catch(_e){}
@@ -33775,7 +34200,7 @@ function buildServiceButton(){
 function updateServiceSectionSummaries(){
   const dest=selectedDestinationService?.(),folio=qTxt($q('mxQxSrvFolio')?.value),doctor=qTxt($q('mxQxSrvMedName')?.value),ced=qTxt($q('mxQxSrvMedCed')?.value),patient=qTxt($q('mxQxSrvPatient')?.value),age=qTxt($q('mxQxSrvAge')?.value),sex=qTxt($q('mxQxSrvSex')?.value),eye=qTxt($q('mxQxSrvEye')?.value);
   const d=$q('mxQxSumDestination');if(d)d.textContent=dest?`${dest.nombre}${dest.iniciales?' ('+dest.iniciales+')':''}${folio?' · '+folio:''}`:'Pendiente';
-  const m=$q('mxQxSumDoctor');if(m)m.textContent=doctor?`${doctor}${ced?' · Céd. '+ced:''}`:'Pendiente';
+  const m=$q('mxQxSumDoctor'),anest=qTxt($q('mxQxSrvAnestName')?.value);if(m)m.textContent=doctor?`${doctor}${ced?' · Céd. '+ced:''}${anest?' · Anest.: '+anest:''}`:'Pendiente';
   const p=$q('mxQxSumPatient');if(p)p.textContent=patient?`${patient}${age?' · '+age+' años':''}${sex?' · '+sex:''}${eye?' · Ojo: '+eye:''}`:'Pendiente';
   const k=$q('mxQxSumKits');if(k){const rows=serviceAggregate?.()||[],qty=rows.reduce((a,x)=>a+qInt(x.cantidad),0);k.textContent=`${serviceState?.selectedKits?.length||0} kits · ${rows.length} productos · ${qty} pzs`;}
 }
@@ -33790,23 +34215,46 @@ function bindServiceProgressiveSections(){
   modal.querySelectorAll('[data-qx-sec-toggle]').forEach(h=>h.addEventListener('click',()=>setServiceSection(h.dataset.qxSecToggle,true)));
   [['mxQxSecDestination','destination'],['mxQxSecDoctor','doctor'],['mxQxSecPatient','patient']].forEach(([id,step])=>{$q(id)?.addEventListener('focusin',()=>setServiceSection(step,false));});
   $q('mxQxSrvKitSelect')?.addEventListener('focus',()=>setServiceSection('kits',false));
-  ['mxQxSrvMedName','mxQxSrvMedCed','mxQxSrvMedTel','mxQxSrvMedDom','mxQxSrvPatient','mxQxSrvAge','mxQxSrvSex','mxQxSrvEye','mxQxSrvPatientTel'].forEach(id=>$q(id)?.addEventListener('input',updateServiceSectionSummaries));
+  ['mxQxSrvMedName','mxQxSrvMedCed','mxQxSrvMedTel','mxQxSrvMedDom','mxQxSrvAnestName','mxQxSrvPatient','mxQxSrvAge','mxQxSrvSex','mxQxSrvEye','mxQxSrvPatientTel'].forEach(id=>$q(id)?.addEventListener('input',updateServiceSectionSummaries));
   $q('mxQxSrvSex')?.addEventListener('change',()=>{updateServiceSectionSummaries();const ready=qTxt($q('mxQxSrvPatient')?.value)&&qTxt($q('mxQxSrvAge')?.value)&&qTxt($q('mxQxSrvSex')?.value)&&qTxt($q('mxQxSrvEye')?.value);if(ready)setServiceSection('kits',true);});
   $q('mxQxSrvEye')?.addEventListener('change',()=>{updateServiceSectionSummaries();const ready=qTxt($q('mxQxSrvPatient')?.value)&&qTxt($q('mxQxSrvAge')?.value)&&qTxt($q('mxQxSrvSex')?.value)&&qTxt($q('mxQxSrvEye')?.value);if(ready)setServiceSection('kits',true);});
   $q('mxQxSrvAge')?.addEventListener('change',()=>{updateServiceSectionSummaries();const ready=qTxt($q('mxQxSrvPatient')?.value)&&qTxt($q('mxQxSrvAge')?.value)&&qTxt($q('mxQxSrvSex')?.value)&&qTxt($q('mxQxSrvEye')?.value);if(ready)setServiceSection('kits',true);});
 }
 function ensureServiceModal(){
   let modal=$q('mxQxServiceModal');if(modal)return modal;
-  modal=document.createElement('div');modal.id='mxQxServiceModal';modal.className='mx-qx-modal hidden';modal.innerHTML=`<div class="mx-qx-service-card" role="dialog" aria-modal="true" aria-labelledby="mxQxServiceTitle"><div class="mx-qx-service-head"><div><h3 id="mxQxServiceTitle">🩺 Servicio quirúrgico · Kits de quirófano</h3><small>Completa los datos por pasos. Los apartados terminados se minimizan para dejar más espacio a los kits.</small></div><button class="mx-qx-x" id="mxQxServiceClose" type="button">×</button></div><div class="mx-qx-service-body"><div class="mx-qx-service-sec mx-qx-service-compact" id="mxQxSecDestination" data-qx-section="destination"><div class="mx-qx-sec-head" data-qx-sec-toggle="destination"><h4>🏥 Destino y folio del servicio</h4><div class="mx-qx-sec-summary" id="mxQxSumDestination">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-formgrid"><div class="mx-qx-field"><label>Servicio de destino</label><select class="select" id="mxQxSrvService"><option value="">Selecciona servicio de destino</option></select><small id="mxQxSrvServiceHelp">Servicios cargados desde Configuración &gt; Servicios.</small></div><div class="mx-qx-field"><label>Fecha</label><input class="input" id="mxQxSrvDate" readonly></div><div class="mx-qx-field mx-qx-folio-field"><label>Folio automático</label><input class="input" id="mxQxSrvFolio" readonly placeholder="0001-DDMMAAAA-SRV"></div></div></div></div><div class="mx-qx-service-sec is-collapsed" id="mxQxSecDoctor" data-qx-section="doctor"><div class="mx-qx-sec-head" data-qx-sec-toggle="doctor"><h4>👨‍⚕️ Médico solicitante</h4><div class="mx-qx-sec-summary" id="mxQxSumDoctor">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-doctor-grid"><div class="mx-qx-field mx-qx-relative"><label>Nombre del médico</label><input class="input" id="mxQxSrvMedName" placeholder="Buscar o capturar médico"><div class="mx-qx-med-drop" id="mxQxSrvMedDrop"></div></div><div class="mx-qx-field"><label>Cédula</label><input class="input" id="mxQxSrvMedCed" placeholder="Cédula"></div><div class="mx-qx-field"><label>Teléfono</label><input class="input" id="mxQxSrvMedTel" placeholder="Teléfono"></div><div class="mx-qx-field"><label>Domicilio</label><input class="input" id="mxQxSrvMedDom" placeholder="Domicilio del médico"></div><button class="btn" id="mxQxSrvSaveMed" type="button">💾 Médico</button></div></div></div><div class="mx-qx-service-sec is-collapsed" id="mxQxSecPatient" data-qx-section="patient"><div class="mx-qx-sec-head" data-qx-sec-toggle="patient"><h4>🧑 Paciente</h4><div class="mx-qx-sec-summary" id="mxQxSumPatient">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-patient-grid"><div class="mx-qx-field"><label>Nombre del paciente</label><input class="input" id="mxQxSrvPatient" placeholder="Nombre completo"></div><div class="mx-qx-field"><label>Edad</label><input class="input" id="mxQxSrvAge" type="number" min="0" max="130" placeholder="Edad"></div><div class="mx-qx-field"><label>Sexo</label><select class="select" id="mxQxSrvSex"><option value="">Selecciona</option><option>Femenino</option><option>Masculino</option><option>Otro</option><option>No especificado</option></select></div><div class="mx-qx-field"><label>Ojo a operar</label><select class="select" id="mxQxSrvEye"><option value="">Selecciona</option><option>Derecho</option><option>Izquierdo</option><option>Ambos</option></select></div><div class="mx-qx-field"><label>Teléfono</label><input class="input" id="mxQxSrvPatientTel" placeholder="Teléfono del paciente"></div></div></div></div><div class="mx-qx-service-sec" id="mxQxSecKits" data-qx-section="kits"><div class="mx-qx-sec-head"><h4>🧰 Kits requeridos</h4><div class="mx-qx-sec-summary" id="mxQxSumKits">Área de preparación</div><span></span></div><div class="mx-qx-sec-content"><div class="mx-qx-kit-add"><select class="select" id="mxQxSrvKitSelect"><option value="">Selecciona un kit</option></select><button class="btn ok" id="mxQxSrvAddKit" type="button">＋ Agregar kit</button><span class="badge">Agrega kits, ajusta cantidades o retira productos individuales.</span></div><div class="mx-qx-selected" id="mxQxSrvSelected"></div></div></div></div><div class="mx-qx-service-foot"><div class="mx-qx-service-summary" id="mxQxSrvSummary">0 kits · 0 productos · 0 pzs</div><div class="mx-qx-foot-actions"><button class="btn" id="mxQxSrvCancel" type="button">Cancelar</button><button class="btn" id="mxQxSrvPdf" type="button">📄 Enviar a PDF</button><button class="btn mx-qx-loan-btn" id="mxQxSrvLoan" type="button">💼 Registrar préstamo</button><button class="btn ok" id="mxQxSrvFinish" type="button">✅ Finalizar salida</button></div></div></div>`;
+  modal=document.createElement('div');modal.id='mxQxServiceModal';modal.className='mx-qx-modal hidden';modal.innerHTML=`<div class="mx-qx-service-card" role="dialog" aria-modal="true" aria-labelledby="mxQxServiceTitle"><div class="mx-qx-service-head"><div><h3 id="mxQxServiceTitle">🩺 Servicio quirúrgico · Kits de quirófano</h3><small>Completa los datos por pasos. Los apartados terminados se minimizan para dejar más espacio a los kits.</small></div><button class="mx-qx-x" id="mxQxServiceClose" type="button">×</button></div><div class="mx-qx-service-body"><div class="mx-qx-service-sec mx-qx-service-compact" id="mxQxSecDestination" data-qx-section="destination"><div class="mx-qx-sec-head" data-qx-sec-toggle="destination"><h4>🏥 Destino y folio del servicio</h4><div class="mx-qx-sec-summary" id="mxQxSumDestination">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-formgrid"><div class="mx-qx-field"><label>Servicio de destino</label><select class="select" id="mxQxSrvService"><option value="">Selecciona servicio de destino</option></select><small id="mxQxSrvServiceHelp">Servicios cargados desde Configuración &gt; Servicios.</small></div><div class="mx-qx-field"><label>Fecha</label><input class="input" id="mxQxSrvDate" readonly></div><div class="mx-qx-field mx-qx-folio-field"><label>Folio automático</label><input class="input" id="mxQxSrvFolio" readonly placeholder="0001-DDMMAAAA-SRV"></div></div></div></div><div class="mx-qx-service-sec is-collapsed" id="mxQxSecDoctor" data-qx-section="doctor"><div class="mx-qx-sec-head" data-qx-sec-toggle="doctor"><h4>👨‍⚕️ Médico solicitante</h4><div class="mx-qx-sec-summary" id="mxQxSumDoctor">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-doctor-grid"><div class="mx-qx-field mx-qx-relative"><label>Nombre del médico</label><input class="input" id="mxQxSrvMedName" placeholder="Buscar o capturar médico"><div class="mx-qx-med-drop" id="mxQxSrvMedDrop"></div></div><div class="mx-qx-field"><label>Cédula</label><input class="input" id="mxQxSrvMedCed" placeholder="Cédula"></div><div class="mx-qx-field"><label>Teléfono</label><input class="input" id="mxQxSrvMedTel" placeholder="Teléfono"></div><div class="mx-qx-field"><label>Domicilio</label><input class="input" id="mxQxSrvMedDom" placeholder="Domicilio del médico"></div><button class="btn" id="mxQxSrvSaveMed" type="button">💾 Médico</button><div class="mx-qx-field mx-qx-anesthesiologist-field"><label for="mxQxSrvAnestName">Anestesiólogo (Médicos)</label><input class="input" id="mxQxSrvAnestName" list="mxQxSrvAnestList" placeholder="Buscar anestesiólogo en Médicos" autocomplete="off"><datalist id="mxQxSrvAnestList"></datalist><small id="mxQxSrvAnestHelp">Opcional · Selecciona un nombre del catálogo de Médicos.</small></div></div></div></div><div class="mx-qx-service-sec is-collapsed" id="mxQxSecPatient" data-qx-section="patient"><div class="mx-qx-sec-head" data-qx-sec-toggle="patient"><h4>🧑 Paciente</h4><div class="mx-qx-sec-summary" id="mxQxSumPatient">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-patient-grid"><div class="mx-qx-field"><label>Nombre del paciente</label><input class="input" id="mxQxSrvPatient" placeholder="Nombre completo"></div><div class="mx-qx-field"><label>Edad</label><input class="input" id="mxQxSrvAge" type="number" min="0" max="130" placeholder="Edad"></div><div class="mx-qx-field"><label>Sexo</label><select class="select" id="mxQxSrvSex"><option value="">Selecciona</option><option>Femenino</option><option>Masculino</option><option>Otro</option><option>No especificado</option></select></div><div class="mx-qx-field"><label>Ojo a operar</label><select class="select" id="mxQxSrvEye"><option value="">Selecciona</option><option>Derecho</option><option>Izquierdo</option><option>Ambos</option></select></div><div class="mx-qx-field"><label>Teléfono</label><input class="input" id="mxQxSrvPatientTel" placeholder="Teléfono del paciente"></div></div></div></div><div class="mx-qx-service-sec" id="mxQxSecKits" data-qx-section="kits"><div class="mx-qx-sec-head"><h4>🧰 Kits requeridos</h4><div class="mx-qx-sec-summary" id="mxQxSumKits">Área de preparación</div><span></span></div><div class="mx-qx-sec-content"><div class="mx-qx-kit-add"><select class="select" id="mxQxSrvKitSelect"><option value="">Selecciona un kit</option></select><button class="btn ok" id="mxQxSrvAddKit" type="button">＋ Agregar kit</button><span class="badge">Agrega kits, ajusta cantidades o retira productos individuales.</span></div><div class="mx-qx-selected" id="mxQxSrvSelected"></div></div></div></div><div class="mx-qx-service-foot"><div class="mx-qx-service-summary" id="mxQxSrvSummary">0 kits · 0 productos · 0 pzs</div><div class="mx-qx-foot-actions"><button class="btn" id="mxQxSrvCancel" type="button">Cancelar</button><button class="btn" id="mxQxSrvPdf" type="button">📄 Enviar a PDF</button><button class="btn mx-qx-loan-btn" id="mxQxSrvLoan" type="button">💼 Registrar préstamo</button><button class="btn ok" id="mxQxSrvFinish" type="button">✅ Finalizar salida</button></div></div></div>`;
   document.body.appendChild(modal);
   $q('mxQxServiceClose').onclick=closeServiceModal;$q('mxQxSrvCancel').onclick=closeServiceModal;$q('mxQxSrvAddKit').onclick=addServiceKit;$q('mxQxSrvSaveMed').onclick=saveServiceDoctor;$q('mxQxSrvPdf').onclick=generateCurrentServiceOrderPdf;$q('mxQxSrvLoan').onclick=registerServiceLoan;$q('mxQxSrvFinish').onclick=finalizeService;
   $q('mxQxSrvService')?.addEventListener('change',async()=>{await refreshServiceFolioPreview().catch(()=>{});updateServiceSectionSummaries();if(qTxt($q('mxQxSrvService')?.value))setServiceSection('doctor',true);});
   window.addEventListener('mx-servicios-change',()=>{const prev=$q('mxQxSrvService')?.value||serviceState.serviceInitials;renderDestinationServices(prev);refreshServiceFolioPreview().catch(()=>{});});
   modal.addEventListener('mousedown',e=>{if(e.target===modal&&!serviceBusy)closeServiceModal();});
-  bindDoctorSearch();bindServiceProgressiveSections();updateServiceSectionSummaries();
+  bindDoctorSearch();bindServiceAnestesiologoV261();bindServiceProgressiveSections();updateServiceSectionSummaries();
   return modal;
 }
 async function loadDoctors(force=false){const now=Date.now();if(!force&&doctorCache.length&&now-doctorCacheAt<60000)return doctorCache;doctorCache=await idbAll('medicos').catch(()=>[]);doctorCacheAt=now;return doctorCache;}
+// V261: anestesiólogo seleccionado para ESTE pedido; nunca se impone al kit maestro.
+async function loadServiceAnestListV261(force=false){
+  const all=await loadDoctors(force),list=$q('mxQxSrvAnestList');
+  if(list)list.innerHTML=(Array.isArray(all)?all:[]).filter(m=>qTxt(m.nombre)).map(m=>`<option value="${qEsc(m.nombre)}" label="Cédula: ${qEsc(m.cedula||'—')}"></option>`).join('');
+  return all;
+}
+function bindServiceAnestesiologoV261(){
+  const field=$q('mxQxSrvAnestName');if(!field||field.dataset.qxAnestBound)return;
+  field.dataset.qxAnestBound='1';
+  field.addEventListener('focus',()=>loadServiceAnestListV261().catch(e=>console.warn('[Pedido · Anestesiólogo]',e)));
+  field.addEventListener('input',()=>{serviceState.anestId=null;serviceState.anestCedula='';const hint=$q('mxQxSrvAnestHelp');if(hint)hint.textContent='Opcional · Selecciona un nombre del catálogo de Médicos.';updateServiceSectionSummaries();});
+  field.addEventListener('change',()=>hydrateServiceAnestesiologoV261(false).catch(()=>{}));
+}
+async function hydrateServiceAnestesiologoV261(strict=true){
+  const name=qTxt($q('mxQxSrvAnestName')?.value);serviceState.anestId=null;serviceState.anestCedula='';
+  if(!name){const hint=$q('mxQxSrvAnestHelp');if(hint)hint.textContent='Opcional · Selecciona un nombre del catálogo de Médicos.';return {nombre:'',cedula:'',id:null};}
+  const all=await loadServiceAnestListV261(true),matching=all.filter(m=>qNorm(m.nombre)===qNorm(name));
+  if(!matching.length){if(strict)throw new Error('El anestesiólogo no está en Médicos. Selecciona un nombre registrado en el catálogo.');return null;}
+  if(matching.length>1&&new Set(matching.map(m=>qNorm(m.cedula))).size>1){if(strict)throw new Error('Hay varios médicos con ese nombre. Distingue el registro en Médicos antes de continuar.');return null;}
+  const found=matching[0];serviceState.anestId=found._id??null;serviceState.anestCedula=qTxt(found.cedula);$q('mxQxSrvAnestName').value=qTxt(found.nombre);
+  const hint=$q('mxQxSrvAnestHelp');if(hint)hint.textContent=serviceState.anestCedula?'Cédula: '+serviceState.anestCedula:'Registro de Médicos (sin cédula)';
+  updateServiceSectionSummaries();return {nombre:qTxt(found.nombre),cedula:serviceState.anestCedula,id:serviceState.anestId};
+}
 function fillDoctor(m){serviceState.doctorId=m?._id||null;$q('mxQxSrvMedName').value=qTxt(m?.nombre);$q('mxQxSrvMedCed').value=qTxt(m?.cedula);$q('mxQxSrvMedTel').value=qTxt(m?.telefono);$q('mxQxSrvMedDom').value=qTxt(m?.domicilio);renderDoctorDrop([]);updateServiceSectionSummaries();if(qTxt(m?.nombre))setServiceSection('patient',true);}
 function renderDoctorDrop(rows=[]){const d=$q('mxQxSrvMedDrop');if(!d)return;if(!rows.length){d.style.display='none';d.innerHTML='';return;}d.innerHTML=rows.slice(0,25).map((m,i)=>`<div class="mx-qx-med-item" data-qx-med-pick="${i}"><b>${qEsc(m.nombre||'Médico')}</b><small>Cédula: ${qEsc(m.cedula||'—')} · Tel: ${qEsc(m.telefono||'—')}</small></div>`).join('');d.style.display='block';d.querySelectorAll('[data-qx-med-pick]').forEach(el=>el.onmousedown=e=>{e.preventDefault();fillDoctor(rows[Number(el.dataset.qxMedPick)]);});}
 function bindDoctorSearch(){
@@ -33824,7 +34272,7 @@ async function saveServiceDoctor(){
 function renderServiceKitSelect(){
   const sel=$q('mxQxSrvKitSelect');if(!sel)return;const selected=new Set((serviceState.selectedKits||[]).map(k=>String(k.id)));sel.innerHTML='<option value="">Selecciona un kit</option>'+kitRows.map(k=>`<option value="${qEsc(k._id)}" ${selected.has(String(k._id))?'disabled':''}>${qEsc(k.nombre)} · ${qEsc(kitSummary(k))}</option>`).join('');
 }
-function addServiceKit(){const id=$q('mxQxSrvKitSelect')?.value;if(!id)return qAlert('Selecciona un kit para agregar.');if(serviceState.selectedKits.some(k=>String(k.id)===String(id)))return;const k=kitRows.find(x=>String(x._id)===String(id));if(!k)return;serviceState.selectedKits.push({id:k._id,nombre:qTxt(k.nombre),descripcion:qTxt(k.descripcion),productos:qClone(k.productos||[])||[]});setServiceSection('kits',false);renderServiceKits();renderServiceKitSelect();updateServiceSectionSummaries();}
+function addServiceKit(){const id=$q('mxQxSrvKitSelect')?.value;if(!id)return qAlert('Selecciona un kit para agregar.');if(serviceState.selectedKits.some(k=>String(k.id)===String(id)))return;const k=kitRows.find(x=>String(x._id)===String(id));if(!k)return;serviceState.selectedKits.push({id:k._id,nombre:qTxt(k.nombre),descripcion:qTxt(k.descripcion),anestesiologo:qTxt(k.anestesiologo),anestesiologo_cedula:qTxt(k.anestesiologo_cedula),productos:qClone(k.productos||[])||[]});setServiceSection('kits',false);renderServiceKits();renderServiceKitSelect();updateServiceSectionSummaries();}
 function serviceAggregate(){
   const map=new Map();
   for(const k of serviceState.selectedKits||[]){
@@ -33840,28 +34288,42 @@ function serviceAggregate(){
   return[...map.values()].map(x=>({...x,kits:[...x.kits]}));
 }
 async function renderServiceKits(){
-  const host=$q('mxQxSrvSelected');if(!host)return;const av=await qAvailabilityMap().catch(()=>new Map());
+  const host=$q('mxQxSrvSelected');if(!host)return;
+  const token=++serviceRenderSequenceV261;
+  let av=null;try{av=await qAvailabilityMap();}catch(e){console.warn('[Salidas internas · Disponibilidad]',e);}
+  if(token!==serviceRenderSequenceV261||!host.isConnected)return;
+  // La misma clave puede estar en varios kits: el stock se compara contra el TOTAL solicitado.
+  const requested=new Map();for(const it of serviceAggregate())requested.set(qProdKey(it),Math.max(0,qInt(it.cantidad)));
+  const problems=av?[...requested].map(([key,qty])=>({qty,stock:Math.max(0,qInt(av.get(key)?.disponible))})).filter(x=>x.stock<x.qty):[];
+  const shortage=problems.reduce((n,x)=>n+x.qty-x.stock,0),zero=problems.filter(x=>x.stock===0).length;
   let allCost=0,allSale=0;
-  host.innerHTML=serviceState.selectedKits.length?serviceState.selectedKits.map((k,ki)=>{
+  // V260: conservar un único listado y una fila separadora por cada kit.
+  const blocks=serviceState.selectedKits.map((k,ki)=>{
     let kitCost=0,kitSale=0;
     const rows=(k.productos||[]).map((p,pi)=>{
-      const a=av.get(qProdKey(p)),qty=Math.max(1,qInt(p.cantidad)||1),cost=Math.max(0,qNum(a?.costo_unitario ?? p.costo_unitario)),price=Math.max(0,qNum(a?.precio_venta ?? p.precio_venta));
+      const a=av?.get(qProdKey(p)),qty=Math.max(1,qInt(p.cantidad)||1),cost=Math.max(0,qNum(a?.costo_unitario ?? p.costo_unitario)),price=Math.max(0,qNum(a?.precio_venta ?? p.precio_venta));
+      const stock=av?Math.max(0,qInt(a?.disponible)):null,total=requested.get(qProdKey(p))||qty,missing=stock===null?null:Math.max(0,total-stock);
+      const css=stock===0?'mx-qx-kit-stock-none':missing>0?'mx-qx-kit-stock-low':'';
+      const label=stock===null?'Sin comprobar':stock===0?'SIN EXISTENCIA':missing>0?'INSUFICIENTE':'Disponible';
       p.costo_unitario=cost;p.precio_venta=price;kitCost+=cost*qty;kitSale+=price*qty;
-      return `<tr><td><b>${qEsc(p.clave||p.codigo_barras||'')}</b></td><td>${qEsc(p.descripcion||'')}</td><td style="font-weight:900">${qInt(a?.disponible||0)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price)}</td><td><input class="input" type="number" min="1" step="1" value="${qty}" data-qx-srv-qty="${ki}:${pi}"></td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost*qty)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price*qty)}</td><td><button class="btn danger" type="button" data-qx-srv-del-prod="${ki}:${pi}">🗑️</button></td></tr>`;
+      return `<tr class="mx-qx-kit-product-row ${css}"><td><b>${qEsc(p.clave||p.codigo_barras||'')}</b></td><td>${qEsc(p.descripcion||'')}<div><span class="mx-qx-stock-badge">${label}</span>${missing>0?` <small>Faltan ${missing} pzs · saldo proyectado: -${missing} (pedido permitido)</small>`:''}</div></td><td style="font-weight:900">${stock===null?'—':stock}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price)}</td><td><input class="input" type="number" min="1" step="1" value="${qty}" aria-label="Cantidad ${qEsc(p.descripcion||p.clave||'')}" data-qx-srv-qty="${ki}:${pi}"></td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost*qty)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price*qty)}</td><td><button class="btn danger" type="button" data-qx-srv-del-prod="${ki}:${pi}">Quitar</button></td></tr>`;
     }).join('')||'<tr><td colspan="9">Este kit quedó sin productos.</td></tr>';
     allCost+=kitCost;allSale+=kitSale;
-    return `<div class="mx-qx-selected-card"><div class="mx-qx-selected-head"><div><b>${qEsc(k.nombre)}</b><small>${qEsc(k.descripcion||'')}</small><small class="mx-qx-fin-summary" style="text-align:left;margin-top:5px">Costo ${qMoney(kitCost)} · Venta ref. ${qMoney(kitSale)}</small></div><button class="btn danger" type="button" data-qx-srv-del-kit="${ki}">Quitar kit</button></div><div style="overflow:auto"><table class="mx-qx-srv-table"><thead><tr><th>Clave</th><th>Producto</th><th>Disponible</th><th class="mx-qx-financial-only">Costo unit.</th><th class="mx-qx-financial-only">Precio venta</th><th>Cantidad</th><th class="mx-qx-financial-only">Costo</th><th class="mx-qx-financial-only">Venta ref.</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
-  }).join(''):'<div class="badge">Agrega uno o más kits configurados para preparar el servicio.</div>';
-  host.querySelectorAll('[data-qx-srv-del-kit]').forEach(b=>b.onclick=()=>{serviceState.selectedKits.splice(Number(b.dataset.qxSrvDelKit),1);renderServiceKits();renderServiceKitSelect();});
-  host.querySelectorAll('[data-qx-srv-del-prod]').forEach(b=>b.onclick=()=>{const [ki,pi]=String(b.dataset.qxSrvDelProd).split(':').map(Number);serviceState.selectedKits[ki]?.productos?.splice(pi,1);renderServiceKits();});
-  host.querySelectorAll('[data-qx-srv-qty]').forEach(inp=>inp.onchange=()=>{const [ki,pi]=String(inp.dataset.qxSrvQty).split(':').map(Number),p=serviceState.selectedKits[ki]?.productos?.[pi];if(!p)return;p.cantidad=Math.max(1,qInt(inp.value)||1);inp.value=p.cantidad;renderServiceKits();});
+    const section=`<tr class="mx-qx-kit-divider"><td colspan="9"><div class="mx-qx-kit-divider-content"><div><b>🧰 KIT ${ki+1}: ${qEsc(k.nombre)}</b><small>${qEsc(k.descripcion||'')}${qTxt(k.anestesiologo)?` · Anestesiólogo: ${qEsc(k.anestesiologo)}`:''}<span class="mx-qx-financial-only"> · Costo ${qMoney(kitCost)} · Venta ref. ${qMoney(kitSale)}</span></small></div><button class="btn danger" type="button" data-qx-srv-del-kit="${ki}">Quitar kit</button></div></td></tr>`;
+    return section+rows;
+  });
+  const alert=blocks.length?`<div class="mx-qx-srv-stock-notice" role="status">${av?(problems.length?`⚠️ ${problems.length} producto(s) con faltante (${zero} sin existencia); faltan ${shortage} piezas en total. El armado y préstamo quedan habilitados sin descontar inventario hasta finalizar.`:'✅ Disponibilidad suficiente para los kits seleccionados.'):'No se pudo verificar el inventario en este momento; el armado de kits continúa habilitado.'}</div>`:'';
+  host.innerHTML=blocks.length?`<div class="mx-qx-srv-unified-scroll"><table class="mx-qx-srv-table mx-qx-srv-unified-table"><thead><tr><th>Clave</th><th>Producto</th><th>Disponible</th><th class="mx-qx-financial-only">Costo unit.</th><th class="mx-qx-financial-only">Precio venta</th><th>Cantidad</th><th class="mx-qx-financial-only">Costo</th><th class="mx-qx-financial-only">Venta ref.</th><th>Acciones</th></tr></thead><tbody>${blocks.join('')}</tbody></table></div>${alert}`:'<div class="badge">Agrega uno o más kits configurados para preparar el servicio.</div>';
+  host.querySelectorAll('[data-qx-srv-del-kit]').forEach(b=>b.onclick=()=>{serviceState.selectedKits.splice(Number(b.dataset.qxSrvDelKit),1);renderServiceKits();renderServiceKitSelect();updateServiceSectionSummaries();});
+  host.querySelectorAll('[data-qx-srv-del-prod]').forEach(b=>b.onclick=()=>{const [ki,pi]=String(b.dataset.qxSrvDelProd).split(':').map(Number);serviceState.selectedKits[ki]?.productos?.splice(pi,1);renderServiceKits();updateServiceSectionSummaries();});
+  host.querySelectorAll('[data-qx-srv-qty]').forEach(inp=>inp.onchange=()=>{const [ki,pi]=String(inp.dataset.qxSrvQty).split(':').map(Number),p=serviceState.selectedKits[ki]?.productos?.[pi];if(!p)return;p.cantidad=Math.max(1,qInt(inp.value)||1);inp.value=p.cantidad;renderServiceKits();updateServiceSectionSummaries();});
   updateServiceSummary({cost:allCost,sale:allSale});
 }
 
 function updateServiceSummary(fin={}){const rows=serviceAggregate(),qty=rows.reduce((s,x)=>s+qInt(x.cantidad),0),kits=serviceState.selectedKits.length;const el=$q('mxQxSrvSummary');if(el){let text=`${kits} kit${kits===1?'':'s'} · ${rows.length} producto${rows.length===1?'':'s'} · ${qty} pzs`;if(qFinancialOn())text+=` · Costo ${qMoney(fin.cost||0)} · Venta ref. ${qMoney(fin.sale||0)}`;el.textContent=text;}const k=$q('mxQxSumKits');if(k)k.textContent=`${kits} kits · ${rows.length} productos · ${qty} pzs`;updateServiceSectionSummaries();}
 async function openServiceModal(){
-  ensureServiceModal();await loadKits();serviceState={folio:'',selectedKits:[],doctorId:null,serviceName:'',serviceInitials:''};
-  const ids=['mxQxSrvMedName','mxQxSrvMedCed','mxQxSrvMedTel','mxQxSrvMedDom','mxQxSrvPatient','mxQxSrvAge','mxQxSrvPatientTel'];ids.forEach(id=>{const e=$q(id);if(e)e.value='';});if($q('mxQxSrvSex'))$q('mxQxSrvSex').value='';if($q('mxQxSrvEye'))$q('mxQxSrvEye').value='';renderDestinationServices('');if($q('mxQxSrvService'))$q('mxQxSrvService').value='';$q('mxQxSrvDate').value=new Date().toLocaleString('es-MX');await refreshServiceFolioPreview();renderServiceKitSelect();renderServiceKits();updateServiceSectionSummaries();setServiceSection('destination',false);$q('mxQxServiceModal').classList.remove('hidden');setTimeout(()=>$q('mxQxSrvService')?.focus(),40);
+  ensureServiceModal();await loadKits();serviceState={folio:'',selectedKits:[],doctorId:null,anestId:null,anestCedula:'',serviceName:'',serviceInitials:''};
+  const ids=['mxQxSrvMedName','mxQxSrvMedCed','mxQxSrvMedTel','mxQxSrvMedDom','mxQxSrvAnestName','mxQxSrvPatient','mxQxSrvAge','mxQxSrvPatientTel'];ids.forEach(id=>{const e=$q(id);if(e)e.value='';});if($q('mxQxSrvSex'))$q('mxQxSrvSex').value='';if($q('mxQxSrvEye'))$q('mxQxSrvEye').value='';renderDestinationServices('');if($q('mxQxSrvService'))$q('mxQxSrvService').value='';$q('mxQxSrvDate').value=new Date().toLocaleString('es-MX');if($q('mxQxSrvAnestHelp'))$q('mxQxSrvAnestHelp').textContent='Opcional · Selecciona un nombre del catálogo de Médicos.';loadServiceAnestListV261().catch(()=>{});await refreshServiceFolioPreview();renderServiceKitSelect();renderServiceKits();updateServiceSectionSummaries();setServiceSection('destination',false);$q('mxQxServiceModal').classList.remove('hidden');setTimeout(()=>$q('mxQxSrvService')?.focus(),40);
 }
 function closeServiceModal(){if(serviceBusy)return;$q('mxQxServiceModal')?.classList.add('hidden');renderDoctorDrop([]);}
 async function hydrateExactDoctor(){
@@ -33888,10 +34350,10 @@ async function planServiceAllocations(items){
 }
 function serviceShortageTotal(shortages=[]){return (shortages||[]).reduce((s,x)=>s+Math.max(0,qInt(x?.missing)),0);}
 function serviceShortageText(shortages=[]){return (shortages||[]).filter(x=>qInt(x?.missing)>0).map(x=>`${qTxt(x?.item?.clave||x?.item?.descripcion)||'Producto'}: faltan ${qInt(x.missing)} de ${qInt(x.needed)} pzs`).join('\n');}
-async function saveServiceShortageRows({shortages=[],fecha,usuario,kits=[],folio,destino,medico,paciente,eanPrestamo=''}){
+async function saveServiceShortageRows({shortages=[],fecha,usuario,kits=[],folio,destino,medico,paciente,eanPrestamo='',anestesiologo={}}){
   for(const s of shortages||[]){
     const missing=Math.max(0,qInt(s?.missing));if(!missing)continue;const p=s.item||{},needed=Math.max(missing,qInt(s?.needed)),fin=qFinanceOf(p||{}),unitCost=Math.max(0,qNum(p.costo_unitario||p.costo||fin?.costo_final||fin?.costo)),unitPrice=Math.max(0,qNum(p.precio_venta||p.precioVenta||fin?.precio_venta));
-    const reg={fecha,usuario,clave:qTxt(p.clave),codigo_barras:qTxt(p.codigo_barras||p.codigoBarras||p.barcode),descripcion:qTxt(p.descripcion||p.nombre),unidad:qTxt(p.unidad)||'PIEZA',lote:'',caducidad:'',costo_unitario:unitCost,costo:unitCost,precio_venta:unitPrice,valor_costo:0,valor_venta:0,valor_venta_solicitada:unitPrice*missing,pzs:0,cantidad:0,pzs_solicitadas:missing,cantidad_solicitada:missing,pzs_faltantes:missing,cantidad_faltante:missing,pzs_requeridas_kit:needed,pzs_surtidas_kit:Math.max(0,qInt(s?.supplied)),ex_ini:Math.max(0,qInt(s?.supplied)),ex_fin:0,tipo_doc:'Servicio quirúrgico',estado:'Faltante',prestamo_activo:false,ean_prestamo:qTxt(eanPrestamo),folio,servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,medico:medico.nombre,cedula:medico.cedula,paciente:paciente.nombre,expediente:'',observaciones:`Servicio quirúrgico · Destino: ${destino.nombre} (${destino.iniciales}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')} · FALTANTE ${missing} PZS POR EXISTENCIA`,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,kits_quirurgicos:kits,servicio_quirurgico:true,kit_faltante:true,registro_sin_existencia:true,createdAt:new Date().toISOString()};
+    const reg={fecha,usuario,clave:qTxt(p.clave),codigo_barras:qTxt(p.codigo_barras||p.codigoBarras||p.barcode),descripcion:qTxt(p.descripcion||p.nombre),unidad:qTxt(p.unidad)||'PIEZA',lote:'',caducidad:'',costo_unitario:unitCost,costo:unitCost,precio_venta:unitPrice,valor_costo:0,valor_venta:0,valor_venta_solicitada:unitPrice*missing,pzs:0,cantidad:0,pzs_solicitadas:missing,cantidad_solicitada:missing,pzs_prestadas:0,pzs_surtidas_iniciales:0,pzs_utilizadas:0,pzs_devueltas:0,pzs_faltantes:missing,cantidad_faltante:missing,pzs_requeridas_kit:needed,pzs_surtidas_kit:Math.max(0,qInt(s?.supplied)),ex_ini:Math.max(0,qInt(s?.supplied)),ex_fin:0,tipo_doc:'Servicio quirúrgico',estado:'Faltante',prestamo_activo:false,ean_prestamo:qTxt(eanPrestamo),folio,servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(anestesiologo.nombre),anestesiologo_cedula:qTxt(anestesiologo.cedula),anestesiologo_id:anestesiologo.id??null,paciente:paciente.nombre,expediente:'',observaciones:`Servicio quirúrgico · Destino: ${destino.nombre} (${destino.iniciales}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')} · FALTANTE ${missing} PZS POR EXISTENCIA`,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,kits_quirurgicos:kits,servicio_quirurgico:true,kit_faltante:true,registro_sin_existencia:true,createdAt:new Date().toISOString()};
     await saveSalida(reg);
   }
 }
@@ -33930,21 +34392,26 @@ function qPdfHtml(data,logos={}){
   const est=window.mxGetEstablishmentData?.()||{},isOrder=data?.pdfMode==='pedido',docTitle=qServicePdfDocumentTitle(data),docSubtitle=isOrder?'PEDIDO PREVIO · NO AFECTA INVENTARIO':`SOLICITUD DE SERVICIO · ${qServicePdfDestinationName(data).toLocaleUpperCase('es-MX')}`,esc=v=>qEsc(v==null?'':v),items=Array.isArray(data?.items)?data.items:[],leftLogo=logos?.left||logos?.collectiveLeft||'',rightLogo=logos?.right||logos?.collectiveRight||'',footerLogo=logos?.footer||'',unitKey=qTxt(est.claveUnidad||est.clave_unidad)||(typeof mxOrderPdfUnitKey==='function'?mxOrderPdfUnitKey({}):''),service=`${qTxt(data?.destino?.nombre)||'—'}${qTxt(data?.destino?.iniciales)?' ('+qTxt(data.destino.iniciales)+')':''}`;
   const rows=items.map((it,i)=>{let parts={name:it.descripcion,presentation:it.unidad||'PIEZA'};try{if(typeof mxOrderPackagingParts==='function')parts=mxOrderPackagingParts(it)||parts}catch(_e){}const req=qServicePdfRequestedQty(it),sup=qServicePdfSuppliedQty(it,isOrder),price=qNum(it.precio_venta),lineTotal=price*(isOrder?req:sup);return `<tr><td class="c">${i+1}</td><td>${esc(it.clave||it.codigo_barras||'')}</td><td>${esc(parts.name||it.descripcion||'')}</td><td>${esc(parts.presentation||it.unidad||'PIEZA')}</td><td class="c">${req||''}</td><td class="c">${isOrder?'':(sup||'0')}</td><td>${esc(it.lotes||'')}</td><td class="money">${esc(qMoney(price))}</td><td class="money"><b>${esc(qMoney(lineTotal))}</b></td></tr>`}).join('');
   const blank=Math.max(4,10-Math.min(10,items.length)),blankRows=Array.from({length:blank},(_,j)=>`<tr class="blank"><td class="c">${items.length+j+1}</td>${'<td></td>'.repeat(8)}</tr>`).join('');
-  const summary=isOrder?`<b>TOTAL SOLICITADO:</b> ${data.totalSolicitado||0} PIEZAS &nbsp;&nbsp;&nbsp; <b>TOTAL VENTA REFERENCIAL:</b> ${esc(qMoney(data.totalVenta||0))}`:`<b>SOLICITADO:</b> ${data.totalSolicitado||0} PIEZAS &nbsp;&nbsp; <b>SURTIDO:</b> ${data.totalSurtido||0} &nbsp;&nbsp; <b>FALTANTE:</b> ${data.totalFaltante||0} &nbsp;&nbsp;&nbsp; <b>TOTAL VENTA REFERENCIAL:</b> ${esc(qMoney(data.totalVenta||0))}`;
+  const summary=isOrder?`<b>TOTAL SOLICITADO:</b> ${data.totalSolicitado||0} PIEZAS &nbsp;&nbsp;&nbsp; <b>TOTAL VENTA REFERENCIAL:</b> ${esc(qMoney(data.totalVenta||0))}`:`<b>SOLICITADO:</b> ${data.totalSolicitado||0} PIEZAS &nbsp;&nbsp; <b>SURTIDO:</b> ${data.totalSurtido||0} &nbsp;&nbsp; <b>FALTANTE:</b> ${data.totalFaltante||0} &nbsp;&nbsp; <b>PRESTADO INICIAL:</b> ${data.totalPrestadoInicial??data.totalSurtido??0} &nbsp;&nbsp; <b>DEVUELTO:</b> ${data.totalDevuelto??0} &nbsp;&nbsp; <b>TOTAL VENTA REFERENCIAL:</b> ${esc(qMoney(data.totalVenta||0))}`;
   const patientLine=`Nombre: ${data?.paciente?.nombre||'—'} · Edad: ${data?.paciente?.edad||'—'} · Sexo: ${data?.paciente?.sexo||'—'} · Ojo: ${data?.paciente?.ojo||'—'} · Tel: ${data?.paciente?.telefono||'—'}`;
-  const doctorLine=`Nombre: ${data?.medico?.nombre||'—'} · Cédula: ${data?.medico?.cedula||'—'} · Tel: ${data?.medico?.telefono||'—'} · Domicilio: ${data?.medico?.domicilio||'—'}`;
-  return `<!doctype html><html><head><meta charset="utf-8"><style>@page{size:Letter landscape;margin:7mm}*{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#111;margin:0;font-size:8.2px}.official{position:relative;min-height:22mm;text-align:center;padding-top:1mm}.official .lg{position:absolute;left:0;top:0;width:62mm;height:16mm;object-fit:contain;object-position:left top}.official .rg{position:absolute;right:0;top:0;width:50mm;height:18mm;object-fit:contain;object-position:right top}.official .t1{font-weight:800;font-size:10px}.official .t2{font-weight:800;font-size:9px;margin-top:2px}.official .t3{font-weight:900;font-size:10px;margin-top:2px}.official .doc{font-weight:900;font-size:12px;margin-top:4px}.official .sub{font-size:7px;margin-top:2px}.info{width:100%;border-collapse:collapse;margin-top:1.5mm;table-layout:fixed}.info td{border:1px solid #111;padding:2px 3px;vertical-align:middle;height:5.2mm}.info .lab{font-weight:800;font-size:6.5px;width:14%}.info .val{font-size:7.2px}.info .wide{font-size:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tbl{width:100%;border-collapse:collapse;margin-top:3mm;table-layout:fixed}.tbl th,.tbl td{border:1px solid #111;padding:2.4px;vertical-align:top;word-break:break-word}.tbl th{background:#d7d7d7;text-align:center;font-size:6.7px}.tbl td{font-size:7px}.tbl .c{text-align:center}.tbl .money{text-align:right;white-space:nowrap}.tbl tr.blank td{height:6.5mm}.sum{text-align:right;font-size:8.8px;margin-top:3mm}.sign{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5mm;margin-top:10mm}.sig{border:1px solid #111;text-align:center;min-height:15mm;padding:2mm 2mm 1mm;font-size:6.7px}.sig .name{font-weight:800;min-height:5mm}.sig .line{border-top:1px solid #111;margin:2mm 2mm 1mm}.footer{display:flex;align-items:end;gap:3mm;margin-top:3mm;color:#555;font-size:6.2px}.footer img{width:58mm;height:6mm;object-fit:contain;object-position:left bottom}.footer span{flex:1;text-align:right}</style></head><body><div class="official">${leftLogo?`<img class="lg" src="${esc(leftLogo)}">`:''}${rightLogo?`<img class="rg" src="${esc(rightLogo)}">`:''}<div class="t3">${esc((est.nombre||'MACROXEL HOSPITALES').toUpperCase())}</div><div class="doc">${esc(docTitle)}</div><div class="sub">${esc(docSubtitle)}</div></div><table class="info"><tr><td class="lab">HOSPITAL</td><td class="val">${esc(est.nombre||'—')}</td><td class="lab">CLAVE DE LA UNIDAD</td><td class="val">${esc(unitKey||'—')}</td></tr><tr><td class="lab">FECHA</td><td class="val">${esc(data?.fechaTexto||'—')}</td><td class="lab">FOLIO</td><td class="val"><b>${esc(data?.folio||'—')}</b></td></tr><tr><td class="lab">SERVICIO</td><td class="val">${esc(service)}</td><td class="lab">DOCUMENTO</td><td class="val">${esc(isOrder?'PEDIDO':'SOLICITUD')}</td></tr><tr><td class="lab">PACIENTE</td><td class="wide" colspan="3">${esc(patientLine)}</td></tr><tr><td class="lab">MÉDICO SOLICITANTE</td><td class="wide" colspan="3">${esc(doctorLine)}</td></tr><tr><td class="lab">USUARIO FARMACIA</td><td class="val">${esc(data?.usuario||'—')}</td><td class="lab">ESTADO</td><td class="val">${esc(isOrder?'PEDIDO PREVIO · SIN AFECTAR INVENTARIO':'SOLICITUD REGISTRADA')}</td></tr></table><table class="tbl"><colgroup><col style="width:3%"><col style="width:9%"><col style="width:27%"><col style="width:12%"><col style="width:7%"><col style="width:7%"><col style="width:15%"><col style="width:9%"><col style="width:11%"></colgroup><thead><tr><th>#</th><th>CLAVE</th><th>PRODUCTO</th><th>PRESENTACIÓN</th><th>SOLIC.</th><th>SURT.</th><th>LOTE / CADUCIDAD</th><th>PRECIO VENTA</th><th>TOTAL</th></tr></thead><tbody>${rows}${blankRows}</tbody></table><div class="sum">${summary}</div><div class="sign"><div class="sig"><div class="name">${esc(data?.medico?.nombre||'')}</div><div class="line"></div><b>MÉDICO SOLICITANTE · FIRMA</b></div><div class="sig"><div class="name">${esc(data?.paciente?.nombre||'')}</div><div class="line"></div><b>PACIENTE / RESPONSABLE · RECIBE</b></div><div class="sig"><div class="name">${esc(data?.usuario||'')}</div><div class="line"></div><b>FARMACIA · SURTE</b></div></div><div class="footer">${footerLogo?`<img src="${esc(footerLogo)}">`:''}<span>${esc(isOrder?`Pedido para servicio ${qServicePdfDestinationName(data)} generado por Macroxel Hospitales. No modifica inventario.`:`Solicitud para servicio ${qServicePdfDestinationName(data)} generada por Macroxel Hospitales.`)}</span></div></body></html>`;
+  const doctorLine=`Médico: ${data?.medico?.nombre||'—'} · Céd.: ${data?.medico?.cedula||'—'}${data?.anestesiologo?.nombre?` · Anestesiólogo: ${data.anestesiologo.nombre}${data.anestesiologo.cedula?' · Céd.: '+data.anestesiologo.cedula:''}`:''} · Tel: ${data?.medico?.telefono||'—'}`;
+  return `<!doctype html><html><head><meta charset="utf-8"><style>@page{size:Letter landscape;margin:7mm}*{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#111;margin:0;font-size:8.2px}.official{position:relative;min-height:16mm;text-align:center;padding-top:1mm}.official .lg{position:absolute;left:0;top:0;width:62mm;height:16mm;object-fit:contain;object-position:left top}.official .rg{position:absolute;right:0;top:0;width:50mm;height:18mm;object-fit:contain;object-position:right top}.official .t3{font-weight:900;font-size:10px;margin-top:1px}.official .doc{font-weight:900;font-size:12px;margin-top:3px}.official .sub{font-size:7px;margin-top:2px}.info{width:100%;border-collapse:collapse;margin-top:1.5mm;table-layout:fixed}.info td{border:1px solid #111;padding:2px 3px;vertical-align:middle;height:5.2mm}.info .lab{font-weight:800;font-size:6.5px;width:14%}.info .val{font-size:7.2px}.info .wide{font-size:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tbl{width:100%;border-collapse:collapse;margin-top:3mm;table-layout:fixed}.tbl th,.tbl td{border:1px solid #111;padding:2.4px;vertical-align:top;word-break:break-word}.tbl th{background:#d7d7d7;text-align:center;font-size:6.7px}.tbl td{font-size:7px}.tbl .c{text-align:center}.tbl .money{text-align:right;white-space:nowrap}.tbl tr.blank td{height:6.5mm}.sum{text-align:right;font-size:8.8px;margin-top:3mm}.sign{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5mm;margin-top:10mm}.sig{border:1px solid #111;text-align:center;min-height:15mm;padding:2mm 2mm 1mm;font-size:6.7px}.sig .name{font-weight:800;min-height:5mm}.sig .line{border-top:1px solid #111;margin:2mm 2mm 1mm}.footer{display:flex;align-items:end;gap:3mm;margin-top:3mm;color:#555;font-size:6.2px}.footer img{width:58mm;height:6mm;object-fit:contain;object-position:left bottom}.footer span{flex:1;text-align:right}</style></head><body><div class="official">${leftLogo?`<img class="lg" src="${esc(leftLogo)}">`:''}${rightLogo?`<img class="rg" src="${esc(rightLogo)}">`:''}<div class="t3">${esc((est.nombre||'MACROXEL HOSPITALES').toUpperCase())}</div><div class="doc">${esc(docTitle)}</div><div class="sub">${esc(docSubtitle)}</div></div><table class="info"><tr><td class="lab">HOSPITAL</td><td class="val">${esc(est.nombre||'—')}</td><td class="lab">CLAVE DE LA UNIDAD</td><td class="val">${esc(unitKey||'—')}</td></tr><tr><td class="lab">SERVICIO</td><td class="val">${esc(service)}</td><td class="lab">FECHA</td><td class="val">${esc(data?.fechaTexto||'—')}</td></tr><tr><td class="lab">FOLIO</td><td class="val"><b>${esc(data?.folio||'—')}</b></td><td class="lab">DOCUMENTO</td><td class="val">${esc(isOrder?'PEDIDO':'SOLICITUD')}</td></tr><tr><td class="lab">PACIENTE</td><td class="wide" colspan="3">${esc(patientLine)}</td></tr><tr><td class="lab">MÉDICO SOLICITANTE</td><td class="wide" colspan="3">${esc(doctorLine)}</td></tr><tr><td class="lab">USUARIO FARMACIA</td><td class="val">${esc(data?.usuario||'—')}</td><td class="lab">ESTADO</td><td class="val">${esc(isOrder?'PEDIDO PREVIO · SIN AFECTAR INVENTARIO':'SOLICITUD REGISTRADA')}</td></tr></table><table class="tbl"><colgroup><col style="width:3%"><col style="width:9%"><col style="width:27%"><col style="width:12%"><col style="width:7%"><col style="width:7%"><col style="width:15%"><col style="width:9%"><col style="width:11%"></colgroup><thead><tr><th>#</th><th>CLAVE</th><th>PRODUCTO</th><th>PRESENTACIÓN</th><th>SOLIC.</th><th>SURT.</th><th>LOTE / CADUCIDAD</th><th>PRECIO VENTA</th><th>TOTAL</th></tr></thead><tbody>${rows}${blankRows}</tbody></table><div class="sum">${summary}</div><div class="sign"><div class="sig"><div class="name">${esc(data?.medico?.nombre||'')}</div><div class="line"></div><b>MÉDICO SOLICITANTE · FIRMA</b></div><div class="sig"><div class="name">${esc(data?.paciente?.nombre||'')}</div><div class="line"></div><b>PACIENTE / RESPONSABLE · RECIBE</b></div><div class="sig"><div class="name">${esc(data?.usuario||'')}</div><div class="line"></div><b>FARMACIA · SURTE</b></div></div><div class="footer">${footerLogo?`<img src="${esc(footerLogo)}">`:''}<span>${esc(isOrder?`Pedido para servicio ${qServicePdfDestinationName(data)} generado por Macroxel Hospitales. No modifica inventario.`:`Solicitud para servicio ${qServicePdfDestinationName(data)} generada por Macroxel Hospitales.`)}</span></div></body></html>`;
 }
 function drawQxBlankGrid(doc,startY,endY,startNo,widths){const left=8,rowH=7,rows=Math.max(0,Math.floor((endY-startY)/rowH));if(!rows)return startY;const xs=[left];widths.forEach(w=>xs.push(xs.at(-1)+w));doc.setDrawColor(0);doc.setLineWidth(.22);for(let i=0;i<rows;i++){const y=startY+i*rowH;doc.rect(left,y,widths.reduce((a,b)=>a+b,0),rowH);for(let c=1;c<xs.length-1;c++)doc.line(xs[c],y,xs[c],y+rowH);doc.setFont('helvetica','normal');doc.setFontSize(5.2);doc.text(String(startNo+i),left+widths[0]/2,y+4.5,{align:'center'});}return startY+rows*rowH;}
 
 /* ===== MACROXEL V243 · PDF SERVICIO QUIRURGICO SIN DEPENDENCIA EXTERNA ===== */
 function qServicePdfFallbackClean(v){
-  let s='';try{s=typeof mxOrderPdfSafeText==='function'?mxOrderPdfSafeText(v):qTxt(v);}catch(_e){s=String(v??'');}
+  let s='';
+  try{s=typeof mxOrderPdfSafeText==='function'?mxOrderPdfSafeText(v):qTxt(v);}catch(_e){s=String(v??'');}
   try{s=String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'');}catch(_e){s=String(s||'');}
   return s.replace(/[^\x20-\x7E]/g,' ').replace(/\s+/g,' ').trim();
 }
 function qServicePdfFallbackEsc(v){return qServicePdfFallbackClean(v).replace(/\\/g,'\\\\').replace(/\(/g,'\\(').replace(/\)/g,'\\)');}
-function qServicePdfFallbackWrap(v,maxChars=54){const s=qServicePdfFallbackClean(v);if(!s)return [''];const words=s.split(/\s+/),out=[];let line='';for(const word of words){if(!line){line=word;continue;}if((line+' '+word).length<=maxChars)line+=' '+word;else{out.push(line);line=word;}}if(line)out.push(line);return out.length?out:[''];}
+function qServicePdfFallbackWrap(v,maxChars=54){
+  const s=qServicePdfFallbackClean(v);if(!s)return [''];const words=s.split(/\s+/),out=[];let line='';
+  for(const word of words){if(!line){line=word;continue;}if((line+' '+word).length<=maxChars){line+=' '+word;}else{out.push(line);line=word;}}
+  if(line)out.push(line);return out.length?out:[''];
+}
 async function qServicePdfFallbackJpeg(src){
   if(!src)return null;return await new Promise(resolve=>{try{const im=new Image();im.onload=()=>{try{const nw=im.naturalWidth||im.width,nh=im.naturalHeight||im.height;if(!nw||!nh)return resolve(null);const max=1200,scale=Math.min(1,max/Math.max(nw,nh)),c=document.createElement('canvas');c.width=Math.max(1,Math.round(nw*scale));c.height=Math.max(1,Math.round(nh*scale));const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,c.width,c.height);x.drawImage(im,0,0,c.width,c.height);const uri=c.toDataURL('image/jpeg',.88),b64=uri.split(',')[1]||'',bin=atob(b64);resolve({bin,width:c.width,height:c.height})}catch(_e){resolve(null)}};im.onerror=()=>resolve(null);im.src=src}catch(_e){resolve(null)}});
 }
@@ -33957,7 +34424,7 @@ function qServicePdfFallbackBuild(data,assets={}){
   const text=(x,yy,size,value,bold=false,align='left')=>{let tx=x;if(align==='center')tx=x-(String(value||'').length*size*.25);if(align==='right')tx=x-(String(value||'').length*size*.5);c+=`BT /${bold?'F2':'F1'} ${f(size)} Tf ${f(tx)} ${f(yy)} Td (${qServicePdfFallbackEsc(value)}) Tj ET\n`;},line=(x1,y1,x2,y2)=>{c+=`${f(x1)} ${f(y1)} m ${f(x2)} ${f(y2)} l S\n`;},rect=(x,yy,w,h,fill=false)=>{c+=`${fill?'.92 g ':''}${f(x)} ${f(yy)} ${f(w)} ${f(h)} re ${fill?'f 0 g':'S'}\n`;};
   const imgCmd=(name,img,x,top,maxW,maxH,align='left')=>{if(!img?.width||!img?.height)return;const sc=Math.min(maxW/img.width,maxH/img.height),iw=img.width*sc,ih=img.height*sc,ix=align==='right'?x+maxW-iw:x,iy=PH-top-ih;c+=`q ${f(iw)} 0 0 ${f(ih)} ${f(ix)} ${f(iy)} cm /${name} Do Q\n`;};
   const money=v=>'$'+n(v).toFixed(2),tableHead=()=>{const h=18;rect(M,y-h,TW,h,true);for(let i=1;i<xs.length-1;i++)line(xs[i],y-h,xs[i],y);['#','CLAVE','PRODUCTO','PRESENT.','SOLIC.','SURT.','LOTE / CAD.','P. VENTA','TOTAL'].forEach((v,i)=>text(xs[i]+3,y-12,6.3,v,true));y-=h;};
-  const begin=(cont=false)=>{c='0 G 0 g 0.55 w\n';imgCmd('ImL',assets.left,M,7,175,44,'left');imgCmd('ImR',assets.right,PW-M-155,5,155,50,'right');y=PH-M-12;text(PW/2,y,Math.max(7,Math.min(11,380/Math.max(1,title.length)*1.9)),title,true,'center');y-=24;text(M,y,7,`Servicio: ${data?.destino?.nombre||'—'}${data?.destino?.iniciales?' ('+data.destino.iniciales+')':''}`);text(415,y,7,`Fecha: ${data?.fechaTexto||'—'}`);text(PW-M,y,7,cont?`Continuacion · Folio: ${data?.folio||''}`:`Folio: ${data?.folio||''}`,true,'right');y-=12;text(M,y,6.8,`Paciente: ${data?.paciente?.nombre||'—'} · Edad: ${data?.paciente?.edad||'—'} · Sexo: ${data?.paciente?.sexo||'—'} · Ojo: ${data?.paciente?.ojo||'—'} · Tel: ${data?.paciente?.telefono||'—'}`);y-=12;text(M,y,6.6,`Medico: ${data?.medico?.nombre||'—'} · Cedula: ${data?.medico?.cedula||'—'} · Tel: ${data?.medico?.telefono||'—'} · Domicilio: ${data?.medico?.domicilio||'—'}`);y-=8;line(M,y,PW-M,y);y-=8;tableHead();};
+  const begin=(cont=false)=>{c='0 G 0 g 0.55 w\n';imgCmd('ImL',assets.left,M,7,175,44,'left');imgCmd('ImR',assets.right,PW-M-155,5,155,50,'right');y=PH-M-12;text(PW/2,y,Math.max(7,Math.min(11,380/Math.max(1,title.length)*1.9)),title,true,'center');y-=32;text(M,y,7,`Servicio: ${data?.destino?.nombre||'—'}${data?.destino?.iniciales?' ('+data.destino.iniciales+')':''}`);text(420,y,7,`Fecha: ${data?.fechaTexto||'—'}`);text(575,y,7,cont?`Continuacion · Folio: ${data?.folio||''}`:`Folio: ${data?.folio||''}`,true,'left');y-=12;text(M,y,6.8,`Paciente: ${data?.paciente?.nombre||'—'} · Edad: ${data?.paciente?.edad||'—'} · Sexo: ${data?.paciente?.sexo||'—'} · Ojo: ${data?.paciente?.ojo||'—'} · Tel: ${data?.paciente?.telefono||'—'}`);y-=12;text(M,y,6.6,`Medico: ${data?.medico?.nombre||'—'} · Cedula: ${data?.medico?.cedula||'—'}${data?.anestesiologo?.nombre?` · Anestesiologo: ${data.anestesiologo.nombre}`:''} · Tel: ${data?.medico?.telefono||'—'}`);y-=8;line(M,y,PW-M,y);y-=8;tableHead();};
   const finish=()=>{imgCmd('ImF',assets.footer,M,PH-18,165,13,'left');pages.push(c)},need=h=>{if(y-h<78){finish();begin(true)}};begin(false);const items=Array.isArray(data?.items)?data.items:[];
   items.forEach((it,idx)=>{let parts={name:it?.descripcion||'',presentation:it?.unidad||''};try{if(typeof mxOrderPackagingParts==='function')parts=mxOrderPackagingParts(it)||parts}catch(_e){}const product=qServicePdfFallbackWrap(parts.name||it?.descripcion||'',34),lot=qServicePdfFallbackWrap(it?.lotes||'',18),pres=qServicePdfFallbackWrap(parts.presentation||it?.unidad||'',12),lines=Math.max(product.length,lot.length,pres.length,1),rh=Math.max(18,lines*8+6);need(rh);rect(M,y-rh,TW,rh,false);for(let i=1;i<xs.length-1;i++)line(xs[i],y-rh,xs[i],y);const req=qServicePdfRequestedQty(it),sup=qServicePdfSuppliedQty(it,isOrder),price=n(it?.precio_venta),total=price*(isOrder?req:sup);text(xs[0]+6,y-12,6.2,String(idx+1));text(xs[1]+3,y-12,6.2,it?.clave||it?.codigo_barras||'');product.forEach((v,j)=>text(xs[2]+3,y-12-j*8,5.8,v));pres.forEach((v,j)=>text(xs[3]+3,y-12-j*8,5.6,v));text(xs[4]+12,y-12,6.2,String(req||''));text(xs[5]+12,y-12,6.2,isOrder?'':String(sup||0));lot.forEach((v,j)=>text(xs[6]+3,y-12-j*8,5.6,v));text(xs[7]+4,y-12,6.0,money(price));text(xs[8]+4,y-12,6.0,money(total),true);y-=rh;});
   need(70);y-=14;text(M,y,8,isOrder?`TOTAL SOLICITADO: ${data?.totalSolicitado||0} PIEZAS`:`SOLICITADO: ${data?.totalSolicitado||0} · SURTIDO: ${data?.totalSurtido||0} · FALTANTE: ${data?.totalFaltante||0}`,true);text(PW-M,y,8,`TOTAL VENTA: ${money(data?.totalVenta||0)}`,true,'right');y-=25;const sigW=220;[M,M+258,M+516].forEach(x=>line(x,y,x+sigW,y));y-=11;text(M+10,y,6.2,'MEDICO SOLICITANTE · FIRMA',true);text(M+268,y,6.2,'PACIENTE / RESPONSABLE · RECIBE',true);text(M+526,y,6.2,'FARMACIA · SURTE',true);finish();
@@ -33967,6 +34434,7 @@ function qServicePdfFallbackBuild(data,assets={}){
 async function qServicePdfFallbackDownload(data){
   const assets=await qServicePdfFallbackAssets(),out=qServicePdfFallbackBuild(data,assets),bytes=new Uint8Array(out.pdf.length);for(let i=0;i<out.pdf.length;i++)bytes[i]=out.pdf.charCodeAt(i)&255;const blob=new Blob([bytes],{type:'application/pdf'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=out.filename;a.style.display='none';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);return {ok:true,filename:out.filename,fallback:true};
 }
+
 async function printServicePdf(rawData){
   const data=await qServicePdfHydrateData(rawData||{}),isOrder=data?.pdfMode==='pedido',pdfTitle=qServicePdfDocumentTitle(data),logos=typeof mxOrderPdfLogos==='function'?await mxOrderPdfLogos():{};
   if(window.electronSql?.savePdfHtml){
@@ -33978,12 +34446,12 @@ async function printServicePdf(rawData){
   const drawConfiguredLogos=()=>{addImageFit(logos?.left||logos?.collectiveLeft||'',8,4.8,62,16,'left');addImageFit(logos?.right||logos?.collectiveRight||'',w-58,4.2,50,18,'right')};
   const drawFooterLogo=()=>{addImageFit(logos?.footer||'',8,h-11.1,58,6.2,'left')};
   const fitLine=(value,x,y,maxW,size=5.45,style='normal')=>{let s=safe(value||'—'),fs=size;doc.setFont('helvetica',style);while(fs>4.15){doc.setFontSize(fs);if(doc.getTextWidth(s)<=maxW)break;fs-=.18}if(doc.getTextWidth(s)>maxW){let cut=s;while(cut.length>5&&doc.getTextWidth(cut+'...')>maxW)cut=cut.slice(0,-1);s=cut+'...'}doc.text(s,x,y)};
-  const drawHeader=(continuation=false)=>{drawConfiguredLogos();doc.setTextColor(0);doc.setFont('helvetica','bold');doc.setFontSize(9);doc.text(safe(String(est.nombre||'MACROXEL HOSPITALES').toUpperCase()),w/2,19.5,{align:'center'});doc.setFontSize(8.2);doc.text(continuation?`${pdfTitle} · CONTINUACION`:pdfTitle,w/2,24.2,{align:'center'})};
+  const drawHeader=(continuation=false)=>{drawConfiguredLogos();doc.setTextColor(0);doc.setFont('helvetica','bold');doc.setFontSize(9);doc.text(safe(String(est.nombre||'MACROXEL HOSPITALES').toUpperCase()),w/2,14,{align:'center'});doc.setFontSize(Math.max(6.3,Math.min(8.6,8.6*36/Math.max(36,pdfTitle.length))));doc.text(continuation?`${pdfTitle} · CONTINUACION`:pdfTitle,w/2,19,{align:'center'});if(continuation){doc.setFontSize(5.8);doc.text(`Folio ${safe(data.folio||'')}`,w-60,24.2,{align:'left'})}};
   drawHeader(false);const topY=29,rowH=5.6,rowsN=6,boxH=rowH*rowsN,mid=w/2;doc.setDrawColor(0);doc.setLineWidth(.3);doc.rect(8,topY,w-16,boxH);for(let i=1;i<rowsN;i++)mxOrderPdfLine(doc,8,topY+i*rowH,w-8,topY+i*rowH,.18);[0,1,2,5].forEach(i=>mxOrderPdfLine(doc,mid,topY+i*rowH,mid,topY+(i+1)*rowH,.18));
   const pair=(row,lbl1,val1,lbl2,val2)=>{const yy=topY+3.85+row*rowH;doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text(lbl1,10,yy);fitLine(val1,34,yy,mid-36,5.55);doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text(lbl2,mid+2,yy);fitLine(val2,mid+29,yy,w-8-(mid+31),5.55)};
-  pair(0,'HOSPITAL',est.nombre||'—','CLAVE UNIDAD',unitKey||'—');pair(1,'FECHA',data.fechaTexto||'—','FOLIO',data.folio||'—');pair(2,'SERVICIO',service,'DOCUMENTO',isOrder?'PEDIDO':'SALIDA');
+  pair(0,'HOSPITAL',est.nombre||'—','CLAVE UNIDAD',unitKey||'—');pair(1,'SERVICIO',service,'FECHA',data.fechaTexto||'—');pair(2,'FOLIO',data.folio||'—','DOCUMENTO',isOrder?'PEDIDO':'SOLICITUD');
   const patientLine=`Nombre: ${data?.paciente?.nombre||'—'} · Edad: ${data?.paciente?.edad||'—'} · Sexo: ${data?.paciente?.sexo||'—'} · Ojo: ${data?.paciente?.ojo||'—'} · Tel: ${data?.paciente?.telefono||'—'}`;doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text('PACIENTE',10,topY+3.85+3*rowH);fitLine(patientLine,31,topY+3.85+3*rowH,w-41,5.45);
-  const doctorLine=`Nombre: ${data?.medico?.nombre||'—'} · Cédula: ${data?.medico?.cedula||'—'} · Tel: ${data?.medico?.telefono||'—'} · Domicilio: ${data?.medico?.domicilio||'—'}`;doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text('MÉDICO',10,topY+3.85+4*rowH);fitLine(doctorLine,31,topY+3.85+4*rowH,w-41,5.35);
+  const doctorLine=`Médico: ${data?.medico?.nombre||'—'} · Céd.: ${data?.medico?.cedula||'—'}${data?.anestesiologo?.nombre?` · Anestesiólogo: ${data.anestesiologo.nombre}${data.anestesiologo.cedula?' · Céd.: '+data.anestesiologo.cedula:''}`:''} · Tel: ${data?.medico?.telefono||'—'}`;doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text('MÉDICO',10,topY+3.85+4*rowH);fitLine(doctorLine,31,topY+3.85+4*rowH,w-41,5.35);
   pair(5,'USUARIO',data.usuario||'—','ESTADO',isOrder?'PEDIDO PREVIO · SIN AFECTAR INVENTARIO':'SOLICITUD REGISTRADA');
   const widths=[7,23,70,30,18,18,39,28,30.4],body=data.items.map((it,i)=>{let parts={name:it.descripcion,presentation:it.unidad||'PIEZA'};try{if(typeof mxOrderPackagingParts==='function')parts=mxOrderPackagingParts(it)||parts}catch(_e){}const req=qServicePdfRequestedQty(it),sup=qServicePdfSuppliedQty(it,isOrder),price=qNum(it.precio_venta),lineTotal=price*(isOrder?req:sup);return[String(i+1),safe(it.clave||it.codigo_barras||''),safe(parts.name||it.descripcion),safe(parts.presentation||it.unidad||'PIEZA'),String(req||''),isOrder?'':String(sup||0),safe(it.lotes||''),safe(qMoney(price)),safe(qMoney(lineTotal))]});
   doc.autoTable({startY:topY+boxH+4,head:[['#','CLAVE','PRODUCTO','PRESENTACION','SOLIC.','SURT.','LOTE / CADUCIDAD','PRECIO VENTA','TOTAL']],body:body.length?body:[['','','','','','','','','']],theme:'grid',margin:{left:8,right:8,top:28,bottom:39},styles:{font:'helvetica',fontSize:5.45,cellPadding:.8,textColor:[0,0,0],lineColor:[0,0,0],lineWidth:.22,overflow:'linebreak',valign:'middle'},headStyles:{fillColor:[215,215,215],textColor:[0,0,0],fontStyle:'bold',halign:'center',fontSize:5.0},columnStyles:{0:{cellWidth:widths[0],halign:'center'},1:{cellWidth:widths[1]},2:{cellWidth:widths[2]},3:{cellWidth:widths[3]},4:{cellWidth:widths[4],halign:'center'},5:{cellWidth:widths[5],halign:'center'},6:{cellWidth:widths[6]},7:{cellWidth:widths[7],halign:'right'},8:{cellWidth:widths[8],halign:'right',fontStyle:'bold'}},didDrawPage:d=>{if((d?.pageNumber||1)>1)drawHeader(true)}});
@@ -34002,17 +34470,30 @@ async function qSurgicalRows(force=false){
   if(!Array.isArray(rows)||!rows.length){try{rows=(await idbAll('salidas').catch(()=>[])).filter(r=>qNorm(r?.tipo_doc||r?.tipoDoc)==='servicio quirurgico'||r?.servicio_quirurgico===true);}catch(_e){rows=[];}}
   serviceHistoryRowsCache=(rows||[]).filter(r=>r&&(qNorm(r.tipo_doc||r.tipoDoc)==='servicio quirurgico'||r.servicio_quirurgico===true));serviceHistoryLoadedAt=Date.now();return serviceHistoryRowsCache.slice();
 }
+function qServiceLineQty(row){return Math.max(0,qInt(row?.pzs??row?.cantidad??0));}
+function qServiceLineRequested(row){return Math.max(0,qInt(row?.pzs_solicitadas??row?.cantidad_solicitada??row?.pzs_requeridas_kit??(qServiceLineQty(row)+qInt(row?.pzs_faltantes??row?.cantidad_faltante??0))));}
+function qServiceLineLoaned(row){if(row?.kit_faltante||row?.registro_sin_existencia)return 0;if(!row?.ean_prestamo&&!row?.eanPrestamo&&!row?.prestamo_activo&&row?.pzs_prestadas===undefined&&row?.pzs_surtidas_iniciales===undefined)return 0;return Math.max(0,qInt(row?.pzs_prestadas??row?.pzs_surtidas_iniciales??row?.pzs_surtidas_kit??qServiceLineQty(row)));}
 function qGroupServiceRows(rows){
-  const groups=new Map();for(const r of rows||[]){const folio=qTxt(r.folio||r.folio_doc);if(!folio)continue;const g=groups.get(folio)||{folio,rows:[],stamp:0};g.rows.push(r);g.stamp=Math.max(g.stamp,qServiceRowStamp(r));groups.set(folio,g);} 
+  const groups=new Map();for(const r of rows||[]){const folio=qTxt(r.folio||r.folio_doc);if(!folio)continue;const g=groups.get(folio)||{folio,rows:[],stamp:0};g.rows.push(r);g.stamp=Math.max(g.stamp,qServiceRowStamp(r));groups.set(folio,g);}
   const out=[];for(const g of groups.values()){
-    const rows=g.rows.slice().sort((a,b)=>(Number(a._id)||0)-(Number(b._id)||0)),r=rows[0]||{},itemsMap=new Map(),kits=new Set();let total=0,faltantes=0;
-    const positiveRows=rows.filter(x=>qInt(x.pzs||x.cantidad)>0);
+    const rows=g.rows.slice().sort((a,b)=>(Number(a._id)||0)-(Number(b._id)||0)),r=rows[0]||{},itemsMap=new Map(),kits=new Set();let total=0,faltantes=0,solicitadas=0,prestadas=0,devueltas=0;
+    const positiveRows=rows.filter(x=>qServiceLineQty(x)>0);
     for(const x of rows){
-      const qty=qInt(x.pzs||x.cantidad),missing=qInt(x.pzs_faltantes||x.cantidad_faltante);(Array.isArray(x.kits_quirurgicos)?x.kits_quirurgicos:[]).forEach(k=>{if(qTxt(k))kits.add(qTxt(k));});if(qty<=0&&missing<=0)continue;total+=qty;faltantes+=missing;const key=qProdKey(x)||`${qNorm(x.descripcion)}|${qNorm(x.lote)}`,price=Math.max(0,qNum(x.precio_venta||x.precioVenta)),cost=Math.max(0,qNum(x.costo_unitario||x.costo_final||x.costo)),it=itemsMap.get(key)||{clave:qTxt(x.clave),codigo_barras:qTxt(x.codigo_barras),descripcion:qTxt(x.descripcion),unidad:qTxt(x.unidad)||'PIEZA',cantidad:0,faltante:0,solicitada:0,costo_unitario:0,precio_venta:0,valor_costo:0,valor_venta:0,lotes:new Set(),kits:new Set()};
-      it.cantidad+=qty;it.faltante+=missing;it.solicitada+=qty+missing;if(!it.precio_venta&&price>0)it.precio_venta=price;if(!it.costo_unitario&&cost>0)it.costo_unitario=cost;it.valor_venta+=Math.max(0,qNum(x.valor_venta))||(qty*price);it.valor_costo+=Math.max(0,qNum(x.valor_costo))||(qty*cost);if(qTxt(x.lote)||qTxt(x.caducidad))it.lotes.add(`${qTxt(x.lote)||'S/L'} / ${qTxt(x.caducidad)||'S/C'}`);if(missing>0)it.lotes.add('FALTANTE / SIN EXISTENCIA');(Array.isArray(x.kits_quirurgicos)?x.kits_quirurgicos:[]).forEach(k=>{if(qTxt(k))it.kits.add(qTxt(k));});itemsMap.set(key,it);
+      const qty=qServiceLineQty(x),missing=Math.max(0,qInt(x.pzs_faltantes??x.cantidad_faltante??0)),requested=qServiceLineRequested(x),loaned=qServiceLineLoaned(x),returned=Math.max(0,qInt(x.pzs_devueltas??(loaned-qty)));
+      (Array.isArray(x.kits_quirurgicos)?x.kits_quirurgicos:[]).forEach(k=>{if(qTxt(k))kits.add(qTxt(k));});
+      total+=qty;faltantes+=missing;solicitadas+=requested;prestadas+=loaned;devueltas+=returned;
+      if(qty<=0&&missing<=0&&requested<=0&&loaned<=0)continue;
+      const key=qProdKey(x)||`${qNorm(x.descripcion)}|${qNorm(x.lote)}`,price=Math.max(0,qNum(x.precio_venta||x.precioVenta)),cost=Math.max(0,qNum(x.costo_unitario||x.costo_final||x.costo));
+      const it=itemsMap.get(key)||{clave:qTxt(x.clave),codigo_barras:qTxt(x.codigo_barras),descripcion:qTxt(x.descripcion),unidad:qTxt(x.unidad)||'PIEZA',cantidad:0,faltante:0,solicitada:0,prestada:0,devuelta:0,costo_unitario:0,precio_venta:0,valor_costo:0,valor_venta:0,lotes:new Set(),kits:new Set()};
+      it.cantidad+=qty;it.faltante+=missing;it.solicitada+=requested;it.prestada+=loaned;it.devuelta+=returned;
+      if(!it.precio_venta&&price>0)it.precio_venta=price;if(!it.costo_unitario&&cost>0)it.costo_unitario=cost;
+      it.valor_venta+=qty*price;it.valor_costo+=qty*cost;
+      if(qTxt(x.lote)||qTxt(x.caducidad))it.lotes.add(`${qTxt(x.lote)||'S/L'} / ${qTxt(x.caducidad)||'S/C'}`);
+      if(missing>0)it.lotes.add('FALTANTE / SIN EXISTENCIA');
+      (Array.isArray(x.kits_quirurgicos)?x.kits_quirurgicos:[]).forEach(k=>{if(qTxt(k))it.kits.add(qTxt(k));});itemsMap.set(key,it);
     }
-    const prestamoActivo=positiveRows.some(x=>x?.prestamo_activo===true||qNorm(x?.estado)==='prestado'),recuperado=!positiveRows.length&&!faltantes&&rows.some(x=>qNorm(x?.estado)==='recuperado'),estado=prestamoActivo?(faltantes>0?'Prestado parcial':'Prestado'):(faltantes>0?(total>0?'Parcial':'Faltante'):(recuperado?'Recuperado':(qTxt(r.estado)||'Completa')));
-    out.push({folio:g.folio,rows,stamp:g.stamp,fecha:qDateYmd(r.fecha||r.createdAt),eanPrestamo:qTxt(rows.find(x=>qTxt(x.ean_prestamo||x.eanPrestamo))?.ean_prestamo||rows.find(x=>qTxt(x.ean_prestamo||x.eanPrestamo))?.eanPrestamo),medico:{nombre:qTxt(r.medico),cedula:qTxt(r.cedula),telefono:qTxt(r.telefono_medico),domicilio:qTxt(r.domicilio_medico)},paciente:{nombre:qTxt(r.paciente),edad:qTxt(r.edad_paciente),sexo:qTxt(r.sexo_paciente),ojo:qTxt(r.ojo_operacion||r.ojo_operado||r.ojo||r.lateralidad),telefono:qTxt(r.telefono_paciente)},destino:{nombre:qTxt(r.servicio_destino||r.servicio||r.destino),iniciales:qTxt(r.servicio_iniciales)},kits:[...kits],total,faltantes,solicitadas:total+faltantes,estado,prestamoActivo,usuario:qTxt(r.usuario),items:[...itemsMap.values()].map(it=>({...it,lotes:[...it.lotes].join(', '),kits:[...it.kits]}))});
+    const prestamoActivo=rows.some(x=>x?.prestamo_activo===true)||positiveRows.some(x=>qNorm(x?.estado)==='prestado'),recuperado=!positiveRows.length&&!faltantes&&rows.some(x=>qNorm(x?.estado)==='recuperado'),estado=prestamoActivo?(rows.some(x=>x.prestamo_sin_descontar===true)?'Préstamo pendiente':(faltantes>0?'Prestado parcial':'Prestado')):(faltantes>0?(total>0?'Parcial':'Faltante'):(recuperado?'Recuperado':(qTxt(r.estado)||'Completa')));
+    out.push({folio:g.folio,rows,stamp:g.stamp,fecha:qDateYmd(r.fecha||r.createdAt),eanPrestamo:qTxt(rows.find(x=>qTxt(x.ean_prestamo||x.eanPrestamo))?.ean_prestamo||rows.find(x=>qTxt(x.ean_prestamo||x.eanPrestamo))?.eanPrestamo),medico:{nombre:qTxt(r.medico),cedula:qTxt(r.cedula),telefono:qTxt(r.telefono_medico),domicilio:qTxt(r.domicilio_medico)},anestesiologo:{nombre:qTxt(r.anestesiologo),cedula:qTxt(r.anestesiologo_cedula),id:r.anestesiologo_id??null},paciente:{nombre:qTxt(r.paciente),edad:qTxt(r.edad_paciente),sexo:qTxt(r.sexo_paciente),ojo:qTxt(r.ojo_operacion||r.ojo_operado||r.ojo||r.lateralidad),telefono:qTxt(r.telefono_paciente)},destino:{nombre:qTxt(r.servicio_destino||r.servicio||r.destino),iniciales:qTxt(r.servicio_iniciales)},kits:[...kits],total,faltantes,solicitadas,prestadas,devueltas,estado,prestamoActivo,usuario:qTxt(r.usuario),items:[...itemsMap.values()].map(it=>({...it,lotes:[...it.lotes].join(', '),kits:[...it.kits],cantidad_surtida:it.cantidad,prestada_inicial:it.prestada}))});
   }
   return out.sort((a,b)=>b.stamp-a.stamp||b.folio.localeCompare(a.folio));
 }
@@ -34037,10 +34518,10 @@ async function generateUniqueLoanEan(){const rows=await qSurgicalRows(true).catc
 function qLoanLabelHtml(group){const g=group||{},ean=qTxt(g.eanPrestamo),name=qTxt(g.paciente?.nombre)||'SIN PACIENTE',service=qTxt(g.destino?.nombre)||'SIN SERVICIO',eye=qTxt(g.paciente?.ojo)||'SIN OJO';return `<!doctype html><html><head><meta charset="utf-8"><title>Etiqueta EAN ${qEsc(ean)}</title><style>@page{size:80mm 20mm;margin:0}*{box-sizing:border-box}html,body{width:80mm;height:20mm;margin:0!important;padding:0!important;overflow:hidden!important;font-family:Arial,sans-serif;color:#000;background:#fff}.label{width:80mm;height:20mm;max-height:20mm;margin:0;padding:.15mm .7mm .15mm;border:0;text-align:center;overflow:hidden;display:grid;grid-template-rows:2.55mm 2.45mm 14.55mm;align-items:center;page-break-inside:avoid;break-inside:avoid}.name{font-size:8.1pt;font-weight:900;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-transform:uppercase;letter-spacing:.05mm}.meta{font-size:6.3pt;font-weight:800;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-transform:uppercase}.barcode{width:100%;height:14.55mm;display:flex;align-items:center;justify-content:center;overflow:hidden}.barcode svg{width:78.4mm!important;height:14.35mm!important;max-width:78.4mm!important;max-height:14.35mm!important;display:block;margin:0 auto;shape-rendering:crispEdges}@media print{html,body,.label{width:80mm!important;height:20mm!important;max-height:20mm!important;overflow:hidden!important}.label{page-break-after:avoid!important;page-break-before:avoid!important}.barcode svg{width:78.4mm!important;height:14.35mm!important}}</style></head><body><div class="label"><div class="name">${qEsc(name)}</div><div class="meta">SERVICIO: ${qEsc(service)} · OJO: ${qEsc(eye)}</div><div class="barcode">${qEan13Svg(ean,{moduleWidth:3,barHeight:40,quiet:10})}</div></div></body></html>`;}
 function printLoanLabel(group){const html=qLoanLabelHtml(group),frame=document.createElement('iframe');frame.style.cssText='position:fixed;right:0;bottom:0;width:1px;height:1px;border:0;opacity:0;pointer-events:none';document.body.appendChild(frame);const doc=frame.contentDocument||frame.contentWindow?.document;if(!doc){frame.remove();return qAlert('No se pudo preparar la impresión.');}doc.open();doc.write(html);doc.close();setTimeout(()=>{try{frame.contentWindow.focus();frame.contentWindow.print();}catch(e){qAlert('No se pudo abrir el diálogo de impresión: '+(e?.message||e));}setTimeout(()=>frame.remove(),1500);},180);}
 function openLoanLabelModal(group,created=false){if(!group?.eanPrestamo)return qAlert('Este préstamo no tiene EAN asignado.');$q('mxQxLoanLabelModal')?.remove();const modal=document.createElement('div');modal.id='mxQxLoanLabelModal';modal.className='mx-qx-modal';modal.innerHTML=`<div class="mx-qx-label-card"><div class="mx-qx-edit-head"><div><h3>🏷️ ${created?'Préstamo registrado · Etiqueta EAN-13':'Etiqueta de préstamo'}</h3><small>El EAN identifica este préstamo dentro de Macroxel.</small></div><button class="mx-qx-x" id="mxQxLoanLabelX" type="button">×</button></div><div class="mx-qx-label-body"><div class="mx-qx-label-preview"><div style="font-size:11px;font-weight:900;color:#475569">${qEsc(window.mxGetEstablishmentData?.()?.nombre||'MACROXEL')}</div><div class="mx-qx-label-name">${qEsc(group.paciente?.nombre||'SIN PACIENTE')}</div><div class="mx-qx-label-meta">Edad: <b>${qEsc(group.paciente?.edad||'—')}</b> · Sexo: <b>${qEsc(group.paciente?.sexo||'—')}</b> · Fecha: <b>${qEsc(qDateDisplay(group.fecha))}</b><br>Folio: <b>${qEsc(group.folio)}</b><br>Servicio: <b>${qEsc(group.destino?.nombre||'—')}</b> · Ojo: <b>${qEsc(group.paciente?.ojo||'—')}</b></div>${qEan13Svg(group.eanPrestamo,{moduleWidth:2,barHeight:68,quiet:12})}<div class="mx-qx-ean-text">${qEsc(group.eanPrestamo)}</div></div></div><div class="mx-qx-edit-foot"><button class="btn" id="mxQxLoanLabelClose" type="button">Cerrar</button><button class="btn ok" id="mxQxLoanLabelPrint" type="button">🖨️ Imprimir etiqueta</button></div></div>`;document.body.appendChild(modal);const close=()=>modal.remove();$q('mxQxLoanLabelX').onclick=close;$q('mxQxLoanLabelClose').onclick=close;$q('mxQxLoanLabelPrint').onclick=()=>printLoanLabel(group);modal.addEventListener('mousedown',e=>{if(e.target===modal)close()});}
-function openLoanLookupModal(group){if(!group)return;$q('mxQxLoanLookupModal')?.remove();const modal=document.createElement('div');modal.id='mxQxLoanLookupModal';modal.className='mx-qx-modal';const state=group.prestamoActivo?'Préstamo activo':(qNorm(group.estado)==='recuperado'?'Recuperado':'Finalizado');modal.innerHTML=`<div class="mx-qx-loan-lookup"><div class="mx-qx-edit-head"><div><h3>▥ Préstamo localizado</h3><small>EAN <span class="mx-qx-ean-text" style="color:#fff">${qEsc(group.eanPrestamo)}</span> · ${qEsc(state)}</small></div><button class="mx-qx-x" id="mxQxLoanLookupX" type="button">×</button></div><div class="mx-qx-adjust-body"><div class="mx-qx-loan-person"><div><small>PACIENTE</small><b>${qEsc(group.paciente?.nombre||'—')}</b></div><div><small>EDAD</small><b>${qEsc(group.paciente?.edad||'—')}</b></div><div><small>SEXO</small><b>${qEsc(group.paciente?.sexo||'—')}</b></div><div><small>OJO</small><b>${qEsc(group.paciente?.ojo||'—')}</b></div><div><small>FECHA</small><b>${qEsc(qDateDisplay(group.fecha))}</b></div></div><div class="mx-qx-loan-person"><div><small>FOLIO</small><b>${qEsc(group.folio)}</b></div><div style="grid-column:span 3"><small>SERVICIO</small><b>${qEsc(group.destino?.nombre||'—')} ${group.destino?.iniciales?'('+qEsc(group.destino.iniciales)+')':''}</b></div><div><small>ESTADO</small><b>${qEsc(state)}</b></div></div><table class="mx-qx-adjust-table"><thead><tr><th>CLAVE</th><th>PRODUCTO</th><th>CANTIDAD ACTUAL</th><th>LOTE / CADUCIDAD</th></tr></thead><tbody>${(group.items||[]).map(it=>`<tr><td>${qEsc(it.clave||it.codigo_barras||'')}</td><td>${qEsc(it.descripcion||'')}</td><td><b>${qInt(it.cantidad)}</b></td><td>${qEsc(it.lotes||'')}</td></tr>`).join('')||'<tr><td colspan="4">Sin piezas pendientes; el préstamo fue recuperado completamente.</td></tr>'}</tbody></table></div><div class="mx-qx-edit-foot"><button class="btn" id="mxQxLoanLookupClose" type="button">Cerrar</button><button class="btn" id="mxQxLoanLookupLabel" type="button">🏷️ Etiqueta</button>${group.prestamoActivo?'<button class="btn" id="mxQxLoanLookupAdjust" type="button">↩️ Ajustar préstamo</button><button class="btn ok" id="mxQxLoanLookupFinish" type="button">✅ Finalizar</button>':''}</div></div>`;document.body.appendChild(modal);const close=()=>modal.remove();$q('mxQxLoanLookupX').onclick=close;$q('mxQxLoanLookupClose').onclick=close;$q('mxQxLoanLookupLabel').onclick=()=>openLoanLabelModal(group,false);if(group.prestamoActivo){$q('mxQxLoanLookupAdjust').onclick=()=>{close();openServiceLoanAdjust(group.folio)};$q('mxQxLoanLookupFinish').onclick=async()=>{close();await finalizeServiceLoan(group.folio,null)}}modal.addEventListener('mousedown',e=>{if(e.target===modal)close()});}
+function openLoanLookupModal(group){if(!group)return;$q('mxQxLoanLookupModal')?.remove();const modal=document.createElement('div');modal.id='mxQxLoanLookupModal';modal.className='mx-qx-modal';const state=group.prestamoActivo?'Préstamo activo':(qNorm(group.estado)==='recuperado'?'Recuperado':'Finalizado');modal.innerHTML=`<div class="mx-qx-loan-lookup"><div class="mx-qx-edit-head"><div><h3>▥ Préstamo localizado</h3><small>EAN <span class="mx-qx-ean-text" style="color:#fff">${qEsc(group.eanPrestamo)}</span> · ${qEsc(state)}</small></div><button class="mx-qx-x" id="mxQxLoanLookupX" type="button">×</button></div><div class="mx-qx-adjust-body"><div class="mx-qx-loan-person"><div><small>PACIENTE</small><b>${qEsc(group.paciente?.nombre||'—')}</b></div><div><small>EDAD</small><b>${qEsc(group.paciente?.edad||'—')}</b></div><div><small>SEXO</small><b>${qEsc(group.paciente?.sexo||'—')}</b></div><div><small>OJO</small><b>${qEsc(group.paciente?.ojo||'—')}</b></div><div><small>FECHA</small><b>${qEsc(qDateDisplay(group.fecha))}</b></div></div><div class="mx-qx-loan-person"><div><small>FOLIO</small><b>${qEsc(group.folio)}</b></div><div style="grid-column:span 3"><small>SERVICIO</small><b>${qEsc(group.destino?.nombre||'—')} ${group.destino?.iniciales?'('+qEsc(group.destino.iniciales)+')':''}</b></div><div><small>ESTADO</small><b>${qEsc(state)}</b></div></div><table class="mx-qx-adjust-table"><thead><tr><th>CLAVE</th><th>PRODUCTO</th><th>SOLICITADAS</th><th>PRESTADAS</th><th>USADAS / SURTIDO FINAL</th><th>DEVUELTAS</th><th>LOTE / CADUCIDAD</th></tr></thead><tbody>${(group.items||[]).map(it=>`<tr><td>${qEsc(it.clave||it.codigo_barras||'')}</td><td>${qEsc(it.descripcion||'')}</td><td><b>${qInt(it.solicitada)}</b></td><td>${qInt(it.prestada)}</td><td><b>${qInt(it.cantidad)}</b></td><td>${qInt(it.devuelta)}</td><td>${qEsc(it.lotes||'')}</td></tr>`).join('')||'<tr><td colspan="7">Sin productos para este folio.</td></tr>'}</tbody></table></div><div class="mx-qx-edit-foot"><button class="btn" id="mxQxLoanLookupClose" type="button">Cerrar</button><button class="btn" id="mxQxLoanLookupLabel" type="button">🏷️ Etiqueta</button>${group.prestamoActivo?'<button class="btn" id="mxQxLoanLookupAdjust" type="button">↩️ Ajustar préstamo</button><button class="btn ok" id="mxQxLoanLookupFinish" type="button">✅ Finalizar</button>':''}</div></div>`;document.body.appendChild(modal);const close=()=>modal.remove();$q('mxQxLoanLookupX').onclick=close;$q('mxQxLoanLookupClose').onclick=close;$q('mxQxLoanLookupLabel').onclick=()=>openLoanLabelModal(group,false);if(group.prestamoActivo){$q('mxQxLoanLookupAdjust').onclick=()=>{close();openServiceLoanAdjust(group.folio)};$q('mxQxLoanLookupFinish').onclick=async()=>{close();await finalizeServiceLoan(group.folio,null)}}modal.addEventListener('mousedown',e=>{if(e.target===modal)close()});}
 window.mxQxLookupLoanByEan=async function(raw){const ean=String(raw||'').replace(/\D/g,'');if(!/^299\d{10}$/.test(ean)||!qEan13Valid(ean))return false;let rows=await qSurgicalRows(true).catch(()=>[]);rows=(rows||[]).filter(r=>qTxt(r.ean_prestamo||r.eanPrestamo)===ean);if(!rows.length)return false;serviceHistoryRowsCache=[];serviceHistoryLoadedAt=0;serviceHistoryGroups=qGroupServiceRows(await qSurgicalRows(true));const group=serviceHistoryGroups.find(g=>g.eanPrestamo===ean)||qGroupServiceRows(rows)[0];if(!group)return false;renderServiceHistory();openLoanLookupModal(group);return true;};
 function serviceHistoryStatusHtml(group){
-  const state=qNorm(group?.estado),missing=Math.max(0,qInt(group?.faltantes));if(group?.prestamoActivo||state==='prestado'||state==='prestado parcial')return `<span class="mx-qx-status-chip warn">💼 ${missing>0?'Préstamo parcial · faltan '+missing+' pzs':'Préstamo activo'}</span>`;if(state==='recuperado')return '<span class="mx-qx-status-chip info">↩️ Recuperado</span>';if(missing>0)return `<span class="mx-qx-status-chip warn">⚠️ ${group?.total>0?'Salida parcial':'Kit sin existencia'} · faltan ${missing} pzs</span>`;return '<span class="mx-qx-status-chip ok">✅ Completa</span>';
+  const state=qNorm(group?.estado),missing=Math.max(0,qInt(group?.faltantes));if(group?.prestamoActivo||state==='prestado'||state==='prestado parcial')return `<span class="mx-qx-status-chip warn">💼 ${group?.total===0?'Pendiente de finalizar':missing>0?'Préstamo parcial · faltan '+missing+' pzs':'Préstamo activo'}</span>`;if(state==='recuperado')return '<span class="mx-qx-status-chip info">↩️ Recuperado</span>';if(missing>0)return `<span class="mx-qx-status-chip warn">⚠️ ${group?.total>0?'Salida parcial':'Kit sin existencia'} · faltan ${missing} pzs</span>`;return '<span class="mx-qx-status-chip ok">✅ Completa</span>';
 }
 function renderServiceHistory(){
   const body=$q('mxQxHistBody');if(!body)return;
@@ -34052,7 +34533,7 @@ function renderServiceHistory(){
     return !term||qNorm([g.folio,g.destino?.nombre,g.destino?.iniciales,g.medico?.nombre,g.medico?.cedula,g.paciente?.nombre,g.paciente?.ojo,(g.kits||[]).join(' '),g.estado,g.eanPrestamo].join(' ')).includes(term);
   });
   $q('mxQxHistCount').textContent=`${rows.length} servicio${rows.length===1?'':'s'}`;
-  body.innerHTML=rows.length?rows.slice(0,150).map(g=>{const buttons=[`<button class="btn" type="button" data-qx-hist-edit="${qEsc(g.folio)}">✏️ Editar</button>`];if(g.items.length||g.faltantes>0)buttons.push(`<button class="btn ok" type="button" data-qx-hist-pdf="${qEsc(g.folio)}">📄 PDF</button>`);if(g.eanPrestamo)buttons.push(`<button class="btn" type="button" data-qx-hist-label="${qEsc(g.folio)}">🏷️ Etiqueta</button>`);if(g.prestamoActivo){buttons.push(`<button class="btn" type="button" data-qx-hist-adjust="${qEsc(g.folio)}">↩️ Ajustar préstamo</button>`);buttons.push(`<button class="btn ok" type="button" data-qx-hist-finalize="${qEsc(g.folio)}">✅ Finalizar</button>`);}return `<tr><td><b>${qEsc(qDateDisplay(g.fecha))}</b></td><td><b>${qEsc(g.folio)}</b>${g.eanPrestamo?`<span class="mx-qx-ean-badge mx-qx-ean-text">${qEsc(g.eanPrestamo)}</span>`:''}</td><td>${qEsc(g.destino?.nombre||'—')}<small style="display:block;color:#64748b">${qEsc(g.destino?.iniciales||'')}</small></td><td>${qEsc(g.medico?.nombre||'—')}<small style="display:block;color:#64748b">Cédula: ${qEsc(g.medico?.cedula||'—')}</small></td><td>${qEsc(g.paciente?.nombre||'—')}<small style="display:block;color:#64748b">${qEsc(g.paciente?.edad?g.paciente.edad+' años':'')} ${qEsc(g.paciente?.sexo||'')}${g.paciente?.ojo?' · Ojo: '+qEsc(g.paciente.ojo):''}</small></td><td><b>${g.items.length} producto${g.items.length===1?'':'s'} · ${g.total} pzs surtidas${g.faltantes>0?' · '+g.faltantes+' faltantes':''}</b><small style="display:block;color:#64748b">${qEsc((g.kits||[]).join(', ')||'Sin kit')}</small>${serviceHistoryStatusHtml(g)}</td><td><div class="mx-qx-history-actions">${buttons.join('')}</div></td></tr>`;}).join(''):'<tr><td colspan="7" class="mx-qx-history-empty">No hay servicios quirúrgicos con este filtro.</td></tr>';
+  body.innerHTML=rows.length?rows.slice(0,150).map(g=>{const buttons=[`<button class="btn" type="button" data-qx-hist-edit="${qEsc(g.folio)}">✏️ Editar</button>`];if(g.items.length||g.faltantes>0)buttons.push(`<button class="btn ok" type="button" data-qx-hist-pdf="${qEsc(g.folio)}">📄 PDF</button>`);if(g.eanPrestamo)buttons.push(`<button class="btn" type="button" data-qx-hist-label="${qEsc(g.folio)}">🏷️ Etiqueta</button>`);if(g.prestamoActivo){buttons.push(`<button class="btn" type="button" data-qx-hist-adjust="${qEsc(g.folio)}">↩️ Ajustar préstamo</button>`);buttons.push(`<button class="btn ok" type="button" data-qx-hist-finalize="${qEsc(g.folio)}">✅ Finalizar</button>`);}return `<tr><td><b>${qEsc(qDateDisplay(g.fecha))}</b></td><td><b>${qEsc(g.folio)}</b>${g.eanPrestamo?`<span class="mx-qx-ean-badge mx-qx-ean-text">${qEsc(g.eanPrestamo)}</span>`:''}</td><td>${qEsc(g.destino?.nombre||'—')}<small style="display:block;color:#64748b">${qEsc(g.destino?.iniciales||'')}</small></td><td>${qEsc(g.medico?.nombre||'—')}<small style="display:block;color:#64748b">Cédula: ${qEsc(g.medico?.cedula||'—')}${g.anestesiologo?.nombre?` · Anest.: ${qEsc(g.anestesiologo.nombre)}`:''}</small></td><td>${qEsc(g.paciente?.nombre||'—')}<small style="display:block;color:#64748b">${qEsc(g.paciente?.edad?g.paciente.edad+' años':'')} ${qEsc(g.paciente?.sexo||'')}${g.paciente?.ojo?' · Ojo: '+qEsc(g.paciente.ojo):''}</small></td><td><b>${g.items.length} producto${g.items.length===1?'':'s'} · ${g.solicitadas} solicitadas · ${g.prestadas} prestadas · ${g.total} surtidas finales${g.devueltas>0?' · '+g.devueltas+' devueltas':''}${g.faltantes>0?' · '+g.faltantes+' faltantes':''}</b><small style="display:block;color:#64748b">${qEsc((g.kits||[]).join(', ')||'Sin kit')}</small>${serviceHistoryStatusHtml(g)}</td><td><div class="mx-qx-history-actions">${buttons.join('')}</div></td></tr>`;}).join(''):'<tr><td colspan="7" class="mx-qx-history-empty">No hay servicios quirúrgicos con este filtro.</td></tr>';
   body.querySelectorAll('[data-qx-hist-edit]').forEach(b=>b.onclick=()=>openServiceHistoryEdit(b.dataset.qxHistEdit));
   body.querySelectorAll('[data-qx-hist-pdf]').forEach(b=>b.onclick=()=>generateServiceHistoryPdf(b.dataset.qxHistPdf,b));
   body.querySelectorAll('[data-qx-hist-label]').forEach(b=>b.onclick=()=>{const g=serviceHistoryGroups.find(x=>x.folio===b.dataset.qxHistLabel);if(g)openLoanLabelModal(g,false)});
@@ -34061,70 +34542,201 @@ function renderServiceHistory(){
 }
 async function loadServiceHistory(force=false){if(serviceHistoryBusy)return;serviceHistoryBusy=true;const b=$q('mxQxHistRefresh');if(b){b.disabled=true;b.textContent='Actualizando…';}try{serviceHistoryGroups=qGroupServiceRows(await qSurgicalRows(force));renderServiceHistory();}catch(e){console.error('[HISTORIAL SERVICIO QUIRURGICO]',e);const body=$q('mxQxHistBody');if(body)body.innerHTML=`<tr><td colspan="7" class="mx-qx-history-empty">No se pudo cargar el historial: ${qEsc(e?.message||e)}</td></tr>`;}finally{serviceHistoryBusy=false;if(b){b.disabled=false;b.textContent='↻ Actualizar';}}}
 function openServiceHistoryEdit(folio){
-  const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el servicio.');$q('mxQxHistEditModal')?.remove();const modal=document.createElement('div');modal.id='mxQxHistEditModal';modal.className='mx-qx-modal';const services=qConfiguredServices(),opts=services.map(s=>`<option value="${qEsc(s.iniciales)}" data-name="${qEsc(s.nombre)}" ${s.iniciales===g.destino?.iniciales?'selected':''}>${qEsc(s.nombre)} (${qEsc(s.iniciales)})</option>`).join('');modal.innerHTML=`<div class="mx-qx-edit-card"><div class="mx-qx-edit-head"><div><h3>✏️ Editar servicio quirúrgico</h3><small>Folio ${qEsc(g.folio)} · el folio asignado no cambia.</small></div><button class="mx-qx-x" id="mxQxHistEditX" type="button">×</button></div><div class="mx-qx-edit-body"><div class="mx-qx-edit-grid"><div class="mx-qx-field"><label>Fecha</label><input class="input" id="mxQxEditDate" type="date" value="${qEsc(g.fecha)}"></div><div class="mx-qx-field"><label>Servicio de destino</label><select class="select" id="mxQxEditService"><option value="">Selecciona servicio</option>${opts}</select></div><div class="mx-qx-field"><label>Nombre del médico</label><input class="input" id="mxQxEditMedName" value="${qEsc(g.medico?.nombre)}"></div><div class="mx-qx-field"><label>Cédula</label><input class="input" id="mxQxEditMedCed" value="${qEsc(g.medico?.cedula)}"></div><div class="mx-qx-field"><label>Teléfono médico</label><input class="input" id="mxQxEditMedTel" value="${qEsc(g.medico?.telefono)}"></div><div class="mx-qx-field"><label>Domicilio médico</label><input class="input" id="mxQxEditMedDom" value="${qEsc(g.medico?.domicilio)}"></div><div class="mx-qx-field"><label>Nombre del paciente</label><input class="input" id="mxQxEditPatient" value="${qEsc(g.paciente?.nombre)}"></div><div class="mx-qx-field"><label>Edad</label><input class="input" id="mxQxEditAge" type="number" min="0" max="130" value="${qEsc(g.paciente?.edad)}"></div><div class="mx-qx-field"><label>Sexo</label><select class="select" id="mxQxEditSex"><option value="">Selecciona</option>${['Femenino','Masculino','Otro','No especificado'].map(v=>`<option ${qNorm(v)===qNorm(g.paciente?.sexo)?'selected':''}>${v}</option>`).join('')}</select></div><div class="mx-qx-field"><label>Ojo a operar</label><select class="select" id="mxQxEditEye"><option value="">Selecciona</option>${['Derecho','Izquierdo','Ambos'].map(v=>`<option ${qNorm(v)===qNorm(g.paciente?.ojo)?'selected':''}>${v}</option>`).join('')}</select></div><div class="mx-qx-field"><label>Teléfono paciente</label><input class="input" id="mxQxEditPatientTel" value="${qEsc(g.paciente?.telefono)}"></div><div class="mx-qx-edit-wide badge">Los productos y cantidades se ajustan en la opción préstamo cuando el folio sigue prestado. Aquí solo cambias los datos generales.</div></div></div><div class="mx-qx-edit-foot"><button class="btn" id="mxQxHistEditCancel" type="button">Cancelar</button><button class="btn ok" id="mxQxHistEditSave" type="button">💾 Guardar cambios</button></div></div>`;document.body.appendChild(modal);const close=()=>modal.remove();$q('mxQxHistEditX').onclick=close;$q('mxQxHistEditCancel').onclick=close;modal.addEventListener('mousedown',e=>{if(e.target===modal)close()});$q('mxQxHistEditSave').onclick=()=>saveServiceHistoryEdit(g,modal);
+  const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el servicio.');$q('mxQxHistEditModal')?.remove();const modal=document.createElement('div');modal.id='mxQxHistEditModal';modal.className='mx-qx-modal';const services=qConfiguredServices(),opts=services.map(s=>`<option value="${qEsc(s.iniciales)}" data-name="${qEsc(s.nombre)}" ${s.iniciales===g.destino?.iniciales?'selected':''}>${qEsc(s.nombre)} (${qEsc(s.iniciales)})</option>`).join('');modal.innerHTML=`<div class="mx-qx-edit-card"><div class="mx-qx-edit-head"><div><h3>✏️ Editar servicio quirúrgico</h3><small>Folio ${qEsc(g.folio)} · el folio asignado no cambia.</small></div><button class="mx-qx-x" id="mxQxHistEditX" type="button">×</button></div><div class="mx-qx-edit-body"><div class="mx-qx-edit-grid"><div class="mx-qx-field"><label>Fecha</label><input class="input" id="mxQxEditDate" type="date" value="${qEsc(g.fecha)}"></div><div class="mx-qx-field"><label>Servicio de destino</label><select class="select" id="mxQxEditService"><option value="">Selecciona servicio</option>${opts}</select></div><div class="mx-qx-field"><label>Nombre del médico</label><input class="input" id="mxQxEditMedName" value="${qEsc(g.medico?.nombre)}"></div><div class="mx-qx-field"><label>Cédula</label><input class="input" id="mxQxEditMedCed" value="${qEsc(g.medico?.cedula)}"></div><div class="mx-qx-field"><label>Anestesiólogo</label><input class="input" id="mxQxEditAnestName" list="mxQxEditAnestList" value="${qEsc(g.anestesiologo?.nombre||'')}" placeholder="Buscar en Médicos"><datalist id="mxQxEditAnestList"></datalist></div><div class="mx-qx-field"><label>Teléfono médico</label><input class="input" id="mxQxEditMedTel" value="${qEsc(g.medico?.telefono)}"></div><div class="mx-qx-field"><label>Domicilio médico</label><input class="input" id="mxQxEditMedDom" value="${qEsc(g.medico?.domicilio)}"></div><div class="mx-qx-field"><label>Nombre del paciente</label><input class="input" id="mxQxEditPatient" value="${qEsc(g.paciente?.nombre)}"></div><div class="mx-qx-field"><label>Edad</label><input class="input" id="mxQxEditAge" type="number" min="0" max="130" value="${qEsc(g.paciente?.edad)}"></div><div class="mx-qx-field"><label>Sexo</label><select class="select" id="mxQxEditSex"><option value="">Selecciona</option>${['Femenino','Masculino','Otro','No especificado'].map(v=>`<option ${qNorm(v)===qNorm(g.paciente?.sexo)?'selected':''}>${v}</option>`).join('')}</select></div><div class="mx-qx-field"><label>Ojo a operar</label><select class="select" id="mxQxEditEye"><option value="">Selecciona</option>${['Derecho','Izquierdo','Ambos'].map(v=>`<option ${qNorm(v)===qNorm(g.paciente?.ojo)?'selected':''}>${v}</option>`).join('')}</select></div><div class="mx-qx-field"><label>Teléfono paciente</label><input class="input" id="mxQxEditPatientTel" value="${qEsc(g.paciente?.telefono)}"></div><div class="mx-qx-edit-wide badge">Los productos y cantidades se ajustan en la opción préstamo cuando el folio sigue prestado. Aquí solo cambias los datos generales.</div></div></div><div class="mx-qx-edit-foot"><button class="btn" id="mxQxHistEditCancel" type="button">Cancelar</button><button class="btn ok" id="mxQxHistEditSave" type="button">💾 Guardar cambios</button></div></div>`;document.body.appendChild(modal);const close=()=>modal.remove();$q('mxQxHistEditX').onclick=close;$q('mxQxHistEditCancel').onclick=close;modal.addEventListener('mousedown',e=>{if(e.target===modal)close()});loadDoctors().then(all=>{const l=$q('mxQxEditAnestList');if(l)l.innerHTML=all.filter(m=>qTxt(m.nombre)).map(m=>`<option value="${qEsc(m.nombre)}"></option>`).join('');}).catch(()=>{});$q('mxQxHistEditSave').onclick=()=>saveServiceHistoryEdit(g,modal);
 }
 async function saveServiceHistoryEdit(group,modal){
-  const btn=$q('mxQxHistEditSave');if(btn){btn.disabled=true;btn.textContent='Guardando…';}try{const date=qTxt($q('mxQxEditDate')?.value)||group.fecha,sel=$q('mxQxEditService'),code=qTxt(sel?.value)||group.destino?.iniciales,name=qTxt(sel?.options?.[sel.selectedIndex]?.dataset?.name||group.destino?.nombre),medico={nombre:qTxt($q('mxQxEditMedName')?.value),cedula:qTxt($q('mxQxEditMedCed')?.value),telefono:qTxt($q('mxQxEditMedTel')?.value),domicilio:qTxt($q('mxQxEditMedDom')?.value)},paciente={nombre:qTxt($q('mxQxEditPatient')?.value),edad:qTxt($q('mxQxEditAge')?.value),sexo:qTxt($q('mxQxEditSex')?.value),ojo:qTxt($q('mxQxEditEye')?.value),telefono:qTxt($q('mxQxEditPatientTel')?.value)};if(!medico.nombre)throw new Error('Captura el nombre del médico.');if(!paciente.nombre)throw new Error('Captura el nombre del paciente.');if(!paciente.ojo)throw new Error('Selecciona el ojo a operar.');const now=new Date().toISOString(),kits=group.kits||[],updates=group.rows.map(r=>({...r,fecha:qDateDisplay(date),servicio:name||r.servicio,servicio_destino:name||r.servicio_destino,servicio_iniciales:code||r.servicio_iniciales,destino:name||r.destino,medico:medico.nombre,cedula:medico.cedula,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,paciente:paciente.nombre,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,observaciones:`Servicio quirúrgico · Destino: ${name||group.destino?.nombre||'—'} (${code||group.destino?.iniciales||'—'}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}`,updatedAt:now}));if(window.electronSql?.transactionDurable)await window.electronSql.transactionDurable(updates.map(value=>({type:'put',store:'salidas',value})));else for(const value of updates)await window.idbPut('salidas',value);try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true;}catch(_e){}serviceHistoryRowsCache=[];serviceHistoryLoadedAt=0;try{await drawSalidas?.();}catch(_e){}await loadServiceHistory(true);modal.remove();qAlert(`✅ Servicio ${group.folio} actualizado. Los cambios ya se reflejan en Salidas.`);}catch(e){qAlert('No se pudieron guardar los cambios: '+(e?.message||e));}finally{if(btn&&document.body.contains(btn)){btn.disabled=false;btn.textContent='💾 Guardar cambios';}}}
+  const btn=$q('mxQxHistEditSave');if(btn){btn.disabled=true;btn.textContent='Guardando…';}try{const date=qTxt($q('mxQxEditDate')?.value)||group.fecha,sel=$q('mxQxEditService'),code=qTxt(sel?.value)||group.destino?.iniciales,name=qTxt(sel?.options?.[sel.selectedIndex]?.dataset?.name||group.destino?.nombre),medico={nombre:qTxt($q('mxQxEditMedName')?.value),cedula:qTxt($q('mxQxEditMedCed')?.value),telefono:qTxt($q('mxQxEditMedTel')?.value),domicilio:qTxt($q('mxQxEditMedDom')?.value)},paciente={nombre:qTxt($q('mxQxEditPatient')?.value),edad:qTxt($q('mxQxEditAge')?.value),sexo:qTxt($q('mxQxEditSex')?.value),ojo:qTxt($q('mxQxEditEye')?.value),telefono:qTxt($q('mxQxEditPatientTel')?.value)};const anestName=qTxt($q('mxQxEditAnestName')?.value),anestMatches=anestName?(await loadDoctors(true)).filter(m=>qNorm(m.nombre)===qNorm(anestName)):[];if(anestName&&anestMatches.length!==1)throw new Error('Selecciona un anestesiólogo único del catálogo de Médicos.');const anest=anestMatches[0]||null;if(!medico.nombre)throw new Error('Captura el nombre del médico.');if(!paciente.nombre)throw new Error('Captura el nombre del paciente.');if(!paciente.ojo)throw new Error('Selecciona el ojo a operar.');const now=new Date().toISOString(),kits=group.kits||[],updates=group.rows.map(r=>({...r,fecha:qDateDisplay(date),servicio:name||r.servicio,servicio_destino:name||r.servicio_destino,servicio_iniciales:code||r.servicio_iniciales,destino:name||r.destino,medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(anest?.nombre),anestesiologo_cedula:qTxt(anest?.cedula),anestesiologo_id:anest?._id??null,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,paciente:paciente.nombre,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,observaciones:`Servicio quirúrgico · Destino: ${name||group.destino?.nombre||'—'} (${code||group.destino?.iniciales||'—'}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}`,updatedAt:now}));if(window.electronSql?.transactionDurable)await window.electronSql.transactionDurable(updates.map(value=>({type:'put',store:'salidas',value})));else for(const value of updates)await window.idbPut('salidas',value);try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true;}catch(_e){}serviceHistoryRowsCache=[];serviceHistoryLoadedAt=0;try{await drawSalidas?.();}catch(_e){}await loadServiceHistory(true);modal.remove();qAlert(`✅ Servicio ${group.folio} actualizado. Los cambios ya se reflejan en Salidas.`);}catch(e){qAlert('No se pudieron guardar los cambios: '+(e?.message||e));}finally{if(btn&&document.body.contains(btn)){btn.disabled=false;btn.textContent='💾 Guardar cambios';}}}
 async function generateServiceHistoryPdf(folio,button){
-  const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el servicio.');const old=button?.textContent;if(button){button.disabled=true;button.textContent='Generando…';}try{const result=await printServicePdf({folio:g.folio,fechaTexto:qDateDisplay(g.fecha),destino:g.destino,medico:g.medico,paciente:g.paciente,kits:g.kits,items:g.items,usuario:g.usuario});qAlert(`✅ PDF generado: ${result?.filename||('SERVICIO_QUIRURGICO_'+g.folio+'.pdf')}
+  const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el servicio.');const old=button?.textContent;if(button){button.disabled=true;button.textContent='Generando…';}try{const result=await printServicePdf({folio:g.folio,fechaTexto:qDateDisplay(g.fecha),destino:g.destino,medico:g.medico,anestesiologo:g.anestesiologo,paciente:g.paciente,kits:g.kits,items:g.items,usuario:g.usuario,totalPrestadoInicial:g.prestadas,totalDevuelto:g.devueltas});qAlert(`✅ PDF generado: ${result?.filename||('SERVICIO_QUIRURGICO_'+g.folio+'.pdf')}
 
-Se guardó en Descargas > Macroxel Hospitales.`);}catch(e){console.error('[PDF SERVICIO QUIRURGICO MANUAL]',e);qAlert('No se pudo generar el PDF: '+(e?.message||e));}finally{if(button){button.disabled=false;button.textContent=old||'📄 Generar PDF';}}}
-function getCurrentServiceDraft(){return {medico:{nombre:qTxt($q('mxQxSrvMedName')?.value),cedula:qTxt($q('mxQxSrvMedCed')?.value),telefono:qTxt($q('mxQxSrvMedTel')?.value),domicilio:qTxt($q('mxQxSrvMedDom')?.value)},paciente:{nombre:qTxt($q('mxQxSrvPatient')?.value),edad:qTxt($q('mxQxSrvAge')?.value),sexo:qTxt($q('mxQxSrvSex')?.value),ojo:qTxt($q('mxQxSrvEye')?.value),telefono:qTxt($q('mxQxSrvPatientTel')?.value)},items:serviceAggregate(),destino:selectedDestinationService()};}
+${window.electronSql?.savePdfHtml?'Se guardó en Descargas > Macroxel Hospitales.':'Se descargó desde el navegador.'}`);}catch(e){console.error('[PDF SERVICIO QUIRURGICO MANUAL]',e);qAlert('No se pudo generar el PDF: '+(e?.message||e));}finally{if(button){button.disabled=false;button.textContent=old||'📄 Generar PDF';}}}
+function getCurrentServiceDraft(){return {anestesiologo:{nombre:qTxt($q('mxQxSrvAnestName')?.value),cedula:qTxt(serviceState.anestCedula),id:serviceState.anestId??null},medico:{nombre:qTxt($q('mxQxSrvMedName')?.value),cedula:qTxt($q('mxQxSrvMedCed')?.value),telefono:qTxt($q('mxQxSrvMedTel')?.value),domicilio:qTxt($q('mxQxSrvMedDom')?.value)},paciente:{nombre:qTxt($q('mxQxSrvPatient')?.value),edad:qTxt($q('mxQxSrvAge')?.value),sexo:qTxt($q('mxQxSrvSex')?.value),ojo:qTxt($q('mxQxSrvEye')?.value),telefono:qTxt($q('mxQxSrvPatientTel')?.value)},items:serviceAggregate(),destino:selectedDestinationService()};}
 async function generateCurrentServiceOrderPdf(){
-  if(serviceBusy)return;const btn=$q('mxQxSrvPdf'),old=btn?.textContent;try{await hydrateExactDoctor();await refreshServiceFolioPreview();const draft=getCurrentServiceDraft();if(!draft.destino)return qAlert('Selecciona el servicio de destino antes de generar el PDF.');if(!draft.paciente.ojo)return qAlert('Selecciona el ojo a operar antes de generar el PDF.');if(!draft.items.length)return qAlert('Agrega al menos un kit con productos antes de generar el PDF.');const folio=qTxt($q('mxQxSrvFolio')?.value)||qTxt(serviceState.folio)||'BORRADOR',kits=(serviceState.selectedKits||[]).map(k=>qTxt(k.nombre)).filter(Boolean),fechaTexto=qTxt($q('mxQxSrvDate')?.value)||new Date().toLocaleString('es-MX');if(btn){btn.disabled=true;btn.textContent='Generando PDF…';}const result=await printServicePdf({pdfMode:'pedido',folio,fechaTexto,destino:draft.destino,medico:draft.medico,paciente:draft.paciente,kits,items:draft.items,usuario:getLoggedUserLabel?.()||''});qAlert(`✅ Pedido enviado a PDF${result?.filename?' · '+result.filename:''}.
+  if(serviceBusy)return;const btn=$q('mxQxSrvPdf'),old=btn?.textContent;try{await hydrateExactDoctor();await hydrateServiceAnestesiologoV261(true);await refreshServiceFolioPreview();const draft=getCurrentServiceDraft();if(!draft.destino)return qAlert('Selecciona el servicio de destino antes de generar el PDF.');if(!draft.paciente.ojo)return qAlert('Selecciona el ojo a operar antes de generar el PDF.');if(!draft.items.length)return qAlert('Agrega al menos un kit con productos antes de generar el PDF.');const folio=qTxt($q('mxQxSrvFolio')?.value)||qTxt(serviceState.folio)||'BORRADOR',kits=(serviceState.selectedKits||[]).map(k=>qTxt(k.nombre)).filter(Boolean),fechaTexto=qTxt($q('mxQxSrvDate')?.value)||new Date().toLocaleString('es-MX');if(btn){btn.disabled=true;btn.textContent='Generando PDF…';}const result=await printServicePdf({pdfMode:'pedido',folio,fechaTexto,destino:draft.destino,medico:draft.medico,anestesiologo:draft.anestesiologo,paciente:draft.paciente,kits,items:draft.items,usuario:getLoggedUserLabel?.()||''});qAlert(`✅ Pedido enviado a PDF${result?.filename?' · '+result.filename:''}.
 
 No se modificó inventario ni se registró la salida.`);}catch(e){console.error('[PDF PEDIDO SERVICIO]',e);qAlert('No se pudo generar el PDF del pedido: '+(e?.message||e));}finally{if(btn){btn.disabled=false;btn.textContent=old||'📄 Enviar a PDF';}}
 }
 async function refreshServiceUiData(){invCacheAtV148=0;invCatalogAtV148=0;invCacheV148=[];invCatalogV148=[];serviceHistoryRowsCache=[];serviceHistoryLoadedAt=0;try{await refreshCacheInv?.();}catch(_e){}try{await drawInventario?.();}catch(_e){}try{await drawSalidas?.();}catch(_e){}try{await renderDashboard?.();}catch(_e){}try{await loadServiceHistory(true);}catch(_e){}}
 async function registerServiceLoan(){
-  if(serviceBusy)return;await hydrateExactDoctor();const draft=getCurrentServiceDraft(),medico=draft.medico,paciente=draft.paciente,items=draft.items,destino=draft.destino;
-  if(!destino)return qAlert('Selecciona el servicio de destino.');if(!medico.nombre)return qAlert('Captura o selecciona el nombre del médico.');if(!paciente.nombre)return qAlert('Captura el nombre del paciente.');if(!paciente.ojo)return qAlert('Selecciona el ojo a operar.');if(!serviceState.selectedKits.length)return qAlert('Agrega al menos un kit al servicio.');if(!items.length)return qAlert('Los kits seleccionados no tienen productos para surtir.');
+  // V263: EL PRÉSTAMO ES UNA RESERVA, NO UN MOVIMIENTO DE INVENTARIO.
+  if(serviceBusy)return;
+  await hydrateExactDoctor();
+  try{await hydrateServiceAnestesiologoV261(true);}catch(e){return qAlert(e.message);}
+  const draft=getCurrentServiceDraft(),medico=draft.medico,paciente=draft.paciente,items=draft.items,destino=draft.destino;
+  if(!destino)return qAlert('Selecciona el servicio de destino.');
+  if(!medico.nombre)return qAlert('Captura o selecciona el nombre del médico.');
+  if(!paciente.nombre)return qAlert('Captura el nombre del paciente.');
+  if(!paciente.ojo)return qAlert('Selecciona el ojo a operar.');
+  if(!serviceState.selectedKits.length||!items.length)return qAlert('Agrega un kit con productos.');
   await ensureServiceDoctorLinked(medico);await refreshServiceFolioPreview();
-  const total=items.reduce((s,x)=>s+qInt(x.cantidad),0),previewFolio=serviceState.folio||'pendiente';if(!await qConfirm(`¿Registrar el servicio quirúrgico ${previewFolio} como préstamo?
+  const total=items.reduce((s,x)=>s+Math.max(0,qInt(x.cantidad)),0);
+  const previewFolio=serviceState.folio||'pendiente';
+  if(!await qConfirm(`¿Registrar el pedido ${previewFolio} como PRÉSTAMO PENDIENTE?
 
-Destino: ${destino.nombre} (${destino.iniciales})
-Kits: ${serviceState.selectedKits.length}
-Productos: ${items.length}
-Piezas: ${total}
+Destino: ${destino.nombre}
+Piezas solicitadas: ${total}
 
-La falta de existencia no bloqueará el kit. Se prestará únicamente lo disponible y cualquier faltante quedará identificado, sin generar inventario negativo.`))return;
-  serviceBusy=true;const btn=$q('mxQxSrvLoan');if(btn){btn.disabled=true;btn.textContent='Registrando préstamo…';}
+Puedes incluir productos sin existencia y ajustar las piezas realmente usadas. NO se descontará inventario hasta FINALIZAR EL PRÉSTAMO. Los faltantes mostrarán un saldo proyectado negativo.`))return;
+  serviceBusy=true;const btn=$q('mxQxSrvLoan');if(btn){btn.disabled=true;btn.textContent='Guardando pedido…';}
   try{
-    const plan=await planServiceAllocations(items),alloc=plan.alloc||[],shortages=plan.shortages||[],missingTotal=serviceShortageTotal(shortages),servedTotal=alloc.reduce((s,a)=>s+qInt(a.qty),0),usuario=getLoggedUserLabel?.()||'',kits=serviceState.selectedKits.map(k=>k.nombre),fecha=fechaHoy(),eanPrestamo=await generateUniqueLoanEan();
-    let folio=serviceState.folio;if(typeof window.mxReserveSurgicalServiceFolio==='function'){const reserved=await window.mxReserveSurgicalServiceFolio({serviceName:destino.nombre,serviceInitials:destino.iniciales,date:qLocalYmd()});folio=qTxt(reserved?.folio)||folio;}if(!folio)throw new Error('No se pudo generar el folio del servicio quirúrgico.');serviceState.folio=folio;if($q('mxQxSrvFolio'))$q('mxQxSrvFolio').value=folio;
-    for(const a of alloc){
-      const r=a.match,p=a.item,qty=a.qty,prod={clave:qTxt(r.clave||p.clave),codigo_barras:qTxt(r.codigo_barras||r.codigoBarras||r.barcode||p.codigo_barras),descripcion:qTxt(r.descripcion||r.nombre||p.descripcion),unidad:qTxt(r.unidad||p.unidad),lote:qTxt(r.lote),caducidad:qTxt(r.caducidad||r.cad).slice(0,10)};const fin=qFinanceOf(r||{}),unitCost=Math.max(0,qNum(fin?.costo_final||fin?.costo||r.costo_unitario||r.costo||p.costo_unitario||p.costo)),unitPrice=Math.max(0,qNum(fin?.precio_venta||r.precio_venta||r.precioVenta||p.precio_venta||p.precioVenta));
-      await upsertInventario(prod,-qty,{accion:'Préstamo servicio quirúrgico',detalle:`Préstamo servicio quirúrgico ${folio} · Destino: ${destino.nombre} (${destino.iniciales}) · ${qty} pzs · Kits: ${kits.join(', ')}`,usuario});
-      const reg={fecha,usuario,clave:prod.clave,codigo_barras:prod.codigo_barras,descripcion:prod.descripcion,unidad:prod.unidad,lote:prod.lote,caducidad:prod.caducidad,costo_unitario:unitCost,costo:unitCost,precio_venta:unitPrice,valor_costo:unitCost*qty,valor_venta:unitPrice*qty,pzs:qty,ex_ini:a.exIni,ex_fin:Math.max(0,a.exIni-qty),tipo_doc:'Servicio quirúrgico',estado:'Prestado',prestamo_activo:true,ean_prestamo:eanPrestamo,folio,servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,medico:medico.nombre,cedula:medico.cedula,paciente:paciente.nombre,expediente:'',observaciones:`Préstamo servicio quirúrgico · Destino: ${destino.nombre} (${destino.iniciales}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}`,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,kits_quirurgicos:kits,servicio_quirurgico:true,createdAt:new Date().toISOString()};
-      await saveSalida(reg);
+    const availability=await qAvailabilityMap().catch(()=>null);
+    const kits=serviceState.selectedKits.map(k=>k.nombre),fecha=fechaHoy(),usuario=getLoggedUserLabel?.()||'',eanPrestamo=await generateUniqueLoanEan();
+    let folio=serviceState.folio;
+    if(typeof window.mxReserveSurgicalServiceFolio==='function'){
+      const reserved=await window.mxReserveSurgicalServiceFolio({serviceName:destino.nombre,serviceInitials:destino.iniciales,date:qLocalYmd()});
+      folio=qTxt(reserved?.folio)||folio;
     }
-    if(shortages.length)await saveServiceShortageRows({shortages,fecha,usuario,kits,folio,destino,medico,paciente,eanPrestamo});
-    await refreshServiceUiData();serviceBusy=false;if(btn){btn.disabled=false;btn.textContent='💼 Registrar préstamo';}$q('mxQxServiceModal')?.classList.add('hidden');const createdGroup=serviceHistoryGroups.find(g=>g.folio===folio)||qGroupServiceRows((await qSurgicalRows(true)).filter(r=>qTxt(r.folio)===folio))[0];if(createdGroup&&servedTotal>0)openLoanLabelModal(createdGroup,true);else qAlert(`✅ Kit ${folio} registrado.${servedTotal>0?` Se prestaron ${servedTotal} pzs.`:' No había piezas disponibles para préstamo.'}${missingTotal>0?`\n\n⚠️ Faltantes: ${missingTotal} pzs.\n${serviceShortageText(shortages)}`:''}`);
-  }catch(e){console.error('[PRESTAMO SERVICIO QUIRURGICO]',e);serviceBusy=false;if(btn){btn.disabled=false;btn.textContent='💼 Registrar préstamo';}qAlert(e?.message||'No se pudo registrar el préstamo.');}
+    if(!folio)throw Error('No se pudo generar el folio del pedido.');
+    serviceState.folio=folio;if($q('mxQxSrvFolio'))$q('mxQxSrvFolio').value=folio;
+    let missing=0;
+    for(const item of items){
+      const qty=Math.max(0,qInt(item.cantidad));if(!qty)continue;
+      const f=qFinanceOf(item||{});
+      const cost=Math.max(0,qNum(item.costo_unitario||item.costo||f?.costo_final||f?.costo));
+      const price=Math.max(0,qNum(item.precio_venta||item.precioVenta||f?.precio_venta));
+      const available=Math.max(0,qInt(availability?.get(qProdKey(item))?.disponible));
+      missing+=Math.max(0,qty-available);
+      await saveSalida({
+        fecha,usuario,clave:qTxt(item.clave),codigo_barras:qTxt(item.codigo_barras||item.codigoBarras),descripcion:qTxt(item.descripcion),unidad:qTxt(item.unidad)||'PIEZA',
+        lote:'',caducidad:'',costo_unitario:cost,costo:cost,precio_venta:price,
+        valor_costo:0,valor_venta:0,pzs:0,cantidad:0,
+        pzs_solicitadas:qty,cantidad_solicitada:qty,pzs_programadas:qty,
+        pzs_prestadas:0,pzs_surtidas_iniciales:0,pzs_surtidas:0,
+        pzs_utilizadas:qty,pzs_devueltas:0,pzs_no_utilizadas:0,cantidad_surtida:0,
+        pzs_faltantes:0,cantidad_faltante:0,ex_ini:available,ex_fin:available,
+        prestamo_sin_descontar:true,movimiento_inventario_aplicado:false,prestamo_activo:true,
+        estado:'Préstamo pendiente',tipo_doc:'Servicio quirúrgico',ean_prestamo:eanPrestamo,folio,
+        servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,
+        medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(draft.anestesiologo?.nombre),anestesiologo_cedula:qTxt(draft.anestesiologo?.cedula),anestesiologo_id:draft.anestesiologo?.id??null,
+        paciente:paciente.nombre,expediente:'',telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,
+        observaciones:`Préstamo pendiente · Kit sin descuento de Inventario · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}`,
+        kits_quirurgicos:kits,servicio_quirurgico:true,createdAt:new Date().toISOString()
+      });
+    }
+    await refreshServiceUiData();
+    $q('mxQxServiceModal')?.classList.add('hidden');
+    const g=serviceHistoryGroups.find(x=>x.folio===folio);
+    if(g)openLoanLabelModal(g,true);
+    else qAlert(`✅ Pedido ${folio} guardado como préstamo pendiente. No se descontaron existencias.${missing?`\nFaltantes previstos: ${missing} piezas (saldo proyectado negativo).`:''}\nLa salida real se registrará al finalizar.`);
+  }catch(e){console.error('[PRESTAMO V263]',e);qAlert(e?.message||'No se pudo guardar el préstamo pendiente.');}
+  finally{serviceBusy=false;if(btn){btn.disabled=false;btn.textContent='💼 Registrar préstamo';}}
 }
+
 function openServiceLoanAdjust(folio){
-  const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el préstamo.');if(!g.prestamoActivo)return qAlert('Este folio ya no tiene un préstamo activo.');$q('mxQxLoanAdjustModal')?.remove();const loanRows=(g.rows||[]).filter(r=>qInt(r.pzs||r.cantidad)>0);
+  const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el préstamo.');if(!g.prestamoActivo)return qAlert('Este folio ya no tiene un préstamo activo.');$q('mxQxLoanAdjustModal')?.remove();
+  const loanRows=(g.rows||[]).filter(r=>r.prestamo_sin_descontar===true||qServiceLineLoaned(r)>0);
   const modal=document.createElement('div');modal.id='mxQxLoanAdjustModal';modal.className='mx-qx-modal';
-  modal.innerHTML=`<div class="mx-qx-adjust-card"><div class="mx-qx-edit-head"><div><h3>↩️ Ajustar préstamo</h3><small>Folio ${qEsc(g.folio)} · reduce a la cantidad realmente utilizada o deja 0 para recuperar todo.</small></div><button class="mx-qx-x" id="mxQxLoanAdjustX" type="button">×</button></div><div class="mx-qx-adjust-body"><div class="mx-qx-adjust-note">Los cambios devolverán automáticamente al inventario la diferencia que no se ocupó. Cuando termines, usa <b>Finalizar</b> en el historial para cerrar el préstamo.</div><table class="mx-qx-adjust-table"><thead><tr><th>CLAVE</th><th>PRODUCTO</th><th>LOTE / CADUCIDAD</th><th>PZS PRESTADAS</th><th>PZS FINALES</th></tr></thead><tbody>${loanRows.map((r,i)=>`<tr><td>${qEsc(r.clave||'')}</td><td>${qEsc(r.descripcion||'')}</td><td>${qEsc((qTxt(r.lote)||'S/L')+' / '+(qTxt(r.caducidad)||'S/C'))}</td><td><b>${qInt(r.pzs||r.cantidad)}</b></td><td><input class="input" data-qx-loan-qty="${i}" type="number" min="0" step="1" value="${qInt(r.pzs||r.cantidad)}"></td></tr>`).join('')}</tbody></table></div><div class="mx-qx-edit-foot"><button class="btn" id="mxQxLoanAdjustCancel" type="button">Cancelar</button><button class="btn ok" id="mxQxLoanAdjustSave" type="button">💾 Guardar ajuste</button></div></div>`;
+  modal.innerHTML=`<div class="mx-qx-adjust-card"><div class="mx-qx-edit-head"><div><h3>↩️ Ajustar préstamo</h3><small>Folio ${qEsc(g.folio)} · conserva solicitado y prestado; ajusta solo las piezas usadas.</small></div><button class="mx-qx-x" id="mxQxLoanAdjustX" type="button">×</button></div><div class="mx-qx-adjust-body"><div class="mx-qx-adjust-note">En préstamos pendientes puedes cambiar las piezas previstas sin descontar ni devolver Inventario. <b>La salida real se registra al finalizar</b>. Los préstamos antiguos mantienen su devolución habitual.</div><div style="width:100%;overflow-x:auto"><table class="mx-qx-adjust-table"><thead><tr><th>CLAVE</th><th>PRODUCTO</th><th>LOTE / CADUCIDAD</th><th>SOLICITADAS</th><th>PRESTADAS</th><th>DEVUELTAS</th><th>USADAS / SURTIDO FINAL</th></tr></thead><tbody>${loanRows.map((r,i)=>`<tr><td>${qEsc(r.clave||'')}</td><td>${qEsc(r.descripcion||'')}</td><td>${qEsc((qTxt(r.lote)||'S/L')+' / '+(qTxt(r.caducidad)||'S/C'))}</td><td><b>${qServiceLineRequested(r)}</b></td><td><b>${qServiceLineLoaned(r)}</b></td><td>${Math.max(0,(r.prestamo_sin_descontar?qServiceLineRequested(r):qServiceLineLoaned(r))-(r.prestamo_sin_descontar?qInt(r.pzs_utilizadas??qServiceLineRequested(r)):qServiceLineQty(r)))}</td><td><input class="input" aria-label="Piezas usadas ${qEsc(r.descripcion||'')}" data-qx-loan-qty="${i}" type="number" min="0" max="${r.prestamo_sin_descontar?qServiceLineRequested(r):qServiceLineQty(r)}" step="1" value="${r.prestamo_sin_descontar?qInt(r.pzs_utilizadas??qServiceLineRequested(r)):qServiceLineQty(r)}"></td></tr>`).join('')}</tbody></table></div></div><div class="mx-qx-edit-foot"><button class="btn" id="mxQxLoanAdjustCancel" type="button">Cancelar</button><button class="btn ok" id="mxQxLoanAdjustSave" type="button">💾 Guardar ajuste</button></div></div>`;
   document.body.appendChild(modal);const close=()=>modal.remove();$q('mxQxLoanAdjustX').onclick=close;$q('mxQxLoanAdjustCancel').onclick=close;modal.addEventListener('mousedown',e=>{if(e.target===modal)close()});$q('mxQxLoanAdjustSave').onclick=()=>saveServiceLoanAdjust(g,modal);
 }
 async function saveServiceLoanAdjust(group,modal){
   const btn=$q('mxQxLoanAdjustSave');if(btn){btn.disabled=true;btn.textContent='Guardando…';}
-  try{const usuario=getLoggedUserLabel?.()||'',now=new Date().toISOString();const rows=(group.rows||[]).filter(r=>qInt(r.pzs||r.cantidad)>0);for(let i=0;i<rows.length;i++){const row=rows[i],oldQty=qInt(row.pzs||row.cantidad),input=modal.querySelector(`[data-qx-loan-qty="${i}"]`),newQty=Math.max(0,qInt(input?.value));if(newQty===oldQty)continue;const diff=oldQty-newQty;if(diff>0){const prod={clave:qTxt(row.clave),codigo_barras:qTxt(row.codigo_barras),descripcion:qTxt(row.descripcion),unidad:qTxt(row.unidad),lote:qTxt(row.lote),caducidad:qTxt(row.caducidad).slice(0,10)};await upsertInventario(prod,diff,{accion:'Recuperación préstamo servicio quirúrgico',detalle:`Recuperación préstamo ${group.folio} · ${diff} pzs devueltas`,usuario});}
-      row.pzs=newQty;row.cantidad=newQty;row.ex_fin=Math.max(0,(Number(row.ex_ini)||0)-newQty);row.estado=newQty>0?'Prestado':'Recuperado';row.prestamo_activo=newQty>0;row.updatedAt=now;if(typeof window.idbPut==='function')await window.idbPut('salidas',row);
+  try{
+    const usuario=getLoggedUserLabel?.()||'',now=new Date().toISOString();
+    const rows=(group.rows||[]).filter(r=>r.prestamo_sin_descontar===true||qServiceLineLoaned(r)>0);
+    const updates=[];
+    for(let i=0;i<rows.length;i++){
+      const row=rows[i],pending=row.prestamo_sin_descontar===true;
+      const limit=pending?qServiceLineRequested(row):qServiceLineQty(row);
+      const current=pending?Math.max(0,qInt(row.pzs_utilizadas??limit)):qServiceLineQty(row);
+      const raw=modal.querySelector(`[data-qx-loan-qty="${i}"]`)?.value;
+      const wanted=Number(raw);
+      if(raw===undefined||raw===''||!Number.isSafeInteger(wanted)||wanted<0||wanted>limit)
+        throw Error(`Cantidad inválida para ${qTxt(row.descripcion||row.clave)}. Permitido: 0 a ${limit}.`);
+      if(wanted===current)continue;
+      updates.push({row,wanted,current,pending,limit});
     }
-    try{await window.__mxFlushSqlWrites?.()}catch(_e){}try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true;}catch(_e){}
-    await refreshServiceUiData();modal.remove();qAlert(`✅ Préstamo ${group.folio} ajustado. Las piezas no utilizadas ya se devolvieron al inventario.`);
-  }catch(e){qAlert('No se pudo guardar el ajuste del préstamo: '+(e?.message||e));}finally{if(btn&&document.body.contains(btn)){btn.disabled=false;btn.textContent='💾 Guardar ajuste';}}
+    for(const u of updates){
+      const {row,wanted,current,pending,limit}=u;
+      if(!pending&&current>wanted){
+        const prod={clave:qTxt(row.clave),codigo_barras:qTxt(row.codigo_barras),descripcion:qTxt(row.descripcion),unidad:qTxt(row.unidad),lote:qTxt(row.lote),caducidad:qTxt(row.caducidad).slice(0,10)};
+        await upsertInventario(prod,current-wanted,{accion:'Recuperación préstamo servicio quirúrgico',detalle:`Recuperación préstamo ${group.folio} · ${current-wanted} pzs`,usuario});
+      }
+      // Para pedidos pendientes SOLO se registra la cantidad prevista: el inventario sigue intacto.
+      const finalQty=pending?0:wanted;
+      const updated={...row,
+        pzs_solicitadas:qServiceLineRequested(row),cantidad_solicitada:qServiceLineRequested(row),
+        pzs_prestadas:pending?0:qServiceLineLoaned(row),pzs_surtidas_iniciales:pending?0:qServiceLineLoaned(row),
+        pzs_utilizadas:wanted,pzs_devueltas:pending?0:Math.max(0,qServiceLineLoaned(row)-wanted),pzs_no_utilizadas:pending?Math.max(0,limit-wanted):0,
+        pzs_surtidas:finalQty,cantidad_surtida:finalQty,pzs:finalQty,cantidad:finalQty,
+        valor_costo:qNum(row.costo_unitario||row.costo)*finalQty,valor_venta:qNum(row.precio_venta)*finalQty,
+        ex_fin:pending?Number(row.ex_ini)||0:Math.max(0,(Number(row.ex_ini)||0)-wanted),
+        estado:pending?'Préstamo pendiente':(wanted>0?'Prestado':'Recuperado'),prestamo_activo:true,updatedAt:now
+      };
+      await window.idbPut('salidas',updated);
+    }
+    try{await window.__mxFlushSqlWrites?.()}catch(_e){}
+    try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true;}catch(_e){}
+    await refreshServiceUiData();modal.remove();
+    qAlert(group.rows.some(r=>r.prestamo_sin_descontar===true)
+      ?`✅ Pedido ${group.folio} actualizado. Se conservan las piezas solicitadas y se ajustaron las previstas para uso. No se modificó el Inventario.`
+      :`✅ Préstamo ${group.folio} ajustado. Se conservaron las cantidades originales y se registraron las devoluciones.`);
+  }catch(e){qAlert('No se pudo guardar el ajuste: '+(e?.message||e));}
+  finally{if(btn&&document.body.contains(btn)){btn.disabled=false;btn.textContent='💾 Guardar ajuste';}}
 }
+async function finalizePendingServiceLoanV263(group){
+  // Sólo los préstamos v263. Los anteriores ya descontaron existencias al prestarse y
+  // deben conservar su proceso legado para NO descontarse por segunda vez.
+  const pending=(group.rows||[]).filter(r=>r.prestamo_sin_descontar===true);
+  if(!pending.length)return false;
+  if(pending.some(r=>r.prestamo_cierre_en_curso===true))
+    throw Error('Este folio tuvo una finalización interrumpida. Revisa Inventario y Salidas antes de volver a cerrarlo; se evitó un descuento duplicado.');
+  const now=new Date().toISOString(),usuario=getLoggedUserLabel?.()||'';
+  const jobs=pending.map(row=>({row,requested:qServiceLineRequested(row),wanted:Math.min(qServiceLineRequested(row),Math.max(0,qInt(row.pzs_utilizadas??qServiceLineRequested(row))))}));
+  const plan=await planServiceAllocations(jobs.filter(x=>x.wanted>0).map(x=>({...x.row,cantidad:x.wanted}))),alloc=plan.alloc||[];
+  // Guardar marca de inicio ANTES del primer movimiento. Ante fallo no se repite una salida a ciegas.
+  const locked=pending.map(row=>({...row,prestamo_cierre_en_curso:true,prestamo_cierre_iniciado_en:now}));
+  if(window.electronSql?.transactionDurable)
+    await window.electronSql.transactionDurable(locked.map(value=>({type:'put',store:'salidas',value})));
+  else for(const value of locked)await window.idbPut('salidas',value);
+  const served=new Map();
+  for(const a of alloc){
+    const p=a.item,r=a.match,qty=a.qty;if(!qty)continue;
+    const source=jobs.find(x=>qProdKey(x.row)===qProdKey(p))?.row||pending[0];
+    const prod={clave:qTxt(r.clave||p.clave),codigo_barras:qTxt(r.codigo_barras||r.codigoBarras||p.codigo_barras),descripcion:qTxt(r.descripcion||p.descripcion),unidad:qTxt(r.unidad||p.unidad),lote:qTxt(r.lote),caducidad:qTxt(r.caducidad||r.cad).slice(0,10)};
+    await upsertInventario(prod,-qty,{accion:'Finalización préstamo servicio quirúrgico',detalle:`Salida final préstamo ${group.folio} · ${qty} pzs`,usuario});
+    const fin=qFinanceOf(r||{}),cost=Math.max(0,qNum(fin?.costo_final||fin?.costo||r.costo||source.costo_unitario)),price=Math.max(0,qNum(fin?.precio_venta||r.precio_venta||source.precio_venta));
+    const actualRow={...source,fecha:fechaHoy(),
+      lote:prod.lote,caducidad:prod.caducidad,codigo_barras:prod.codigo_barras,
+      pzs:qty,cantidad:qty,pzs_solicitadas:0,cantidad_solicitada:0,pzs_programadas:0,
+      pzs_prestadas:qty,pzs_surtidas_iniciales:qty,pzs_utilizadas:qty,pzs_devueltas:0,pzs_surtidas:qty,cantidad_surtida:qty,
+      pzs_faltantes:0,cantidad_faltante:0,costo_unitario:cost,costo:cost,precio_venta:price,valor_costo:cost*qty,valor_venta:price*qty,
+      ex_ini:a.exIni,ex_fin:a.exIni-qty,estado:'Completa',prestamo_activo:false,
+      prestamo_sin_descontar:false,movimiento_inventario_aplicado:true,prestamo_finalizado_at:now,
+      observaciones:qTxt(source.observaciones)+' · Salida registrada al finalizar',createdAt:now,updatedAt:now
+    };
+    delete actualRow._id;delete actualRow._mxOpId;delete actualRow.prestamo_cierre_en_curso;delete actualRow.prestamo_cierre_iniciado_en;
+    await saveSalida(actualRow);
+    const key=qProdKey(source);served.set(key,(served.get(key)||0)+qty);
+  }
+  const finish=jobs.map(({row,requested,wanted})=>{
+    const used=served.get(qProdKey(row))||0,missing=Math.max(0,wanted-used);
+    return {...row,prestamo_activo:false,prestamo_sin_descontar:false,prestamo_cierre_en_curso:false,
+      prestamo_finalizado_at:now,updatedAt:now,movimiento_inventario_aplicado:false,
+      pzs:0,cantidad:0,pzs_utilizadas:wanted,pzs_solicitadas:requested,cantidad_solicitada:requested,
+      pzs_faltantes:missing,cantidad_faltante:missing,pzs_devueltas:0,pzs_no_utilizadas:Math.max(0,requested-wanted),
+      saldo_pendiente_negativo:-missing,
+      estado:missing>0?'Faltante':(used>0?'Completa':'Recuperado')};
+  });
+  if(window.electronSql?.transactionDurable)
+    await window.electronSql.transactionDurable(finish.map(value=>({type:'put',store:'salidas',value})));
+  else for(const value of finish)await window.idbPut('salidas',value);
+  try{await window.__mxFlushSqlWrites?.()}catch(_e){}
+  try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true;}catch(_e){}
+  await refreshServiceUiData();
+  const totalUsed=[...served.values()].reduce((a,b)=>a+b,0),missing=finish.reduce((a,r)=>a+qInt(r.pzs_faltantes),0);
+  qAlert(`✅ Préstamo ${group.folio} finalizado. Salidas reales: ${totalUsed} piezas.${missing>0?`\n⚠️ ${missing} piezas todavía sin existencia registrada. Se conserva el saldo pendiente negativo en el pedido; NO se creó un lote ficticio.`:''}`);
+  return true;
+}
+
 async function finalizeServiceLoan(folio,button){
   const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el préstamo.');if(!g.prestamoActivo)return qAlert('Este folio ya no tiene un préstamo activo.');if(!await qConfirm(`¿Finalizar el préstamo ${g.folio}?
 
 A partir de este momento las piezas restantes quedarán registradas como salida final.`))return;const old=button?.textContent;if(button){button.disabled=true;button.textContent='Finalizando…';}
-  try{const now=new Date().toISOString(),updates=g.rows.map(r=>qInt(r.pzs_faltantes||r.cantidad_faltante)>0&&qInt(r.pzs||r.cantidad)<=0?({...r,estado:'Faltante',prestamo_activo:false,updatedAt:now,prestamo_finalizado_at:now}):({...r,estado:qInt(r.pzs||r.cantidad)>0?'Completa':'Recuperado',prestamo_activo:false,updatedAt:now,prestamo_finalizado_at:now}));if(window.electronSql?.transactionDurable)await window.electronSql.transactionDurable(updates.map(value=>({type:'put',store:'salidas',value})));else for(const value of updates)await window.idbPut('salidas',value);try{await window.__mxFlushSqlWrites?.()}catch(_e){}try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true;}catch(_e){}await refreshServiceUiData();qAlert(`✅ Préstamo ${g.folio} finalizado. Ya puedes generar el PDF desde el historial.`);}catch(e){qAlert('No se pudo finalizar el préstamo: '+(e?.message||e));}finally{if(button){button.disabled=false;button.textContent=old||'✅ Finalizar';}}
+  try{if(g.rows.some(r=>r.prestamo_sin_descontar===true)){await finalizePendingServiceLoanV263(g);return;}const now=new Date().toISOString(),updates=g.rows.map(r=>qInt(r.pzs_faltantes||r.cantidad_faltante)>0&&qInt(r.pzs||r.cantidad)<=0?({...r,estado:'Faltante',prestamo_activo:false,updatedAt:now,prestamo_finalizado_at:now}):({...r,estado:qInt(r.pzs||r.cantidad)>0?'Completa':'Recuperado',prestamo_activo:false,updatedAt:now,prestamo_finalizado_at:now}));if(window.electronSql?.transactionDurable)await window.electronSql.transactionDurable(updates.map(value=>({type:'put',store:'salidas',value})));else for(const value of updates)await window.idbPut('salidas',value);try{await window.__mxFlushSqlWrites?.()}catch(_e){}try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true;}catch(_e){}await refreshServiceUiData();qAlert(`✅ Préstamo ${g.folio} finalizado. Ya puedes generar el PDF desde el historial.`);}catch(e){qAlert('No se pudo finalizar el préstamo: '+(e?.message||e));}finally{if(button){button.disabled=false;button.textContent=old||'✅ Finalizar';}}
 }
 async function finalizeService(){
-  if(serviceBusy)return;await hydrateExactDoctor();const draft=getCurrentServiceDraft(),medico=draft.medico,paciente=draft.paciente,items=draft.items,destino=draft.destino;
+  if(serviceBusy)return;await hydrateExactDoctor();try{await hydrateServiceAnestesiologoV261(true);}catch(e){return qAlert(e.message);}const draft=getCurrentServiceDraft(),medico=draft.medico,paciente=draft.paciente,items=draft.items,destino=draft.destino;
   if(!destino)return qAlert('Selecciona el servicio de destino.');if(!medico.nombre)return qAlert('Captura o selecciona el nombre del médico.');if(!paciente.nombre)return qAlert('Captura el nombre del paciente.');if(!paciente.ojo)return qAlert('Selecciona el ojo a operar.');if(!serviceState.selectedKits.length)return qAlert('Agrega al menos un kit al servicio.');if(!items.length)return qAlert('Los kits seleccionados no tienen productos para surtir.');
   await ensureServiceDoctorLinked(medico);await refreshServiceFolioPreview();
   const total=items.reduce((s,x)=>s+qInt(x.cantidad),0),previewFolio=serviceState.folio||'pendiente';if(!await qConfirm(`¿Finalizar el servicio quirúrgico ${previewFolio}?
@@ -34144,11 +34756,11 @@ La falta de existencia NO bloqueará el armado del kit. El sistema descontará �
     for(const a of alloc){
       const r=a.match,p=a.item,qty=a.qty,prod={clave:qTxt(r.clave||p.clave),codigo_barras:qTxt(r.codigo_barras||r.codigoBarras||r.barcode||p.codigo_barras),descripcion:qTxt(r.descripcion||r.nombre||p.descripcion),unidad:qTxt(r.unidad||p.unidad),lote:qTxt(r.lote),caducidad:qTxt(r.caducidad||r.cad).slice(0,10)};const fin=qFinanceOf(r||{}),unitCost=Math.max(0,qNum(fin?.costo_final||fin?.costo||r.costo_unitario||r.costo||p.costo_unitario||p.costo)),unitPrice=Math.max(0,qNum(fin?.precio_venta||r.precio_venta||r.precioVenta||p.precio_venta||p.precioVenta));
       await upsertInventario(prod,-qty,{accion:'Servicio quirúrgico',detalle:`Servicio quirúrgico ${folio} · Destino: ${destino.nombre} (${destino.iniciales}) · ${qty} pzs · Kits: ${kits.join(', ')}`,usuario});
-      const reg={fecha,usuario,clave:prod.clave,codigo_barras:prod.codigo_barras,descripcion:prod.descripcion,unidad:prod.unidad,lote:prod.lote,caducidad:prod.caducidad,costo_unitario:unitCost,costo:unitCost,precio_venta:unitPrice,valor_costo:unitCost*qty,valor_venta:unitPrice*qty,pzs:qty,ex_ini:a.exIni,ex_fin:Math.max(0,a.exIni-qty),tipo_doc:'Servicio quirúrgico',estado:missingTotal>0?'Parcial':'Completa',folio,servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,medico:medico.nombre,cedula:medico.cedula,paciente:paciente.nombre,expediente:'',observaciones:`Servicio quirúrgico · Destino: ${destino.nombre} (${destino.iniciales}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}${missingTotal>0?` · Faltantes del kit: ${missingTotal} pzs`:''}`,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,kits_quirurgicos:kits,servicio_quirurgico:true,createdAt:new Date().toISOString()};
+      const reg={fecha,usuario,clave:prod.clave,codigo_barras:prod.codigo_barras,descripcion:prod.descripcion,unidad:prod.unidad,lote:prod.lote,caducidad:prod.caducidad,costo_unitario:unitCost,costo:unitCost,precio_venta:unitPrice,valor_costo:unitCost*qty,valor_venta:unitPrice*qty,pzs:qty,ex_ini:a.exIni,ex_fin:Math.max(0,a.exIni-qty),tipo_doc:'Servicio quirúrgico',estado:missingTotal>0?'Parcial':'Completa',folio,servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(draft.anestesiologo?.nombre),anestesiologo_cedula:qTxt(draft.anestesiologo?.cedula),anestesiologo_id:draft.anestesiologo?.id??null,paciente:paciente.nombre,expediente:'',observaciones:`Servicio quirúrgico · Destino: ${destino.nombre} (${destino.iniciales}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}${missingTotal>0?` · Faltantes del kit: ${missingTotal} pzs`:''}`,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,kits_quirurgicos:kits,servicio_quirurgico:true,createdAt:new Date().toISOString()};
       await saveSalida(reg);
       try{const clas=qNorm(r.clasificacion||r.departamento||'');if(clas.includes('antibiot'))await saveAntibiotico({fecha:reg.fecha,clave:reg.clave,nombre:reg.descripcion,lote:reg.lote||'',pzs:reg.pzs||0,doctor:medico.nombre,cedula:medico.cedula,paciente:paciente.nombre,ojo_operacion:paciente.ojo,servicio:destino.nombre,servicio_iniciales:destino.iniciales,folio_doc:folio,tipo_doc:'Servicio quirúrgico',ex_ini:reg.ex_ini||0,ex_fin:reg.ex_fin||0});}catch(_e){}
     }
-    if(shortages.length)await saveServiceShortageRows({shortages,fecha,usuario,kits,folio,destino,medico,paciente});
+    if(shortages.length)await saveServiceShortageRows({shortages,fecha,usuario,kits,folio,destino,medico,paciente,anestesiologo:draft.anestesiologo});
     await refreshServiceUiData();serviceBusy=false;if(btn){btn.disabled=false;btn.textContent='✅ Finalizar salida';}$q('mxQxServiceModal')?.classList.add('hidden');let finalMsg=`✅ Servicio quirúrgico ${folio} registrado para ${destino.nombre}.\n\nPiezas requeridas: ${total}\nPiezas surtidas: ${servedTotal}`;if(missingTotal>0)finalMsg+=`\nPiezas faltantes: ${missingTotal}\n\n⚠️ El kit se conservó aunque no hubiera existencia suficiente. No se generó inventario negativo.\n${serviceShortageText(shortages)}`;else finalMsg+='\nEstado: completo.';finalMsg+='\n\nEl PDF no se descarga automáticamente. Puedes generarlo cuando quieras desde Historial de servicios quirúrgicos.';qAlert(finalMsg);
   }catch(e){console.error('[SERVICIO QUIRURGICO]',e);serviceBusy=false;if(btn){btn.disabled=false;btn.textContent='✅ Finalizar salida';}qAlert(e?.message||'No se pudo finalizar el servicio quirúrgico.');}
 }
@@ -34459,7 +35071,7 @@ let patCache=[],patAt=0,patBusy=false;
 function rowTime(r={}){for(const v of [r.updatedAt,r.createdAt,r.fechaIso,r.fecha]){const t=Date.parse(v);if(Number.isFinite(t))return t}return Number(r._id)||0}
 async function loadPatients(force=false){if(!force&&patCache.length&&Date.now()-patAt<120000)return patCache;if(patBusy)return patCache;patBusy=true;try{let rows=[];try{if(window.__mxSalidasCache&&Array.isArray(window.__mxSalidasCache.rows)&&!window.__mxSalidasCache.dirty)rows=window.__mxSalidasCache.rows.slice()}catch(_e){}if(!rows.length&&typeof idbAll==='function')rows=await idbAll('salidas').catch(()=>[]);const map=new Map();for(const r of rows||[]){const name=txt(r?.paciente||r?.nombrePaciente||r?.nombre_paciente);if(!name)continue;const key=norm(name),prev=map.get(key),stamp=rowTime(r);if(prev&&prev.stamp>stamp)continue;map.set(key,{nombre:name,edad:txt(r.edad_paciente||r.edadPaciente||r.edad),sexo:txt(r.sexo_paciente||r.sexoPaciente||r.sexo||r.genero),telefono:txt(r.telefono_paciente||r.telefonoPaciente||r.telefono),servicio:txt(r.servicio_destino||r.servicio),expediente:txt(r.expediente),stamp})}patCache=[...map.values()].sort((a,b)=>b.stamp-a.stamp||a.nombre.localeCompare(b.nombre,'es'));patAt=Date.now();return patCache}finally{patBusy=false}}
 function ensurePatientPicker(){const input=document.getElementById('mxQxSrvPatient');if(!input||input.dataset.mxPatPicker==='1')return;input.dataset.mxPatPicker='1';const parent=input.parentElement;parent?.classList.add('mx-qx-relative');let drop=document.getElementById('mxQxSrvPatientDrop');if(!drop){drop=document.createElement('div');drop.id='mxQxSrvPatientDrop';drop.className='mx-qx-patient-drop';parent?.appendChild(drop)}
-  const render=async()=>{const rows=await loadPatients(false),q=norm(input.value),show=rows.filter(x=>!q||norm([x.nombre,x.servicio,x.expediente].join(' ')).includes(q)).slice(0,18);if(!show.length){drop.style.display='none';drop.innerHTML='';return}drop.innerHTML=show.map((x,i)=>`<div class="item" data-pat-i="${i}"><b>${esc(x.nombre)}</b><small>${esc([x.edad?x.edad+' años':'',x.sexo,x.servicio,x.telefono].filter(Boolean).join(' · '))}</small></div>`).join('');drop.style.display='block';drop.querySelectorAll('[data-pat-i]').forEach(el=>el.onmousedown=e=>{e.preventDefault();const x=show[Number(el.dataset.patI)];if(!x)return;input.value=x.nombre||'';const age=document.getElementById('mxQxSrvAge'),sex=document.getElementById('mxQxSrvSex'),tel=document.getElementById('mxQxSrvPatientTel');if(age&&x.edad)age.value=x.edad;if(sex&&x.sexo){const opt=[...sex.options].find(o=>norm(o.value)===norm(x.sexo));if(opt)sex.value=opt.value}if(tel&&x.telefono)tel.value=x.telefono;drop.style.display='none';updateServiceSectionSummaries();if(qTxt(input.value)&&qTxt(age?.value)&&qTxt(sex?.value))setServiceSection('kits',true)})};
+  const render=async()=>{const rows=await loadPatients(false),q=norm(input.value),show=rows.filter(x=>!q||norm([x.nombre,x.servicio,x.expediente].join(' ')).includes(q)).slice(0,18);if(!show.length){drop.style.display='none';drop.innerHTML='';return}drop.innerHTML=show.map((x,i)=>`<div class="item" data-pat-i="${i}"><b>${esc(x.nombre)}</b><small>${esc([x.edad?x.edad+' años':'',x.sexo,x.servicio,x.telefono].filter(Boolean).join(' · '))}</small></div>`).join('');drop.style.display='block';drop.querySelectorAll('[data-pat-i]').forEach(el=>el.onmousedown=e=>{e.preventDefault();const x=show[Number(el.dataset.patI)];if(!x)return;input.value=x.nombre||'';const age=document.getElementById('mxQxSrvAge'),sex=document.getElementById('mxQxSrvSex'),tel=document.getElementById('mxQxSrvPatientTel');if(age&&x.edad)age.value=x.edad;if(sex&&x.sexo){const opt=[...sex.options].find(o=>norm(o.value)===norm(x.sexo));if(opt)sex.value=opt.value}if(tel&&x.telefono)tel.value=x.telefono;drop.style.display='none';updateServiceSectionSummaries();if(qTxt(input.value)&&qTxt(age?.value)&&qTxt(sex?.value)&&qTxt(document.getElementById('mxQxSrvEye')?.value))setServiceSection('kits',true)})};
   input.addEventListener('focus',render);input.addEventListener('input',render);input.addEventListener('blur',()=>setTimeout(()=>{drop.style.display='none'},180));
 }
 function bindPatientPicker(){const btn=document.getElementById('btnQxAddService');if(btn&&!btn.dataset.mxPatHook){btn.dataset.mxPatHook='1';btn.addEventListener('click',()=>{setTimeout(()=>{ensurePatientPicker();loadPatients(false).catch(()=>{})},60)})}ensurePatientPicker()}
@@ -34656,7 +35268,167 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',boot,{once:true}); else boot();
 })();
 
-/* ===== MACROXEL V241 WEB SINCRONIZADO · SERVICIO + OJO + KITS SIN BLOQUEO ===== */
+/* ===== MACROXEL HPS: Kits de Quirófano administrados por Sistema Principal v3 ===== */
+(function(){
+  'use strict';
+  if(window.__mxAntibioticStockKitsPublisherV3)return;window.__mxAntibioticStockKitsPublisherV3=true;
+  const txt=v=>String(v==null?'':v).trim();
+  const norm=v=>txt(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/\s+/g,' ');
+  const safe=v=>{try{return btoa(unescape(encodeURIComponent(txt(v)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}catch(_e){return txt(v).replace(/[.#$\[\]\/]/g,'_')}};
+  const branch=()=>typeof mxGetSucursalFromLicense==='function'?(norm(mxGetSucursalFromLicense())||'HGAM'):'HGAM';
+  const isKit=r=>norm(r?.tipo_doc).replace(/_/g,' ')==='KIT QUIRURGICO';
+  const productKey=p=>norm(p?.clave||p?.codigo_barras||p?.descripcion);
+  let timer=0,busy=false,lastSig='';
+  function normalizeProducts(k){return (Array.isArray(k?.productos)?k.productos:[]).map(p=>({clave:txt(p?.clave),codigo_barras:txt(p?.codigo_barras),descripcion:txt(p?.descripcion),unidad:txt(p?.unidad)||'PIEZA',cantidad:Math.max(1,Math.round(Number(p?.cantidad)||1))})).filter(p=>p.clave||p.codigo_barras||p.descripcion)}
+  function kitId(k){return txt(k?.remoteKitId)||safe(k?._id||k?.nombre)}
+  function newestFirst(a,b){return Date.parse(b?.updatedAt||b?.createdAt||0)-Date.parse(a?.updatedAt||a?.createdAt||0)}
+  function preferredKit(kits,currentId){
+    const byId=kits.find(k=>k.id===currentId);
+    if(byId)return byId;
+    const named=kits.find(k=>/STOCK.*QUIROFANO|QUIROFANO.*STOCK/i.test(norm(k.nombre)));
+    return named||kits.slice().sort(newestFirst)[0]||null;
+  }
+  async function ensureViewerConfig(kits){
+    if(typeof window.mxPublishJson!=='function')return false;
+    const br=branch(),path=`/antibiotic_stock_viewer_config/${encodeURIComponent(br)}/QUIROFANO_STOCK`;
+    let current={};
+    try{current=typeof window.mxGetJson==='function'?(await window.mxGetJson(path).catch(()=>({}))||{}):{}}catch(_e){current={}}
+    const chosen=preferredKit(kits,txt(current?.kitId));
+    const now=new Date().toISOString();
+    if(!chosen){
+      if(txt(current?.kitId)){
+        await window.mxPublishJson(path,{...current,appCode:'QUIROFANO_STOCK',systemId:br,kitId:'',kitName:'',updatedAt:now,source:'SISTEMA_PRINCIPAL_KITS'},'PUT').catch(()=>{});
+      }
+      return false
+    }
+    const desired={
+      ...current,
+      appCode:'QUIROFANO_STOCK',
+      systemId:br,
+      service:txt(current?.service)||'Quirófano',
+      initials:txt(current?.initials)||'QX',
+      kitId:chosen.id,
+      kitName:chosen.nombre,
+      updatedAt:now,
+      source:'SISTEMA_PRINCIPAL_KITS'
+    };
+    const needs=txt(current?.kitId)!==chosen.id||txt(current?.kitName)!==chosen.nombre||txt(current?.systemId)!==br;
+    if(needs)await window.mxPublishJson(path,desired,'PUT');
+    return true
+  }
+  async function publish(){
+    if(busy||typeof window.mxPublishJson!=='function'||typeof window.idbAll!=='function')return false;
+    try{if(typeof window.mxRemoteDbEnabled==='function'&&!window.mxRemoteDbEnabled())return false}catch(_e){}
+    busy=true;
+    try{
+      const br=branch(),root=`/antibiotic_stock_kits/${encodeURIComponent(br)}`;
+      const all=await window.idbAll('settings').catch(()=>[]);
+      const kits=(all||[]).filter(isKit).map(k=>({
+        id:kitId(k),localId:k?._id??'',remoteKitId:txt(k?.remoteKitId),nombre:txt(k?.nombre),descripcion:txt(k?.descripcion),anestesiologo:txt(k?.anestesiologo),anestesiologo_cedula:txt(k?.anestesiologo_cedula),
+        productos:normalizeProducts(k),
+        source:'SISTEMA_PRINCIPAL_KITS',createdByApp:'SISTEMA_PRINCIPAL',createdAt:txt(k?.createdAt),updatedAt:txt(k?.updatedAt||k?.createdAt)||new Date().toISOString()
+      })).filter(k=>k.nombre&&k.productos.length);
+      const sig=JSON.stringify(kits.map(k=>[k.id,k.nombre,k.anestesiologo,k.anestesiologo_cedula,k.updatedAt,k.productos.map(p=>[productKey(p),p.cantidad,p.unidad])]));
+      if(sig!==lastSig){
+        const payload={};for(const k of kits)payload[k.id]=k;
+        const now=new Date().toISOString();
+        await window.mxPublishJson(root,{...payload,__meta:{source:'SISTEMA_PRINCIPAL_KITS',updatedAt:now,count:kits.length}},'PUT');
+        lastSig=sig;
+        try{await window.mxPublishJson(`/sync_versions/${encodeURIComponent(br)}/antibiotic_stock_kits`,{v:Date.now(),updatedAt:now,source:'SISTEMA_PRINCIPAL_KITS'},'PUT')}catch(_e){}
+      }
+      await ensureViewerConfig(kits);
+      return true;
+    }catch(e){console.warn('[STOCK ANTIBIOTICOS] No se pudieron sincronizar Kits:',e?.message||e);return false}
+    finally{busy=false}
+  }
+  function schedule(ms=180){clearTimeout(timer);timer=setTimeout(()=>publish().catch(()=>{}),Math.max(80,Number(ms)||180))}
+  window.mxImportAntibioticStockKitsFromViewer=async()=>false;
+  window.mxPublishAntibioticStockKits=publish;window.mxScheduleAntibioticStockKitsPublish=schedule;
+  const start=()=>{setTimeout(()=>publish().catch(()=>{}),900);setInterval(()=>publish().catch(()=>{}),20000);window.addEventListener('focus',()=>schedule(120))};
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start,{once:true});else start();
+})();
+/* ===== MACROXEL V222: VISOR QX COMPARTIDO + ELIMINAR HISTORIAL DE PRUEBAS ===== */
+(function(){
+'use strict';
+if(window.__mxQxViewerArchiveV222)return;window.__mxQxViewerArchiveV222=true;
+const DOC='QX_VISOR_ARCHIVE_V219',SHARED_SERVICE='QUIROFANO_QX';
+const $=id=>document.getElementById(id),txt=v=>String(v==null?'':v).trim(),norm=v=>txt(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/\s+/g,' '),num=v=>{const n=Number(v);return Number.isFinite(n)?n:0},esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const safe=v=>{try{return btoa(unescape(encodeURIComponent(txt(v)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}catch(_e){return txt(v).replace(/[.#$\[\]\/]/g,'_')}};
+const branch=()=>typeof mxGetSucursalFromLicense==='function'?(norm(mxGetSucursalFromLicense())||'HGAM'):'HGAM';
+let snapshot=null,busy=false,timer=0,localRowId=null,lastRemoteOk=0,modalOpen=false;
+function arrNode(x){return Object.entries(x||{}).filter(([k,v])=>v&&typeof v==='object'&&k!=='__meta').map(([id,v])=>({...v,id:txt(v.id)||id,__key:id}))}
+function dateMs(v){const n=Date.parse(txt(v));return Number.isFinite(n)?n:0}
+function mergeNode(...nodes){const out={};for(const node of nodes){for(const [id,row] of Object.entries(node||{})){if(!row||typeof row!=='object'||id==='__meta')continue;const prev=out[id],a=dateMs(row.updatedAt||row.createdAt||row.date||row.fecha),b=dateMs(prev?.updatedAt||prev?.createdAt||prev?.date||prev?.fecha);if(!prev||a>=b)out[id]=row;}}return out}
+function afterResetNode(node,resetAtMs=0){if(!resetAtMs)return node||{};const out={};for(const [id,row] of Object.entries(node||{})){if(!row||typeof row!=='object'||id==='__meta')continue;const t=dateMs(row.updatedAt||row.createdAt||row.date||row.fecha);if(t>resetAtMs)out[id]=row}return out}
+function isQxOrder(o={}){const src=norm(o.requestSource||o.sourceApp||o.source),sk=norm(o.stockServiceKey||o.legacyStockServiceKey),svc=norm(o.stockService||o.servicio||o.service);return o.stockControl===true&&(src==='QUIROFANO_STOCK_VIEWER'||sk===norm(SHARED_SERVICE)||/QUIROFANO/.test(svc))}
+function orderStatus(o={}){const s=norm(o.status||o.estado);if(/FINAL|SURTIDO|APPLIED/.test(s))return'SURTIDO';if(/REJECT|CANCEL|NO SURTIDO/.test(s))return'NO SURTIDO';if(num(o.totalSurtido)>0)return'PARCIAL';return'PENDIENTE'}
+function productId(p={}){return safe(p.clave||p.codigo_barras||p.descripcion||p.name)}
+function preferredKit(kits={},cfg={}){const list=Object.entries(kits||{}).filter(([k,v])=>k!=='__meta'&&v&&typeof v==='object'&&txt(v.nombre)).map(([id,v])=>({...v,id:txt(v.id)||id}));return list.find(k=>String(k.id)===String(cfg.kitId||''))||list.find(k=>/STOCK.*QUIROFANO|QUIROFANO.*STOCK/i.test(norm(k.nombre)))||list.sort((a,b)=>dateMs(b.updatedAt||b.createdAt)-dateMs(a.updatedAt||a.createdAt))[0]||null}
+function stockRows(kit,uses,orders){const used=new Map(),supplied=new Map(),lots=new Map();for(const u of uses||[]){const k=txt(u.productId)||productId(u);used.set(k,(used.get(k)||0)+Math.max(0,num(u.pieces||u.pzs||u.cantidad)))}for(const o of orders||[]){for(const it of Array.isArray(o.approvedItems)?o.approvedItems:[]){const k=productId(it),q=Math.max(0,num(it.cantidadRecibidaActual??it.cantidadRecibida??it.cantidadDescargarAhora??it.pzs));if(q>0)supplied.set(k,(supplied.get(k)||0)+q)}for(const l of Array.isArray(o.lotesSurtidos)?o.lotesSurtidos:[]){const k=productId(l),at=dateMs(o.finalizedAt||o.updatedAt||o.createdAt),prev=lots.get(k);if(!prev||at>=prev.at)lots.set(k,{lote:txt(l.lote),caducidad:txt(l.caducidad),at})}}
+return (Array.isArray(kit?.productos)?kit.productos:[]).map((p,i)=>{const id=productId(p)||String(i),target=Math.max(1,Math.round(num(p.cantidad)||1)),u=used.get(id)||0,s=supplied.get(id)||0,current=Math.max(0,target+s-u),missing=Math.max(0,target-current),last=lots.get(id)||{};return{id,clave:txt(p.clave),codigo_barras:txt(p.codigo_barras),name:txt(p.descripcion)||txt(p.clave),unit:txt(p.unidad)||'PIEZA',target,used:u,supplied:s,current,missing,last}})}
+function calcSnapshot({cfg={},kits={},shared={},legacy={},ordersNode={}}={}){const patientsNode=mergeNode(shared?.patients,legacy?.patients),usesNode=mergeNode(shared?.uses,legacy?.uses),patients=arrNode(patientsNode).map(x=>({...x,name:txt(x.name||x.nombre||x.paciente),record:txt(x.record||x.expediente)})),uses=arrNode(usesNode).sort((a,b)=>dateMs(b.date||b.createdAt)-dateMs(a.date||a.createdAt)),orders=arrNode(ordersNode).filter(isQxOrder).sort((a,b)=>dateMs(b.updatedAt||b.createdAt)-dateMs(a.updatedAt||a.createdAt)),kit=preferredKit(kits,cfg),stock=stockRows(kit,uses,orders),pendingOrders=orders.filter(o=>['PENDIENTE','PARCIAL'].includes(orderStatus(o)));return{version:219,branch:branch(),service:txt(cfg.service)||'Quirófano',initials:txt(cfg.initials)||'QX',kitId:txt(kit?.id),kitName:txt(kit?.nombre),updatedAt:new Date().toISOString(),patients,uses,orders,stock,metrics:{patients:patients.length,uses:uses.length,piecesUsed:uses.reduce((s,u)=>s+Math.max(0,num(u.pieces||u.pzs||u.cantidad)),0),stockTarget:stock.reduce((s,x)=>s+x.target,0),stockCurrent:stock.reduce((s,x)=>s+x.current,0),missing:stock.reduce((s,x)=>s+x.missing,0),pendingOrders:pendingOrders.length}}}
+async function loadLocal(){try{if(typeof ensureDBReady==='function')await ensureDBReady()}catch(_e){}try{const all=typeof idbAll==='function'?await idbAll('settings'):[],row=(all||[]).find(r=>txt(r?.tipo_doc)===DOC&&norm(r?.branch)===branch());if(row){localRowId=row._id??null;if(row.snapshot&&typeof row.snapshot==='object')snapshot=row.snapshot;else if(txt(row.snapshot_json)){try{snapshot=JSON.parse(row.snapshot_json)}catch(_e){}}}}catch(e){console.warn('[VISOR QX local]',e)}return snapshot}
+async function saveLocal(data){if(!data||typeof idbPut!=='function')return false;try{let existingId=localRowId;if(existingId==null){const all=await idbAll('settings').catch(()=>[]),row=(all||[]).find(r=>txt(r?.tipo_doc)===DOC&&norm(r?.branch)===branch());if(row)existingId=row._id??null}const row={tipo_doc:DOC,folio:'VISOR-QX',descripcion:'Historial compartido del visor de Quirófano',branch:branch(),service:txt(data.service),kitName:txt(data.kitName),updatedAt:new Date().toISOString(),snapshot:data};if(existingId!=null)row._id=existingId;const id=await idbPut('settings',row);if(localRowId==null)localRowId=id;try{await window.__mxFlushSqlWrites?.()}catch(_e){}return true}catch(e){console.warn('[VISOR QX guardar local]',e);return false}}
+async function remoteRead(){if(typeof window.mxGetJson!=='function'||!txt(window.mxRemoteDbUrl?.()))throw new Error('Firebase operativa no disponible.');const b=branch(),cfg=await window.mxGetJson(`/antibiotic_stock_viewer_config/${encodeURIComponent(b)}/QUIROFANO_STOCK`).catch(()=>({}))||{},legacyService=txt(cfg.service)||'Quirófano',legacyKey=safe(norm(legacyService)),sharedKey=SHARED_SERVICE;const [kits,sharedRaw,legacyRaw,ordersNode]=await Promise.all([window.mxGetJson(`/antibiotic_stock_kits/${encodeURIComponent(b)}`).catch(()=>({})),window.mxGetJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(sharedKey)}`).catch(()=>({})),window.mxGetJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(legacyKey)}`).catch(()=>({})),window.mxGetJson(`/service_orders/${encodeURIComponent(b)}`).catch(()=>({}))]);const resetAtMs=Math.max(0,num(sharedRaw?.__meta?.resetAtMs)),shared={...(sharedRaw||{}),patients:afterResetNode(sharedRaw?.patients,resetAtMs),uses:afterResetNode(sharedRaw?.uses,resetAtMs)},legacy={...(legacyRaw||{}),patients:afterResetNode(legacyRaw?.patients,resetAtMs),uses:afterResetNode(legacyRaw?.uses,resetAtMs)},data=calcSnapshot({cfg,kits:kits||{},shared,legacy,ordersNode:ordersNode||{}}),mergedPatients=mergeNode(shared?.patients,legacy?.patients),mergedUses=mergeNode(shared?.uses,legacy?.uses);if(typeof window.mxPublishJson==='function'){const writes=[];if(JSON.stringify(sharedRaw?.patients||{})!==JSON.stringify(mergedPatients))writes.push(window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(sharedKey)}/patients`,mergedPatients,'PUT').catch(()=>false));if(JSON.stringify(sharedRaw?.uses||{})!==JSON.stringify(mergedUses))writes.push(window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(sharedKey)}/uses`,mergedUses,'PUT').catch(()=>false));if(resetAtMs&&JSON.stringify(legacyRaw?.patients||{})!==JSON.stringify(legacy?.patients||{}))writes.push(window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(legacyKey)}/patients`,legacy?.patients||{},'PUT').catch(()=>false));if(resetAtMs&&JSON.stringify(legacyRaw?.uses||{})!==JSON.stringify(legacy?.uses||{}))writes.push(window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(legacyKey)}/uses`,legacy?.uses||{},'PUT').catch(()=>false));writes.push(window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(sharedKey)}/__meta`,{...(sharedRaw?.__meta||{}),version:222,resetAtMs:resetAtMs||0,source:'SISTEMA_PRINCIPAL_ARCHIVE',service:legacyService,updatedAt:new Date().toISOString(),updatedAtMs:Date.now()},'PUT').catch(()=>false));await Promise.all(writes)}return data}
+async function refresh(force=false){if(busy)return snapshot;busy=true;try{if(!snapshot)await loadLocal();if(navigator.onLine!==false&&typeof window.mxGetJson==='function'&&txt(window.mxRemoteDbUrl?.())){const data=await remoteRead();snapshot=data;lastRemoteOk=Date.now();await saveLocal(data)}renderModal();return snapshot}catch(e){console.warn('[VISOR QX refresh]',e?.message||e);renderModal(e);return snapshot}finally{busy=false}}
+function fmt(v){if(!v)return'—';const d=new Date(v);return Number.isNaN(d.getTime())?txt(v):d.toLocaleString('es-MX',{hour12:false})}
+function totalRequested(o={}){return (o.items||[]).reduce((s,x)=>s+Math.max(0,num(x.cantidadSolicitadaAhora??x.cantidadSolicitada??x.cantidad??x.pzs)),0)}
+function totalSupplied(o={}){const a=Array.isArray(o.approvedItems)?o.approvedItems:[];return a.reduce((s,x)=>s+Math.max(0,num(x.cantidadRecibidaActual??x.cantidadRecibida??x.cantidadDescargarAhora??x.pzs)),0)}
+async function deleteHistory(){if(busy)return;const ask=async m=>{try{if(typeof window.mxConfirm==='function')return !!(await window.mxConfirm(m))}catch(_e){}return window.confirm(m)};if(!(await ask('¿Eliminar TODO el historial de pruebas del Visor QX? Se eliminarán pacientes, aplicaciones y pedidos de reposición de Quirófano en Firebase y la copia local de este equipo. El Kit y la configuración del stock NO se eliminarán.')))return;if(typeof window.mxPublishJson!=='function'||!txt(window.mxRemoteDbUrl?.())){window.alert('No hay conexión con Firebase. Conecta el Sistema Principal antes de eliminar el historial compartido.');return}busy=true;const btn=$('mxQxArchiveDelete'),status=$('mxQxArchiveStatus');if(btn)btn.disabled=true;if(status)status.textContent='Eliminando historial de pruebas…';try{const b=branch(),cfg=await window.mxGetJson(`/antibiotic_stock_viewer_config/${encodeURIComponent(b)}/QUIROFANO_STOCK`).catch(()=>({}))||{},legacyService=txt(cfg.service)||'Quirófano',legacyKey=safe(norm(legacyService)),sharedKey=SHARED_SERVICE,ordersNode=await window.mxGetJson(`/service_orders/${encodeURIComponent(b)}`).catch(()=>({}))||{},qxOrders=Object.entries(ordersNode).filter(([id,o])=>o&&typeof o==='object'&&isQxOrder(o)),resetAtMs=Date.now(),resetAt=new Date(resetAtMs).toISOString();const writes=[window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(sharedKey)}/patients`,null,'PUT'),window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(sharedKey)}/uses`,null,'PUT')];if(legacyKey!==sharedKey){writes.push(window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(legacyKey)}/patients`,null,'PUT'));writes.push(window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(legacyKey)}/uses`,null,'PUT'))}for(const [id] of qxOrders)writes.push(window.mxPublishJson(`/service_orders/${encodeURIComponent(b)}/${encodeURIComponent(id)}`,null,'PUT'));await Promise.all(writes);await window.mxPublishJson(`/antibiotic_stock_control/${encodeURIComponent(b)}/${encodeURIComponent(sharedKey)}/__meta`,{version:222,source:'SISTEMA_PRINCIPAL_ARCHIVE',service:legacyService,historyCleared:true,resetAt,resetAtMs,updatedAt:resetAt,updatedAtMs:resetAtMs},'PUT');try{const rows=typeof idbAll==='function'?await idbAll('settings'):[];for(const row of (rows||[]).filter(r=>txt(r?.tipo_doc)===DOC&&norm(r?.branch)===b)){if(row?._id!=null&&typeof idbDelete==='function')await idbDelete('settings',row._id)}}catch(e){console.warn('[VISOR QX limpiar local]',e)}try{for(let i=localStorage.length-1;i>=0;i--){const k=localStorage.key(i)||'';if(k.startsWith('mx_qx_shared_cache_v219::'))localStorage.removeItem(k)}}catch(_e){}localRowId=null;snapshot=null;lastRemoteOk=Date.now();const data=await remoteRead();snapshot=data;await saveLocal(data);renderModal();window.dispatchEvent(new CustomEvent('mx-qx-history-cleared',{detail:{branch:b,resetAtMs}}));window.alert(`Historial del Visor QX eliminado. Se borraron ${qxOrders.length} pedido(s) QX, pacientes y aplicaciones. El Kit y la configuración de stock se conservaron.`)}catch(e){console.error('[VISOR QX eliminar historial]',e);window.alert('No se pudo eliminar todo el historial: '+txt(e?.message||e));renderModal(e)}finally{busy=false;if(btn)btn.disabled=false}}
+function ensureUi(){if(!$('mxQxArchiveStyle')){const st=document.createElement('style');st.id='mxQxArchiveStyle';st.textContent=`#btnQxViewerArchive{font-weight:950!important;padding:11px 18px!important;min-height:44px!important;border-radius:13px!important;white-space:nowrap;background:#0b4f7d!important;color:#fff!important}.mx-qxa-modal{position:fixed;inset:0;z-index:100350;background:rgba(15,23,42,.62);display:flex;align-items:center;justify-content:center;padding:14px}.mx-qxa-modal.hidden{display:none!important}.mx-qxa-card{width:min(1480px,99vw);height:95vh;background:#f6f9fd;border-radius:18px;box-shadow:0 28px 90px rgba(2,6,23,.38);display:flex;flex-direction:column;overflow:hidden}.mx-qxa-head{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:14px 17px;background:linear-gradient(135deg,#0b4f7d,#0f3156);color:#fff}.mx-qxa-head h3{margin:0;color:#fff}.mx-qxa-head small{display:block;margin-top:3px;opacity:.9}.mx-qxa-head-actions{display:flex;gap:8px}.mx-qxa-head .btn{background:#fff;color:#0b4f7d}.mx-qxa-head .btn.danger{background:#b91c1c!important;color:#fff!important;border:1px solid rgba(255,255,255,.35)!important}.mx-qxa-body{padding:12px;overflow:auto}.mx-qxa-cards{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:8px;margin-bottom:10px}.mx-qxa-kpi{background:#fff;border:1px solid #dbe5f3;border-radius:13px;padding:10px}.mx-qxa-kpi small{display:block;color:#64748b;font-weight:800}.mx-qxa-kpi b{font-size:22px;color:#0f3e68}.mx-qxa-sec{background:#fff;border:1px solid #dbe5f3;border-radius:14px;margin-bottom:10px;overflow:hidden}.mx-qxa-sec h4{margin:0;padding:10px 12px;background:#eef5ff;color:#123b68;display:flex;justify-content:space-between;gap:10px;align-items:center}.mx-qxa-scroll{overflow:auto;max-height:290px}.mx-qxa-table{width:100%;border-collapse:collapse;font-size:11px}.mx-qxa-table th,.mx-qxa-table td{padding:7px 8px;border-bottom:1px solid #e5edf6;vertical-align:top;text-align:left}.mx-qxa-table th{position:sticky;top:0;background:#f8fbff;color:#183b61;z-index:1}.mx-qxa-empty{text-align:center!important;color:#64748b;padding:20px!important}.mx-qxa-status{font-weight:900}.mx-qxa-status.ok{color:#166534}.mx-qxa-status.warn{color:#92400e}.mx-qxa-status.bad{color:#b91c1c}@media(max-width:900px){.mx-qxa-cards{grid-template-columns:repeat(2,1fr)}.mx-qxa-card{height:97vh}}`;document.head.appendChild(st)}const clean=$('btnSrLimpiar'),host=clean?.parentElement;let qxBtn=$('btnQxViewerArchive');if(host&&!qxBtn){qxBtn=document.createElement('button');qxBtn.id='btnQxViewerArchive';qxBtn.className='btn';qxBtn.type='button';qxBtn.textContent='👁 Visor QX';qxBtn.title='Ver historial, pacientes, stock y pedidos compartidos del visor de Quirófano';host.insertBefore(qxBtn,clean)}if(qxBtn){qxBtn.onclick=openModal;qxBtn.style.display='inline-flex';qxBtn.style.alignItems='center';qxBtn.style.justifyContent='center'}if(!$('mxQxArchiveModal')){const m=document.createElement('div');m.id='mxQxArchiveModal';m.className='mx-qxa-modal hidden';m.innerHTML=`<div class="mx-qxa-card"><div class="mx-qxa-head"><div><h3>👁 Visor QX · historial compartido</h3><small id="mxQxArchiveStatus">Cargando copia local…</small></div><div class="mx-qxa-head-actions"><button class="btn danger" id="mxQxArchiveDelete" type="button" title="Eliminar pacientes, aplicaciones y pedidos QX de prueba">🗑 Eliminar historial</button><button class="btn" id="mxQxArchiveRefresh" type="button">↻ Actualizar</button><button class="btn" id="mxQxArchiveClose" type="button">✕ Cerrar</button></div></div><div class="mx-qxa-body" id="mxQxArchiveBody"></div></div>`;document.body.appendChild(m);$('mxQxArchiveClose').onclick=closeModal;$('mxQxArchiveRefresh').onclick=()=>refresh(true);$('mxQxArchiveDelete').onclick=deleteHistory;m.addEventListener('mousedown',e=>{if(e.target===m)closeModal()})}}
+function renderModal(error){ensureUi();const body=$('mxQxArchiveBody'),status=$('mxQxArchiveStatus');if(!body)return;const d=snapshot;if(status){const remote=lastRemoteOk?`Compartido · última sincronización ${fmt(lastRemoteOk)}`:'Copia local';status.textContent=error?`${remote} · sin conexión nueva: ${txt(error.message||error)}`:d?`${remote} · ${txt(d.service)||'Quirófano'} · Kit ${txt(d.kitName)||'—'}`:'Sin información guardada'}if(!d){body.innerHTML='<div class="mx-qxa-sec"><div class="mx-qxa-empty">Todavía no hay una copia local del Visor QX. Con conexión activa se cargará automáticamente desde Firebase.</div></div>';return}const m=d.metrics||{},patients=(d.patients||[]).slice().sort((a,b)=>txt(a.name).localeCompare(txt(b.name),'es')),stock=d.stock||[],uses=(d.uses||[]).slice(0,700),orders=(d.orders||[]).slice(0,300);body.innerHTML=`<div class="mx-qxa-cards"><div class="mx-qxa-kpi"><small>Pacientes</small><b>${m.patients||0}</b></div><div class="mx-qxa-kpi"><small>Aplicaciones</small><b>${m.uses||0}</b></div><div class="mx-qxa-kpi"><small>Piezas usadas</small><b>${m.piecesUsed||0}</b></div><div class="mx-qxa-kpi"><small>Stock actual</small><b>${m.stockCurrent||0}</b></div><div class="mx-qxa-kpi"><small>Faltante</small><b>${m.missing||0}</b></div><div class="mx-qxa-kpi"><small>Pedidos pendientes</small><b>${m.pendingOrders||0}</b></div></div><div class="mx-qxa-sec"><h4><span>🧑 Pacientes del visor</span><small>${patients.length} registros</small></h4><div class="mx-qxa-scroll"><table class="mx-qxa-table"><thead><tr><th>Paciente</th><th>Expediente</th><th>Servicio</th><th>Actualizado</th></tr></thead><tbody>${patients.length?patients.map(p=>`<tr><td><b>${esc(p.name||p.nombre||p.paciente||'—')}</b></td><td>${esc(p.record||p.expediente||'—')}</td><td>${esc(p.service||p.servicio||d.service||'Quirófano')}</td><td>${esc(fmt(p.updatedAt||p.createdAt))}</td></tr>`).join(''):'<tr><td colspan="4" class="mx-qxa-empty">Sin pacientes registrados todavía.</td></tr>'}</tbody></table></div></div><div class="mx-qxa-sec"><h4><span>💊 Stock de Quirófano</span><small>${esc(d.kitName||'Kit no definido')}</small></h4><div class="mx-qxa-scroll"><table class="mx-qxa-table"><thead><tr><th>Clave</th><th>Antibiótico</th><th>Objetivo</th><th>Usado</th><th>Surtido</th><th>Existencia</th><th>Faltante</th><th>Lote / caducidad</th></tr></thead><tbody>${stock.length?stock.map(x=>`<tr><td><b>${esc(x.clave||'—')}</b></td><td>${esc(x.name||'—')}</td><td>${num(x.target)}</td><td>${num(x.used)}</td><td>${num(x.supplied)}</td><td><b>${num(x.current)}</b></td><td class="mx-qxa-status ${num(x.missing)>0?'bad':'ok'}">${num(x.missing)}</td><td>${esc(x.last?.lote||'—')} / ${esc(x.last?.caducidad||'—')}</td></tr>`).join(''):'<tr><td colspan="8" class="mx-qxa-empty">No hay stock configurado en el kit activo.</td></tr>'}</tbody></table></div></div><div class="mx-qxa-sec"><h4><span>🧾 Historial de aplicaciones</span><small>${uses.length}${(d.uses||[]).length>uses.length?' de '+(d.uses||[]).length:''}</small></h4><div class="mx-qxa-scroll"><table class="mx-qxa-table"><thead><tr><th>Fecha</th><th>Paciente</th><th>Expediente</th><th>Antibiótico</th><th>Dosis</th><th>Cada</th><th>Pzs</th><th>Procedimiento</th><th>Enfermera(o)</th></tr></thead><tbody>${uses.length?uses.map(u=>`<tr><td>${esc(fmt(u.date||u.createdAt))}</td><td><b>${esc(u.patientName||'—')}</b></td><td>${esc(u.patientRecord||'—')}</td><td>${esc(u.antibioticName||u.descripcion||u.clave||'—')}</td><td>${esc(u.dose||'—')}</td><td>${num(u.doseIntervalHours)>0?'c/'+num(u.doseIntervalHours)+' h':'—'}</td><td><b>${num(u.pieces||u.pzs||u.cantidad)}</b></td><td>${esc(u.procedure||'—')}</td><td>${esc(u.nurse||'—')}</td></tr>`).join(''):'<tr><td colspan="9" class="mx-qxa-empty">Sin aplicaciones registradas.</td></tr>'}</tbody></table></div></div><div class="mx-qxa-sec"><h4><span>📦 Pedidos / reposición solicitada</span><small>${orders.length} registros</small></h4><div class="mx-qxa-scroll"><table class="mx-qxa-table"><thead><tr><th>Fecha</th><th>Folio</th><th>Estado</th><th>Solicitado</th><th>Surtido</th><th>Pendiente</th><th>Solicitante</th><th>Detalle</th></tr></thead><tbody>${orders.length?orders.map(o=>{const req=totalRequested(o),sup=totalSupplied(o),st=orderStatus(o);return`<tr><td>${esc(fmt(o.createdAt||o.updatedAt))}</td><td><b>${esc(o.folioSolicitud||o.folio||o.id||'—')}</b></td><td class="mx-qxa-status ${st==='SURTIDO'?'ok':st==='NO SURTIDO'?'bad':'warn'}">${esc(st)}</td><td>${req}</td><td>${sup}</td><td>${Math.max(0,req-sup)}</td><td>${esc(o.solicitante||o.quienSolicita||o.usuarioSolicita||'—')}</td><td>${esc((o.items||[]).map(x=>`${x.clave||''} ${x.descripcion||''} ×${num(x.cantidadSolicitadaAhora??x.cantidad??x.pzs)}`).join(' · ')||'—')}</td></tr>`}).join(''):'<tr><td colspan="8" class="mx-qxa-empty">Sin pedidos del Visor QX.</td></tr>'}</tbody></table></div></div>`}
+async function openModal(){ensureUi();modalOpen=true;$('mxQxArchiveModal')?.classList.remove('hidden');if(!snapshot)await loadLocal();renderModal();refresh(true).catch(()=>{})}
+function closeModal(){modalOpen=false;$('mxQxArchiveModal')?.classList.add('hidden')}
+function schedule(ms=400){clearTimeout(timer);timer=setTimeout(()=>refresh(false).catch(()=>{}),ms)}
+window.mxRefreshQxViewerArchive=()=>refresh(true);window.mxOpenQxViewerArchive=openModal;window.mxDeleteQxViewerHistory=deleteHistory;
+async function boot(){ensureUi();await loadLocal();renderModal();setTimeout(()=>refresh(false).catch(()=>{}),1400);setInterval(()=>{if(document.hidden)return;if(modalOpen||$('view-salidasrapidas')&&!$('view-salidasrapidas').classList.contains('hidden'))refresh(false).catch(()=>{})},20000);window.addEventListener('focus',()=>schedule(250));window.addEventListener('online',()=>schedule(120));window.addEventListener('mx-viewer-refresh-now',()=>schedule(120));const mo=new MutationObserver(()=>ensureUi());mo.observe(document.body,{childList:true,subtree:true})}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
+})();
+
+
+/* ===== MACROXEL HPS · Espejo hospitalario v2 (snapshot completo sanitizado) ===== */
+(()=>{
+  'use strict';
+  if(window.__mxHospitalMirrorPublisherV2)return;window.__mxHospitalMirrorPublisherV2=true;
+  const STORES=['inventory','entradas','salidas','antibioticos','movimientos','pedidos','conteo','medicos','cpm','transferencias','users','settings'];
+  const SIG_PREFIX='mx_hospital_mirror_sig_v2_';
+  const timers=new Map();let publishingAll=false;
+  const txt=v=>String(v==null?'':v).trim();
+  const branch=()=>{try{return txt(window.mxGetSucursalFromLicense?.()||window.mxGetEcosystemStoreId?.()||'HGAM').toUpperCase().replace(/[.#$\[\]\/]/g,'_')||'HGAM'}catch(_e){return'HGAM'}};
+  const dbReady=()=>typeof window.idbAll==='function'&&typeof window.mxPublishJson==='function'&&(!window.mxRemoteDbEnabled||window.mxRemoteDbEnabled());
+  function safeKey(v){let s=txt(v);if(!s)return'';return s.replace(/[.#$\[\]\/]/g,'_')}
+  function recordKey(row,i){return safeKey(row?._id??row?.id??row?.firebase_id??row?.folio??row?.folio_doc??row?.codigo_barras??row?.clave??('R'+i))||('R'+i)}
+  const SECRET_RE=/(password|pass(?:word)?|contras(?:eña|ena)?|pwd|secret|token|firebase|remote.?db|github.*(?:url|route|base)|license|licencia|api.?key|private.?key|access.?key|auth)/i;
+  function sanitize(store,value,depth=0){
+    if(depth>7)return null;
+    if(Array.isArray(value))return value.map(v=>sanitize(store,v,depth+1));
+    if(!value||typeof value!=='object')return value;
+    const out={};for(const [k,v] of Object.entries(value)){if(SECRET_RE.test(k))continue;if(store==='users'&&/^(pin|clave|hash|salt)$/i.test(k))continue;const x=sanitize(store,v,depth+1);if(x!==undefined)out[k]=x}return out
+  }
+  function hashRows(rows){let h=2166136261;for(const r of rows){const s=JSON.stringify(r);for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}}return(h>>>0).toString(36)+'_'+rows.length}
+  function toNode(store,rows){const node={};(rows||[]).forEach((r,i)=>{if(!r||typeof r!=='object')return;let k=recordKey(r,i);if(Object.prototype.hasOwnProperty.call(node,k))k=k+'_'+i;node[k]=sanitize(store,r)});return node}
+  async function publishMeta(extra={}){
+    if(!dbReady())return false;const b=branch(),counts={};
+    for(const store of STORES){try{counts[store]=(await window.idbAll(store).catch(()=>[])).length||0}catch(_e){counts[store]=0}}
+    const meta={version:2,source:'SISTEMA_PRINCIPAL_MACROXEL_HOSPITALES',readOnlyMirror:true,systemId:b,unitName:txt(window.mxGetUnitNameFromLicense?.()||''),updatedAt:new Date().toISOString(),updatedAtText:new Date().toLocaleString('es-MX'),deviceId:txt(localStorage.getItem('macroxel_device_id')||localStorage.getItem('mx_license_device_id')||''),menuVersion:'principal-v204',counts,...extra};
+    await window.mxPublishJson(`/hospital_mirror/${encodeURIComponent(b)}/meta`,meta).catch(()=>false);return true
+  }
+  async function publishStore(store,force=false){
+    store=txt(store);if(!STORES.includes(store)||!dbReady())return false;
+    try{const raw=await window.idbAll(store).catch(()=>[]),rows=(raw||[]).map(r=>sanitize(store,r)),sig=hashRows(rows),sigKey=SIG_PREFIX+branch()+'_'+store;if(!force&&localStorage.getItem(sigKey)===sig)return false;await window.mxPublishJson(`/hospital_mirror/${encodeURIComponent(branch())}/stores/${encodeURIComponent(store)}`,toNode(store,rows));try{localStorage.setItem(sigKey,sig)}catch(_e){}await window.mxPublishJson(`/hospital_mirror/${encodeURIComponent(branch())}/store_meta/${encodeURIComponent(store)}`,{count:rows.length,updatedAt:new Date().toISOString(),signature:sig}).catch(()=>{});return true}catch(e){console.warn('[ESPEJO HOSPITALARIO] No se pudo publicar',store,e?.message||e);return false}
+  }
+  function schedule(store,delay=550){if(!STORES.includes(String(store||'')))return;clearTimeout(timers.get(store));timers.set(store,setTimeout(()=>{timers.delete(store);publishStore(store,false).then(changed=>{if(changed)publishMeta({lastStore:store}).catch(()=>{})})},Math.max(120,Number(delay)||550)))}
+  async function publishAll(force=false){if(publishingAll||!dbReady())return false;publishingAll=true;try{let changed=false;for(const store of STORES){changed=(await publishStore(store,force))||changed;await new Promise(r=>setTimeout(r,70))}await publishMeta({fullSync:true});return changed}finally{publishingAll=false}}
+  function wrapOne(name,storeArgIndex=0){const original=window[name];if(typeof original!=='function'||original.__mxHospitalMirrorWrapped)return;const fn=async function(){const store=String(arguments[storeArgIndex]||'');const result=await original.apply(this,arguments);if(STORES.includes(store))schedule(store,350);return result};fn.__mxHospitalMirrorWrapped=true;fn.__mxHospitalMirrorOriginal=original;window[name]=fn}
+  function wrapWrites(){wrapOne('idbPut');wrapOne('idbBulkPut');wrapOne('idbDelete');wrapOne('idbClear');wrapOne('mxReplaceStoreSafely')}
+  window.mxHospitalMirrorPublishAll=publishAll;window.mxHospitalMirrorPublishStore=publishStore;window.mxHospitalMirrorSchedule=schedule;
+  function start(){wrapWrites();setTimeout(()=>publishAll(true).catch(()=>{}),3500);setInterval(()=>{wrapWrites();if(!document.hidden)publishAll(false).catch(()=>{})},45000);window.addEventListener('focus',()=>{wrapWrites();setTimeout(()=>publishAll(false).catch(()=>{}),700)});window.addEventListener('mx-operational-sync',()=>setTimeout(()=>publishAll(false).catch(()=>{}),900))}
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start,{once:true});else start();
+})();
+
+/* ===== MACROXEL V241 · SERVICIO QUIRÚRGICO: SERVICIO + OJO EN ETIQUETA Y DOCUMENTOS ===== */
+
+/* ===== MACROXEL V242 WEB SINCRONIZADO · SERVICIO + OJO + KITS SIN BLOQUEO + CACHE ===== */
 
 /* ===== MACROXEL V243 PDF WEB + HISTORIAL PDF ===== */
 
@@ -34665,61 +35437,114 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 /* ===== MACROXEL V245 · LOGOS CONFIGURACION + DATOS EN UNA FILA ===== */
 
 
-/* ===== MACROXEL V246 · LOGOS PDF QUIROFANO TOMADOS DIRECTAMENTE DE CONFIGURACION ===== */
+/* ===== MACROXEL v259 · AUDITORÍA SEGURA DE ENTRADAS SIN INVENTARIO ===== */
 (function(){
-  'use strict';
-  if(window.__mxQxPdfConfiguredLogosV246)return;
-  window.__mxQxPdfConfiguredLogosV246=true;
-  const KEY='mx_collective_pdf_assets_principal_v1';
-  const ROOT='/collective_pdf_assets';
-  const qtxt=v=>v==null?'':String(v).trim();
-  const readLocal=()=>{try{return JSON.parse(localStorage.getItem(KEY)||'{}')||{}}catch(_e){return{}}};
-  const branch=()=>{try{return String(window.mxGetSucursalFromLicense?.()||'HGAM').trim().toUpperCase()||'HGAM'}catch(_e){return'HGAM'}};
-  const previewSrc=id=>{try{const el=document.getElementById(id);return qtxt(el?.currentSrc||el?.src||'')}catch(_e){return''}};
-  const isUseful=src=>!!src && !/^blob:null/i.test(src);
-
-  async function loadPng(src){
-    src=qtxt(src);if(!isUseful(src))return'';
-    try{
-      if(typeof mxOrderPdfLoadImage==='function'){
-        const d=await Promise.race([Promise.resolve(mxOrderPdfLoadImage(src)),new Promise(r=>setTimeout(()=>r(''),2200))]);
-        if(d)return d;
-      }
-    }catch(_e){}
-    try{
-      const r=await fetch(src,{cache:'no-store'});if(!r.ok)return'';const b=await r.blob();
-      const data=await new Promise((resolve,reject)=>{const fr=new FileReader();fr.onload=()=>resolve(String(fr.result||''));fr.onerror=reject;fr.readAsDataURL(b)});
-      if(typeof mxOrderPdfLoadImage==='function')return await mxOrderPdfLoadImage(data);
-      return data;
-    }catch(_e){return''}
-  }
-  async function firstValid(list){for(const src of list){const d=await loadPng(src);if(d)return d}return''}
-  async function remoteAssets(){
-    let remote={};
-    try{if(typeof window.mxGetJson==='function' && qtxt(window.mxRemoteDbUrl?.()))remote=await window.mxGetJson(`${ROOT}/${encodeURIComponent(branch())}`)||{}}catch(_e){}
-    return remote&&typeof remote==='object'?remote:{};
-  }
-  async function configuredSources(){
-    let getter={};try{if(typeof window.mxGetCollectivePdfAssets==='function')getter=await window.mxGetCollectivePdfAssets()||{}}catch(_e){}
-    const local=readLocal(),remote=await remoteAssets();
-    return {
-      left:[remote.left,getter.left,local.left,previewSrc('mxColImgLeftPreview'),remote.collective,getter.collective,local.collective,previewSrc('mxColImgCollectivePreview')],
-      right:[remote.right,getter.right,local.right,previewSrc('mxColImgRightPreview'),'./logo_macroxel_hps.png'],
-      collective:[remote.collective,getter.collective,local.collective,previewSrc('mxColImgCollectivePreview')],
-      footer:[remote.footer,getter.footer,local.footer,previewSrc('mxColImgFooterPreview')]
-    };
-  }
-  async function resolveLogos(){
-    const src=await configuredSources();
-    let [left,right,collective,footer]=await Promise.all([firstValid(src.left),firstValid(src.right),firstValid(src.collective),firstValid(src.footer)]);
-    let split={left:'',right:''};
-    try{if(collective&&typeof mxOrderPdfSplitCollectiveHeader==='function')split=await mxOrderPdfSplitCollectiveHeader(collective)||split}catch(_e){}
-    if(!left)left=split.left||collective||'';
-    if(!right)right=split.right||'';
-    const out={left,right,collective,footer,collectiveLeft:split.left||left,collectiveRight:split.right||right};
-    window.__mxQxPdfLastLogoStatus={at:new Date().toISOString(),branch:branch(),left:!!out.left,right:!!out.right,footer:!!out.footer,collective:!!out.collective};
-    return out;
-  }
-  window.mxQxPdfConfiguredLogos=resolveLogos;
-  try{window.mxOrderPdfLogos=resolveLogos}catch(_e){}
+'use strict';
+if(window.__mxEntradasAuditV259)return;window.__mxEntradasAuditV259=true;
+const str=v=>String(v==null?'':v).trim();
+const canon=v=>str(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/\s+/g,' ');
+const num=v=>{const n=Number(v);return Number.isFinite(n)?n:0;};
+const dateKey=v=>{
+  try{const d=typeof parseFechaFlexible==='function'?parseFechaFlexible(v):null;
+    if(d&&!isNaN(d))return [d.getFullYear(),String(d.getMonth()+1).padStart(2,'0'),String(d.getDate()).padStart(2,'0')].join('-');
+  }catch(_e){}
+  return canon(v);
+};
+const key=r=>[canon(r?.clave||r?.codigo),canon(r?.lote),dateKey(r?.caducidad||r?.cad)].join('|');
+const hasIdentity=r=>!!canon(r?.clave||r?.codigo)&&!!canon(r?.lote)&&!!dateKey(r?.caducidad||r?.cad);
+let auditBusy=false;
+async function audit({repair=false,quiet=false}={}){
+  if(auditBusy)throw new Error('La revisión de Entradas ya se está ejecutando.');
+  auditBusy=true;
+  try{
+    if(typeof ensureDBReady==='function')await ensureDBReady();
+    const [entradas,inventario,salidas]=await Promise.all([idbAll('entradas'),idbAll('inventory'),idbAll('salidas')]);
+    const invKeys=new Set((inventario||[]).filter(hasIdentity).map(key));
+    const sales=new Set((salidas||[]).filter(hasIdentity).map(key));
+    const groups=new Map();let withoutDate=0;
+    for(const r of entradas||[]){
+      if(!str(r.fecha)&&!str(r.fechaIso)&&!str(r.createdAt))withoutDate++;
+      if(!hasIdentity(r)||!(num(r.pzs)>0))continue;
+      const k=key(r);if(invKeys.has(k))continue;
+      let g=groups.get(k);
+      if(!g){g={key:k,rows:[],qty:0,first:r};groups.set(k,g);}
+      g.rows.push(r);g.qty+=num(r.pzs);
+    }
+    const safe=[],review=[];
+    for(const g of groups.values()){
+      // Movimientos anteriores con saldo inicial o salidas: no inventar existencias.
+      // Recuperación sólo cuando el historial es inequívoco y no hay otro inventario para el mismo lote.
+      const historyHasPrior=g.rows.some(r=>num(r.ex_ini??r.antes)>0.000001);
+      const hasSales=sales.has(g.key);
+      if(historyHasPrior||hasSales){review.push(g);continue;}
+      safe.push(g);
+    }
+    const result={missing:groups.size,safe:safe.length,manual:review.length,withoutDate,repaired:0,examples:[...groups.values()].slice(0,8).map(g=>`${str(g.first.clave)} · Lote ${str(g.first.lote)} · ${str(g.first.caducidad)}`)};
+    if(!repair){if(!quiet){
+      const preview=`Se detectaron ${result.missing} lotes con Entradas pero sin registro en Inventario.\nRecuperación segura: ${result.safe}.\nRevisión manual necesaria: ${result.manual}.\nMovimientos sin fecha recuperable: ${withoutDate}.\n\n${result.examples.join('\n')||'Sin faltantes.'}\n\n¿Registrar en Inventario los ${safe.length} lotes seguros SIN modificar los que ya existen?`;
+      if(!safe.length){window.mxAlert?.(preview.replace(/\n\n¿Registrar[\s\S]*$/,''));return result;}
+      const okay=typeof window.mxConfirm==='function'?await window.mxConfirm(preview):confirm(preview);
+      if(!okay)return result;
+    }else return result;}
+    // Releer justo antes del commit y evitar registrar un lote que otro módulo ya creó.
+    const latest=await idbAll('inventory');const current=new Set((latest||[]).filter(hasIdentity).map(key));
+    const toInsert=safe.filter(g=>!current.has(g.key)).map(g=>{
+      const r=g.first,qty=g.qty;
+      const entry={clave:str(r.clave||r.codigo),codigo_barras:str(r.codigo_barras||r.codigoBarras),descripcion:str(r.descripcion||r.nombre),unidad:str(r.unidad),lote:str(r.lote),caducidad:str(r.caducidad||r.cad),clasificacion:str(r.clasificacion),restriccion:str(r.restriccion),ubicacion:str(r.ubicacion),proveedor:str(r.proveedor),almacen:qty,estantes:0,existencia:qty,base_exist:0,entradas:qty,salidas:0,_mxRecoveredFromEntriesV259:true,_mxRecoveredAt:new Date().toISOString()};
+      for(const f of ['costo','precio_venta','iva_pct','ieps_pct','iva','ieps','costo_final','margen_ganancia'])if(r[f]!==undefined)entry[f]=r[f];
+      return entry;
+    });
+    if(toInsert.length){
+      if(window.electronSql?.isElectron&&typeof window.electronSql.transactionDurable==='function'){
+        await window.electronSql.transactionDurable(toInsert.map(value=>({type:'put',store:'inventory',value})));
+      }else if(typeof db!=='undefined'&&db){
+        await new Promise((resolve,reject)=>{
+          const tx=db.transaction('inventory','readwrite');let fail=null;
+          tx.oncomplete=()=>resolve();tx.onabort=()=>reject(tx.error||fail||new Error('No se completó la reparación.'));
+          tx.onerror=()=>{fail=tx.error;};
+          for(const value of toInsert)tx.objectStore('inventory').put(value);
+        });
+      }else throw new Error('No hay conexión a la base local.');
+      window.__mxClearSqlCache?.('inventory');window.__mxInvalidateInventoryCache?.();
+      const verified=await (window.electronSql?.isElectron?window.electronSql.all('inventory'):idbAll('inventory'));
+      const after=new Set((verified||[]).filter(hasIdentity).map(key));
+      if(toInsert.some(r=>!after.has(key(r))))throw new Error('No se logró verificar el inventario recuperado. Revisa la base, NO repitas la importación.');
+      result.repaired=toInsert.length;
+      try{await drawInventario?.({forceDb:true})}catch(_e){}
+      try{await window.mxPublicarClavesInventarioFirebase?.([...new Set(toInsert.map(x=>x.clave))])}catch(_e){}
+    }
+    if(!quiet)window.mxAlert?.(`Revisión terminada. Lotes recuperados: ${result.repaired}. Para revisión manual: ${result.manual}. Fechas sin origen verificable: ${withoutDate}. No se alteraron otros productos.`);
+    return result;
+  }finally{auditBusy=false;}
+}
+window.mxAuditEntradasSinInventario=audit;
+async function correctMissingDate(id){
+  if(!(id>0))return;
+  if(typeof ensureDBReady==='function')await ensureDBReady();
+  const raw=window.electronSql?.isElectron&&typeof window.electronSql.get==='function'?
+    await window.electronSql.get('entradas',id):await new Promise((resolve,reject)=>{
+      const tx=db.transaction('entradas','readonly'),rq=tx.objectStore('entradas').get(id);
+      rq.onsuccess=()=>resolve(rq.result);rq.onerror=()=>reject(rq.error);
+    });
+  if(!raw)throw new Error('La Entrada ya no existe.');
+  const input=typeof window.mxPrompt==='function'?await window.mxPrompt('Fecha real de la Entrada (DD/MM/AAAA):'):prompt('Fecha real de la Entrada (DD/MM/AAAA):');
+  if(input==null||!str(input))return;
+  const m=str(input).match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  const d=m?new Date(Number(m[3]),Number(m[2])-1,Number(m[1])):null;
+  if(!m||!d||d.getFullYear()!==Number(m[3])||d.getMonth()!==Number(m[2])-1||d.getDate()!==Number(m[1]))throw new Error('Fecha inválida. Escribe DD/MM/AAAA.');
+  const saved={...raw,fecha:input,updatedAt:new Date().toISOString()};
+  if(window.electronSql?.isElectron&&typeof window.electronSql.transactionDurable==='function')await window.electronSql.transactionDurable([{type:'put',store:'entradas',value:saved}]);
+  else await new Promise((resolve,reject)=>{const tx=db.transaction('entradas','readwrite');tx.objectStore('entradas').put(saved);tx.oncomplete=resolve;tx.onabort=()=>reject(tx.error||new Error('No se completó la corrección de fecha.'));});
+  window.__mxClearSqlCache?.('entradas');await drawEntradas?.();
+}
+function bind(){
+  const b=document.getElementById('btnMxAuditEntriesV259');
+  if(b&&!b.dataset.boundV259){b.dataset.boundV259='1';b.addEventListener('click',async()=>{b.disabled=true;try{await audit()}catch(e){console.error('[MX AUDIT ENTRADAS]',e);window.mxAlert?.('No se pudo verificar el inventario: '+(e.message||e));}finally{b.disabled=false;}})}
+  if(!window.__mxEntDateHandlerV259){window.__mxEntDateHandlerV259=true;document.addEventListener('click',async ev=>{
+    const button=ev.target?.closest?.('[data-mx-ent-set-fecha]');if(!button)return;
+    ev.preventDefault();ev.stopPropagation();button.disabled=true;
+    try{await correctMissingDate(Number(button.dataset.mxEntSetFecha))}catch(e){window.mxAlert?.('No se pudo corregir la fecha: '+(e?.message||e))}finally{button.disabled=false;}
+  },true)}
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bind,{once:true});else bind();
 })();
