@@ -1,0 +1,48 @@
+name: Sincronizar web Macroxel v263
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/macroxel-web-v263-sync.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-v263:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener código actual de GitHub
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Instalar decodificador de cambios
+        run: python -m pip -q install brotli
+
+      - name: Sincronizar web y verificar integridad
+        shell: bash
+        run: |
+          base64 -d tools/v263_web_sync_patcher.b64 > /tmp/macroxel_web_v263_patcher.py
+          python /tmp/macroxel_web_v263_patcher.py docs tools/v263_web_sync_patch.b64
+          node --check docs/sistema-inventario.js
+          grep -q 'function finalizePendingServiceLoanV263' docs/sistema-inventario.js
+          grep -q 'loadKitAnestesiologosV261' docs/sistema-inventario.js
+          grep -q 'Solo Catálogo (CPM)' docs/sistema-inventario.js
+          grep -q 'function removeImage(key)' docs/sistema-inventario.js
+          grep -q 'sistema-inventario.js?v=v263-logos-removibles-prestamos-pendientes' docs/index.html
+          echo "Web v263 revisada correctamente"
+
+      - name: Publicar solamente los archivos web
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/index.html docs/sistema-inventario.js; then
+            echo "No hay diferencias que publicar."
+            exit 0
+          fi
+          git config user.name "Macroxel Web Sync"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/index.html docs/sistema-inventario.js
+          git commit -m "Sincroniza sistema web con v263: anestesiólogo, kits, préstamos, inventario y logos"
+          git push origin HEAD:main
