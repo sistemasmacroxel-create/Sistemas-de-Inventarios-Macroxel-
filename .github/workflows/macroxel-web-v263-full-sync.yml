@@ -1,0 +1,65 @@
+name: Publicar web completo Macroxel v263
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/macroxel-web-v263-full-sync.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publicacion-v263:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener web existente
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Recuperar archivos íntegros de v263
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),zlib=require('zlib'),crypto=require('crypto');
+          const files=[
+            {
+              source:'tools/v263_web_exact_index.br.b64',
+              target:'docs/index.html',
+              expected:'32704cb6286025a214369d7f7760554d468e59db79b8b4a0584b5ada1e552b32'
+            },
+            {
+              source:'tools/v263_web_exact_js.br.b64',
+              target:'docs/sistema-inventario.js',
+              expected:'a6e096bceeab72f1d7fea38e30816f62b84cf837202b4db7a7e7c313400dd0c7'
+            }
+          ];
+          for(const f of files){
+            const encoded=fs.readFileSync(f.source,'utf8').replace(/\s/g,'');
+            const data=zlib.brotliDecompressSync(Buffer.from(encoded,'base64'));
+            const hash=crypto.createHash('sha256').update(data).digest('hex');
+            if(hash!==f.expected)throw Error('Integridad inválida '+f.target+': '+hash);
+            fs.writeFileSync(f.target,data);
+            console.log('Verificado '+f.target+' '+data.length+' bytes');
+          }
+          NODE
+      - name: Probar sintaxis, anestesiólogo, kits, préstamos y logos
+        run: |
+          node --check docs/sistema-inventario.js
+          grep -q 'loadKitAnestesiologosV261' docs/sistema-inventario.js
+          grep -q 'function finalizePendingServiceLoanV263' docs/sistema-inventario.js
+          grep -q 'Solo Catálogo (CPM)' docs/sistema-inventario.js
+          grep -q 'function removeImage(key)' docs/sistema-inventario.js
+          grep -q 'data-mx-colimg-remove="collective"' docs/index.html
+          grep -q 'v263-logos-removibles-prestamos-pendientes' docs/index.html
+      - name: Guardar solo sistema web
+        run: |
+          if git diff --quiet -- docs/index.html docs/sistema-inventario.js; then
+            echo "Web v263 sin cambios pendientes."
+            exit 0
+          fi
+          git config user.name "Macroxel Web Sync"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/index.html docs/sistema-inventario.js
+          git commit -m "Publica web Macroxel v263 completo sincronizado con escritorio"
+          git push origin HEAD:main
