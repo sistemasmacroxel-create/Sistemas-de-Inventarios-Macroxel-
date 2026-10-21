@@ -35600,3 +35600,57 @@ function bind(){
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bind,{once:true});else bind();
 })();
+
+
+/* MACROXEL V264 · AUDITORIA DE GUARDADO (SOLO LECTURA) */
+(()=>{'use strict';if(window.__mxAuditDataV264)return;window.__mxAuditDataV264=true;
+const txt=v=>String(v??'').trim(),upper=v=>txt(v).toUpperCase();
+window.mxAuditDataPersistenceV264=async({download=true}={})=>{
+ const report={version:'v264',readOnly:true,generatedAt:new Date().toISOString(),backend:window.electronSql?.isElectron?'SQLite':'IndexedDB',counts:{},sqlCountMismatch:{},incidents:{},warnings:[]};
+ if(window.electronSql?.isElectron){await window.__mxFlushSqlWrites?.();await window.electronSql.flush?.();}
+ await ensureDBReady();window.__mxClearSqlCache?.();
+ const names=['inventory','entradas','salidas','pedidos','folios','medicos','cpm','settings','users','transferencias','antibioticos'],data={};
+ for(const name of names){
+  if(window.mxStoreExists&&!window.mxStoreExists(name))continue;
+  const rows=await idbAll(name);if(!Array.isArray(rows))throw Error('No se recuperó '+name);
+  data[name]=rows;report.counts[name]=rows.length;
+  if(window.electronSql?.isElectron&&typeof window.electronSql.count==='function'){
+   const count=Number(await window.electronSql.count(name));
+   if(Number.isFinite(count)&&count!==rows.length)report.sqlCountMismatch[name]={visible:rows.length,persisted:count};
+  }
+ }
+ function add(label,items,pick){
+  if(items.length)report.incidents[label]={count:items.length,examples:items.slice(0,15).map(pick)};
+ }
+ const inv=data.inventory||[],ent=data.entradas||[],sal=data.salidas||[],keys=new Set(),dup=[];
+ for(const r of inv){if(!txt(r.clave))continue;
+  const k=[upper(r.clave),upper(r.lote),upper(r.caducidad)].join('|');if(keys.has(k))dup.push(r);else keys.add(k);
+ }
+ add('inventario_duplicado',dup,r=>({clave:txt(r.clave),lote:txt(r.lote),caducidad:txt(r.caducidad)}));
+ add('inventario_sin_clave',inv.filter(r=>!txt(r.clave)),r=>({id:r._id,lote:txt(r.lote)}));
+ add('existencias_negativas',inv.filter(r=>Number(r.existencia)<0),r=>({clave:txt(r.clave),lote:txt(r.lote),existencia:r.existencia}));
+ add('entradas_sin_fecha',ent.filter(r=>!txt(r.fecha)&&!txt(r.fechaIso)&&!txt(r.createdAt)),r=>({id:r._id,clave:txt(r.clave),lote:txt(r.lote)}));
+ add('entradas_sin_clave',ent.filter(r=>!txt(r.clave)),r=>({id:r._id,folio:txt(r.folio)}));
+ add('salidas_sin_fecha',sal.filter(r=>!txt(r.fecha)&&!txt(r.fechaIso)&&!txt(r.createdAt)),r=>({id:r._id,folio:txt(r.folio)}));
+ add('prestamos_interrumpidos',sal.filter(r=>r.prestamo_cierre_en_curso===true),r=>({id:r._id,folio:txt(r.folio)}));
+ const valid=new Set(inv.filter(r=>txt(r.clave)&&txt(r.lote)).map(r=>upper(r.clave)+'|'+upper(r.lote)));
+ add('entradas_sin_lote_actual',ent.filter(r=>txt(r.clave)&&txt(r.lote)&&!valid.has(upper(r.clave)+'|'+upper(r.lote))),r=>({clave:txt(r.clave),lote:txt(r.lote),folio:txt(r.folio)}));
+ report.warnings.push('Entradas históricas sin lote actual no siempre son pérdida de datos: confirmar bajas y ajustes.');
+ const anomalies=Object.values(report.incidents).reduce((a,b)=>a+b.count,0),sql=Object.keys(report.sqlCountMismatch).length;
+ report.summary={incidents:anomalies,sqlCountMismatch:sql};
+ if(download){
+  const blob=new Blob([JSON.stringify(report,null,2)],{type:'application/json;charset=utf-8'}),link=document.createElement('a');
+  link.href=URL.createObjectURL(blob);link.download='MACROXEL_AUDITORIA_GUARDADO_'+new Date().toISOString().slice(0,10)+'.json';
+  document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(link.href),30000);
+ }
+ mxAlert('AUDITORÍA DE GUARDADO (solo lectura)\nInventario: '+(report.counts.inventory??'—')+'\nEntradas: '+(report.counts.entradas??'—')+'\nSalidas: '+(report.counts.salidas??'—')+'\nObservaciones: '+anomalies+'\nDiferencias de lectura SQL: '+sql+'\n\nSe descargó el informe JSON. No se modificaron datos.');
+ return report;
+};
+function bind(){
+ const b=document.getElementById('btnMxAuditPersistenceV264');if(!b||b.dataset.mxAuditBound)return;b.dataset.mxAuditBound='1';
+ b.addEventListener('click',async()=>{const t=b.textContent;b.disabled=true;b.textContent='Auditando…';
+  try{await window.mxAuditDataPersistenceV264({download:true});}catch(e){console.error('[AUDITORIA v264]',e);mxAlert('Error de auditoría: '+(e.message||e));}finally{b.disabled=false;b.textContent=t;}
+ });
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bind,{once:true});else bind();
+})();
