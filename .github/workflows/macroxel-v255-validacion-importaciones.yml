@@ -38,7 +38,7 @@ jobs:
         run: |
           node <<'NODE'
           const fs=require('fs'),vm=require('vm'),s=fs.readFileSync('docs/sistema-inventario.js','utf8');
-          const p=s.indexOf('/* ===== MACROXEL V255 IMPORTACIONES FINANCIERAS');
+          const p=s.indexOf('function mxImportCanonicalKey(');
           const q=s.indexOf('function mapCPM(r)',p);
           if(p<0||q<=p)throw Error('No se encontró el código financiero');
           const ctx={};
