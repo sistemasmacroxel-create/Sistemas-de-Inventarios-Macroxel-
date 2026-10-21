@@ -1,0 +1,31 @@
+name: Macroxel v264 validacion de persistencia web
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/sistema-inventario.js"
+      - "docs/index.html"
+      - ".github/workflows/macroxel-v264-persistencia-check.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Comprobar sintaxis del runtime
+        run: node --check docs/sistema-inventario.js
+      - name: Verificar integridad del parche de datos
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          js=Path('docs/sistema-inventario.js').read_text(encoding='utf-8')
+          index=Path('docs/index.html').read_text(encoding='utf-8')
+          for marker in ['async function mxAtomicReplaceStores(entries)', 'window.mxAuditDataPersistenceV264', 'this._aborted = true;', 'window.mxReplaceStoresSafely = async function']:
+              assert marker in js,marker
+          assert 'id="btnMxAuditPersistenceV264"' in index
+          assert 'sistema-inventario.js?v=v264-persistencia-audit' in index
+          print('Persistencia web v264: validación correcta')
+          PY
