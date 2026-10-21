@@ -333,11 +333,15 @@
     _fail(error) {
       if (this._completed || this._aborted) return;
       this.error = error instanceof Error ? error : new Error(String(error || 'Error de transacción'));
+      this._aborted = true;
+      this._writeQueue.length = 0;
+      clearTimeout(this._commitTimer);
+      clearTimeout(this._completeTimer);
       setTimeout(() => {
-        if (typeof this.onerror === 'function') this.onerror({ target: this, type: 'error' });
+        try { if (typeof this.onerror === 'function') this.onerror({ target: this, type: 'error' }); }
+        finally { if (typeof this.onabort === 'function') this.onabort({ target: this, type: 'abort' }); }
       }, 0);
     }
-
     _scheduleComplete() {
       clearTimeout(this._completeTimer);
       this._completeTimer = setTimeout(() => {
@@ -2807,10 +2811,56 @@ function idbDelete(s,id){return new Promise((res,rej)=>{if(!db) return rej('DB')
     });
   }
 
+  async function mxAtomicReplaceStores(entries){
+    const prepared=[];
+    for(const [name,rows] of entries){
+      if(!Array.isArray(rows))throw Error('Datos inválidos: '+name);
+      if(name==='kv'&&rows.length&&!rows.some(x=>x&&typeof x==='object'&&Object.prototype.hasOwnProperty.call(x,'__mxKey'))){console.warn('[MX] Respaldo antiguo sin claves KV: conservado');continue;}
+      const clean=name==='kv'?rows.map(x=>({key:x.__mxKey,value:clone(x.value)})):rows.map(x=>clone(x));
+      const ids=new Set();
+      for(const item of clean){
+        const key=name==='kv'?item.key:item?._id;
+        if(key==null||key==='')continue;
+        if(ids.has(String(key)))throw Error('ID duplicado en '+name+'; no se importó.');
+        ids.add(String(key));
+      }
+      prepared.push([name,clean]);
+    }
+    if(!prepared.length)return [];
+    if(window.electronSql?.isElectron&&typeof window.electronSql.transactionDurable==='function'){
+      const ops=[];
+      for(const [name,items] of prepared){
+        ops.push({type:'clear',store:name});
+        for(const v of items)ops.push(name==='kv'?{type:'put',store:name,key:v.key,value:v.value}:{type:'put',store:name,value:v});
+      }
+      await window.electronSql.transactionDurable(ops);
+      window.__mxClearSqlCache?.();
+      return prepared.map(x=>x[0]);
+    }
+    if(!db||db.__mxLocalFallback||window.__mxUseLsDb)return null;
+    await new Promise((resolve,reject)=>{
+      let tx;
+      try{
+        tx=db.transaction(prepared.map(x=>x[0]),'readwrite');
+        tx.oncomplete=resolve;
+        tx.onerror=()=>reject(tx.error||Error('Error de transacción'));
+        tx.onabort=()=>reject(tx.error||Error('Transacción cancelada'));
+        for(const [name,items] of prepared){
+          const store=tx.objectStore(name);store.clear();
+          for(const v of items)name==='kv'?store.put(v.value,v.key):store.put(v);
+        }
+      }catch(e){try{tx?.abort()}catch(_){}reject(e)}
+    });
+    window.__mxInvalidateInventoryCache?.();
+    return prepared.map(x=>x[0]);
+  }
+
   window.mxReplaceStoreSafely = async function(storeName, rows){
     const next=Array.isArray(rows)?rows:[];
     if(typeof ensureDBReady==='function') await ensureDBReady(); else if(typeof idbOpen==='function') await idbOpen();
     if(!window.__mxUseLsDb && !window.mxStoreExists(storeName)) throw new Error('Módulo no disponible: '+storeName);
+    const done=await mxAtomicReplaceStores([[storeName,next]]);
+    if(done!==null)return {ok:true,count:next.length};
     const previous=await window.mxIdbAllWithKeys(storeName);
     try{
       await replaceOneStore(storeName,next);
@@ -2825,6 +2875,8 @@ function idbDelete(s,id){return new Promise((res,rej)=>{if(!db) return rej('DB')
     if(typeof ensureDBReady==='function') await ensureDBReady(); else if(typeof idbOpen==='function') await idbOpen();
     const entries=Object.entries(dataByStore||{}).filter(([name,rows])=>Array.isArray(rows) && (window.__mxUseLsDb || window.mxStoreExists(name)));
     if(!entries.length) throw new Error('El respaldo no contiene módulos compatibles.');
+    const done=await mxAtomicReplaceStores(entries);
+    if(done!==null)return {ok:true,stores:done};
     const previous={};
     for(const [name] of entries) previous[name]=await window.mxIdbAllWithKeys(name);
     try{
