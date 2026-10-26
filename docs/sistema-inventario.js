@@ -332,6 +332,7 @@
 
     _fail(error) {
       if (this._completed || this._aborted) return;
+      // v264: jamás se completa con éxito una transacción que falló.
       this.error = error instanceof Error ? error : new Error(String(error || 'Error de transacción'));
       this._aborted = true;
       this._writeQueue.length = 0;
@@ -342,6 +343,7 @@
         finally { if (typeof this.onabort === 'function') this.onabort({ target: this, type: 'abort' }); }
       }, 0);
     }
+
     _scheduleComplete() {
       clearTimeout(this._completeTimer);
       this._completeTimer = setTimeout(() => {
@@ -2811,56 +2813,67 @@ function idbDelete(s,id){return new Promise((res,rej)=>{if(!db) return rej('DB')
     });
   }
 
+  // v264: las importaciones y los respaldos se aplican sin vaciar previamente las tablas.
+  // SQL e IndexedDB garantizan todo-o-nada, incluso si falla una fila de la carga.
   async function mxAtomicReplaceStores(entries){
     const prepared=[];
-    for(const [name,rows] of entries){
-      if(!Array.isArray(rows))throw Error('Datos inválidos: '+name);
-      if(name==='kv'&&rows.length&&!rows.some(x=>x&&typeof x==='object'&&Object.prototype.hasOwnProperty.call(x,'__mxKey'))){console.warn('[MX] Respaldo antiguo sin claves KV: conservado');continue;}
-      const clean=name==='kv'?rows.map(x=>({key:x.__mxKey,value:clone(x.value)})):rows.map(x=>clone(x));
-      const ids=new Set();
-      for(const item of clean){
-        const key=name==='kv'?item.key:item?._id;
-        if(key==null||key==='')continue;
-        if(ids.has(String(key)))throw Error('ID duplicado en '+name+'; no se importó.');
-        ids.add(String(key));
+    for(const [name, rows] of entries){
+      if(!Array.isArray(rows)) throw new Error('Datos inválidos al restaurar '+name);
+      if(name==='kv' && rows.length && !rows.some(x=>x&&typeof x==='object'&&Object.prototype.hasOwnProperty.call(x,'__mxKey'))){
+        console.warn('[MX] Respaldo antiguo sin claves KV: se conserva la configuración.');
+        continue;
       }
-      prepared.push([name,clean]);
+      const cleanRows=name==='kv'?rows.map(x=>({key:x.__mxKey,value:clone(x.value)})):rows.map(x=>clone(x));
+      const ids=new Set();
+      for(const r of cleanRows){
+        const k=name==='kv'?r.key:r?._id;
+        if(k===undefined||k===null||k==='')continue;
+        const normalized=String(k);
+        if(ids.has(normalized))throw new Error(`ID duplicado en ${name}; no se modificaron los registros.`);
+        ids.add(normalized);
+      }
+      prepared.push([name,cleanRows]);
     }
     if(!prepared.length)return [];
-    if(window.electronSql?.isElectron&&typeof window.electronSql.transactionDurable==='function'){
+    if(window.electronSql?.isElectron && typeof window.electronSql.transactionDurable==='function'){
       const ops=[];
-      for(const [name,items] of prepared){
+      for(const [name, rows] of prepared){
         ops.push({type:'clear',store:name});
-        for(const v of items)ops.push(name==='kv'?{type:'put',store:name,key:v.key,value:v.value}:{type:'put',store:name,value:v});
+        for(const value of rows) ops.push(name==='kv'
+          ?{type:'put',store:name,key:value.key,value:value.value}
+          :{type:'put',store:name,value});
       }
       await window.electronSql.transactionDurable(ops);
       window.__mxClearSqlCache?.();
-      return prepared.map(x=>x[0]);
+      return prepared.map(([name])=>name);
     }
-    if(!db||db.__mxLocalFallback||window.__mxUseLsDb)return null;
+    if(!db || db.__mxLocalFallback || window.__mxUseLsDb)return null;
     await new Promise((resolve,reject)=>{
       let tx;
       try{
-        tx=db.transaction(prepared.map(x=>x[0]),'readwrite');
-        tx.oncomplete=resolve;
-        tx.onerror=()=>reject(tx.error||Error('Error de transacción'));
-        tx.onabort=()=>reject(tx.error||Error('Transacción cancelada'));
-        for(const [name,items] of prepared){
-          const store=tx.objectStore(name);store.clear();
-          for(const v of items)name==='kv'?store.put(v.value,v.key):store.put(v);
+        tx=db.transaction(prepared.map(([name])=>name),'readwrite');
+        tx.oncomplete=()=>resolve();
+        tx.onerror=()=>reject(tx.error||new Error('Error de transacción atómica'));
+        tx.onabort=()=>reject(tx.error||new Error('La restauración fue cancelada'));
+        for(const [name, rows] of prepared){
+          const store=tx.objectStore(name);
+          store.clear();
+          for(const value of rows) name==='kv'?store.put(value.value,value.key):store.put(value);
         }
-      }catch(e){try{tx?.abort()}catch(_){}reject(e)}
+      }catch(err){try{tx?.abort()}catch(_e){}reject(err)}
     });
     window.__mxInvalidateInventoryCache?.();
-    return prepared.map(x=>x[0]);
+    return prepared.map(([name])=>name);
   }
 
   window.mxReplaceStoreSafely = async function(storeName, rows){
     const next=Array.isArray(rows)?rows:[];
     if(typeof ensureDBReady==='function') await ensureDBReady(); else if(typeof idbOpen==='function') await idbOpen();
     if(!window.__mxUseLsDb && !window.mxStoreExists(storeName)) throw new Error('Módulo no disponible: '+storeName);
-    const done=await mxAtomicReplaceStores([[storeName,next]]);
-    if(done!==null)return {ok:true,count:next.length};
+    // Una sustitución nativa nunca usa CLEAR y PUT en transacciones distintas.
+    const applied=await mxAtomicReplaceStores([[storeName,next]]);
+    if(applied!==null)return {ok:true,count:next.length};
+    // Compatibilidad con el almacenamiento local legado: conserva rollback.
     const previous=await window.mxIdbAllWithKeys(storeName);
     try{
       await replaceOneStore(storeName,next);
@@ -2875,8 +2888,8 @@ function idbDelete(s,id){return new Promise((res,rej)=>{if(!db) return rej('DB')
     if(typeof ensureDBReady==='function') await ensureDBReady(); else if(typeof idbOpen==='function') await idbOpen();
     const entries=Object.entries(dataByStore||{}).filter(([name,rows])=>Array.isArray(rows) && (window.__mxUseLsDb || window.mxStoreExists(name)));
     if(!entries.length) throw new Error('El respaldo no contiene módulos compatibles.');
-    const done=await mxAtomicReplaceStores(entries);
-    if(done!==null)return {ok:true,stores:done};
+    const applied=await mxAtomicReplaceStores(entries);
+    if(applied!==null)return {ok:true,stores:applied};
     const previous={};
     for(const [name] of entries) previous[name]=await window.mxIdbAllWithKeys(name);
     try{
@@ -5159,6 +5172,7 @@ const MODULES=[
   {id:'censo',label:'Censo',icon:'🏥',perm:'salidas',group:'operativo'},
   {id:'antibioticos',label:'Antibióticos',icon:'💊',group:'operativo'},
   {id:'inventario',label:'Inventario',icon:'📦',group:'operativo'},
+  {id:'resurtido',label:'Resurtido inteligente',icon:'📦',perm:'inventario',group:'operativo'},
   {id:'pedidos',label:'Pedidos',icon:'📋',group:'operativo'},
   {id:'transferencias',label:'Transferencias',icon:'🔁',perm:'transferencias',group:'operativo'},
 
@@ -9766,6 +9780,22 @@ async function mxProcesarAvisosSalidaNoBloqueantes(prod, invNow){
   }catch(e){ console.warn('[MX] Avisos de salida no bloqueantes', e); }
 }
 
+/* V270 · Precios del lote visibles en todos los buscadores de Inventario (solo modo Financiero).
+   La funcion usa el mismo normalizador que Inventario y nunca hace consultas adicionales. */
+function mxInventorySearchFinHTMLV270(product){
+  try{
+    if(typeof window.mxFinancialEnabled!=='function' || !window.mxFinancialEnabled())return '';
+    const r=product||{};
+    const fin=(typeof window.mxFinancialNormalizeRecord==='function' && window.mxFinancialNormalizeRecord(r))||null;
+    const toNum=v=>{const n=Number(v);return Number.isFinite(n)?Math.max(0,n):0;};
+    // Costo antes de impuestos, igual que el campo editable del Inventario.
+    const cost=fin ? toNum(fin.costo) : toNum(r.costo ?? r.costo_unitario ?? r.costoUnitario ?? r.precio_compra ?? r.precioCompra ?? r.costo_final);
+    const price=fin ? toNum(fin.precio_venta) : toNum(r.precio_venta ?? r.precioVenta ?? r.precioVentaUnitario ?? r.venta);
+    const money=mxInventorySearchFinHTMLV270.money||(mxInventorySearchFinHTMLV270.money=new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',minimumFractionDigits:2,maximumFractionDigits:2}));
+    return `<span class="mx-inv-search-cost-v270" style="font-weight:800;color:#17436a;white-space:nowrap">Costo unit.: ${money.format(cost)}</span> · <span class="mx-inv-search-price-v270" style="font-weight:800;color:#166534;white-space:nowrap">Precio venta: ${money.format(price)}</span>`;
+  }catch(_e){return '';}
+}
+
 function attachSmartSearchSalidas(){
   const inp=$('#salBusca');
   if(!inp || inp.dataset.mxBoundSmartSearchSalidas==='1') return;
@@ -10055,7 +10085,7 @@ if(!list.length){ __mxSalEnterPending=false; __mxSalMovePending=0; return; }
           Alm: ${__alm}
           | Est: ${__est}
           | Total: ${__tot}
-        </span>
+        </span> — ${mxInventorySearchFinHTMLV270(x)}
       </div>
       `;
     }).join('');
@@ -10989,11 +11019,20 @@ if(document.readyState==='loading'){
 }
 
 function validarEntradasPrev(){
-  const tipo = $('#entTipoDoc').value, folio = $('#entFolioDoc').value.trim();
-  if(!tipo || !folio) return {ok:false, msg:'Selecciona tipo y captura folio antes de registrar.'};
-  const financiero = (typeof window.mxFinancialEnabled==='function' && window.mxFinancialEnabled());
-  const proveedor = String(document.getElementById('entProveedor')?.value || '').trim();
-  if(financiero && !proveedor) return {ok:false, msg:'En modo Financiero selecciona un proveedor antes de registrar la Entrada. Si no existe, agrégalo en el módulo Proveedores.'};
+  const tipoEl=document.getElementById('entTipoDoc'),folioEl=document.getElementById('entFolioDoc');
+  const tipo=String(tipoEl?.value||'').trim(),folio=String(folioEl?.value||'').trim();
+  if(!tipo){tipoEl?.focus();return {ok:false,msg:'Selecciona el tipo de documento antes de registrar la Entrada.'};}
+  if(!folio){folioEl?.focus();return {ok:false,msg:'Captura el número de folio antes de registrar la Entrada.'};}
+  const financiero=(typeof window.mxFinancialEnabled==='function'&&window.mxFinancialEnabled());
+  if(financiero){
+    const proveedorEl=document.getElementById('entProveedor');
+    const seleccionado=String(proveedorEl?.value||'').trim();
+    const snapshot=(typeof window.mxEntradaProveedorSnapshot==='function'?window.mxEntradaProveedorSnapshot():{});
+    if(!seleccionado||!String(snapshot.proveedor_id||'').trim()||!String(snapshot.proveedor||'').trim()){
+      proveedorEl?.focus();
+      return {ok:false,msg:'En modo Financiero es obligatorio seleccionar un proveedor del catálogo de Proveedores antes de registrar la Entrada.'};
+    }
+  }
   return {ok:true};
 }
 
@@ -14270,9 +14309,19 @@ boot();
       + '  </div>'
       + '  <div id="cpmAmpCalcBody" style="padding:10px;">'
       + '    <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:8px;">'
-      + '      <label class="cpm-field" style="min-width:210px;max-width:280px;"><span>Tipo de dosificación</span><select id="cpmDoseType" class="cpm-input"><option value="ampula">Ampollas</option><option value="gotas">Gotas</option><option value="tableta">Tabletas</option><option value="ml">mL</option></select></label>'
+      + '      <label class="cpm-field" style="min-width:180px;max-width:250px;"><span>Tipo de dosificación</span><select id="cpmDoseType" class="cpm-input"><option value="ampula">Ampollas</option><option value="gotas">Gotas</option><option value="tableta">Tabletas</option><option value="ml">mL</option></select></label>'
+      + '      <button type="button" class="cpm-btn" id="cpmDoseAddToggle" style="margin-bottom:1px" title="Registrar un nuevo tipo de dosificación">＋ Nuevo tipo</button>'
+      + '      <button type="button" class="cpm-btn danger" id="cpmDoseRemove" style="margin-bottom:1px" title="Quitar el tipo de dosificación seleccionado">🗑 Eliminar tipo</button>'
+      + '      <button type="button" class="cpm-btn" id="cpmDoseRestore" style="margin-bottom:1px;display:none" title="Volver a mostrar Ampollas, Gotas, Tabletas y mL">Restaurar básicos</button>'
       + '      <div id="cpmDoseUnitHint" style="font-size:11px;color:#475569;padding:0 0 9px 2px;">Resultado en ampollas.</div>'
       + '    </div>'
+      + '    <div id="cpmDoseNewWrap" style="display:none;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 8px;background:#fff;padding:9px;border:1px solid #cbd5e1;border-radius:9px;">'
+      + '      <label class="cpm-field" style="flex:1;min-width:150px"><span>Nombre del nuevo tipo</span><input type="text" id="cpmDoseNewName" class="cpm-input" maxlength="40" placeholder="Ej. Sobres, parches, jeringas"></label>'
+      + '      <button type="button" class="cpm-btn ok" id="cpmDoseSaveNew">Agregar tipo</button>'
+      + '      <button type="button" class="cpm-btn" id="cpmDoseCancelNew">Cancelar</button>'
+      + '      <small style="flex-basis:100%;font-size:11px;color:#475569">Los tipos adicionales calculan: unidades por envase × envases + unidades extra. Los tipos se guardan en este equipo/navegador.</small>'
+      + '    </div>'
+
       + '    <div class="cpm-inline-grid" style="margin-top:0;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));">'
       + '      <label class="cpm-field"><span id="cpmDosePerLabel">Ampollas por caja</span><input id="cpmAmpPorCaja" class="cpm-input" type="number" min="0" step="0.01" placeholder="Auto / manual"></label>'
       + '      <label class="cpm-field"><span id="cpmDoseContainersLabel">Cajas</span><input id="cpmAmpNumCajas" class="cpm-input" type="number" min="0" step="0.01" placeholder="Cantidad"></label>'
@@ -14357,6 +14406,87 @@ boot();
       }catch(e){}
     }
 
+    // v268 · Tipos de dosificación configurables por establecimiento local.
+    // Nunca se eliminan existencias ni registros al ocultar un tipo del selector.
+    var mxDoseStorageKey='__mx_cpm_dose_types_v268';
+    var mxDoseDefaults=[{id:'ampula',name:'Ampollas'},{id:'gotas',name:'Gotas'},{id:'tableta',name:'Tabletas'},{id:'ml',name:'mL'}];
+    function mxDoseReadState(){
+      var empty={custom:[],hiddenDefaults:[]};
+      try{
+        var raw=JSON.parse(localStorage.getItem(mxDoseStorageKey)||'{}');
+        if(!raw||typeof raw!=='object')return empty;
+        var seen={};
+        var customs=(Array.isArray(raw.custom)?raw.custom:[]).filter(function(row){
+          if(!row||typeof row.id!=='string'||!/^custom_[a-z0-9_]{1,48}$/i.test(row.id)||typeof row.name!=='string')return false;
+          row.name=row.name.trim().replace(/\s+/g,' ');
+          if(!row.name||row.name.length>40||seen[row.id])return false;
+          seen[row.id]=true;return true;
+        }).slice(0,40).map(function(row){return{id:row.id,name:row.name};});
+        var hidden=(Array.isArray(raw.hiddenDefaults)?raw.hiddenDefaults:[]).filter(function(id){return mxDoseDefaults.some(function(d){return d.id===id;});});
+        return {custom:customs,hiddenDefaults:hidden};
+      }catch(e){return empty;}
+    }
+    var mxDoseState=mxDoseReadState();
+    function mxDoseSaveState(){
+      try{localStorage.setItem(mxDoseStorageKey,JSON.stringify(mxDoseState));return true;}
+      catch(e){try{mxAlert('No se pudieron guardar los tipos de dosificación en este navegador.');}catch(_e){}return false;}
+    }
+    function mxDoseChoices(){return mxDoseDefaults.filter(function(d){return mxDoseState.hiddenDefaults.indexOf(d.id)<0;}).concat(mxDoseState.custom);}
+    function mxDoseRenderTypes(wanted){
+      var sel=document.getElementById('cpmDoseType');if(!sel)return;
+      var previous=wanted||sel.value;
+      var choices=mxDoseChoices();
+      // No dejar la calculadora sin tipos utilizables.
+      if(!choices.length){mxDoseState.hiddenDefaults=[];choices=mxDoseChoices();mxDoseSaveState();}
+      sel.replaceChildren();
+      choices.forEach(function(t){var o=document.createElement('option');o.value=t.id;o.textContent=t.name;sel.appendChild(o);});
+      sel.value=choices.some(function(t){return t.id===previous;})?previous:choices[0].id;
+      var restore=document.getElementById('cpmDoseRestore');if(restore)restore.style.display=mxDoseState.hiddenDefaults.length?'inline-block':'none';
+      var remove=document.getElementById('cpmDoseRemove');if(remove)remove.disabled=choices.length<2;
+      mxRefreshDoseUi();
+    }
+    function mxDoseToggleNew(open){
+      var wrap=document.getElementById('cpmDoseNewWrap');if(wrap)wrap.style.display=open?'flex':'none';
+      var add=document.getElementById('cpmDoseAddToggle');if(add)add.setAttribute('aria-expanded',open?'true':'false');
+      if(open){var input=document.getElementById('cpmDoseNewName');if(input)input.focus();}
+    }
+    function mxDoseManageBind(){
+      mxDoseRenderTypes('ampula');
+      var toggle=document.getElementById('cpmDoseAddToggle'),save=document.getElementById('cpmDoseSaveNew');
+      var cancel=document.getElementById('cpmDoseCancelNew'),input=document.getElementById('cpmDoseNewName');
+      var remove=document.getElementById('cpmDoseRemove'),restore=document.getElementById('cpmDoseRestore');
+      if(toggle)toggle.addEventListener('click',function(){mxDoseToggleNew(document.getElementById('cpmDoseNewWrap').style.display==='none');});
+      if(cancel)cancel.addEventListener('click',function(){if(input)input.value='';mxDoseToggleNew(false);});
+      function addNew(){
+        var name=String(input&&input.value||'').trim().replace(/\s+/g,' ');
+        if(name.length<2||name.length>40){mxAlert('Escribe un nombre de tipo de dosificación de 2 a 40 caracteres.');if(input)input.focus();return;}
+        function key(s){return s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();}
+        if(mxDoseDefaults.concat(mxDoseState.custom).some(function(t){return key(t.name)===key(name);})){
+          mxAlert('Ese tipo de dosificación ya existe.');return;
+        }
+        if(mxDoseState.custom.length>=40){mxAlert('Se permiten hasta 40 tipos personalizados.');return;}
+        var id='custom_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);
+        mxDoseState.custom.push({id:id,name:name});
+        if(!mxDoseSaveState()){mxDoseState.custom.pop();return;}
+        mxDoseRenderTypes(id);mxClearAmpulasInlineCalc();
+        if(input)input.value='';mxDoseToggleNew(false);
+      }
+      if(save)save.addEventListener('click',addNew);
+      if(input)input.addEventListener('keydown',function(ev){if(ev.key==='Enter'){ev.preventDefault();addNew();}});
+      if(remove)remove.addEventListener('click',async function(){
+        var id=mxDoseType(),items=mxDoseChoices(),selected=items.find(function(t){return t.id===id;});
+        if(!selected||items.length<2)return;
+        var ok=await mxConfirm('¿Eliminar "'+selected.name+'" de los tipos disponibles? No se modificarán productos ni movimientos guardados.');
+        if(!ok)return;
+        if(mxDoseDefaults.some(function(t){return t.id===id;}))mxDoseState.hiddenDefaults.push(id);
+        else mxDoseState.custom=mxDoseState.custom.filter(function(t){return t.id!==id;});
+        if(!mxDoseSaveState()){mxDoseState=mxDoseReadState();return;}
+        mxDoseRenderTypes();mxClearAmpulasInlineCalc();
+      });
+      if(restore)restore.addEventListener('click',function(){
+        mxDoseState.hiddenDefaults=[];if(mxDoseSaveState())mxDoseRenderTypes();
+      });
+    }
     function mxDoseType(){
       try{ return String(document.getElementById('cpmDoseType')?.value || 'ampula'); }catch(e){ return 'ampula'; }
     }
@@ -14365,6 +14495,8 @@ boot();
       if(t === 'tableta') return {unit:'tabletas', per:'Tabletas por caja', containers:'Cajas', extra:'Tabletas extra', total:'Total tabletas', formula:'Fórmula: (tabletas por caja × cajas) + tabletas extra.'};
       if(t === 'gotas') return {unit:'gotas', per:'mL por frasco', containers:'Frascos', extra:'Gotas extra', total:'Total gotas', formula:'Fórmula: (mL por frasco × frascos × gotas por mL) + gotas extra.'};
       if(t === 'ml') return {unit:'mL', per:'mL por frasco', containers:'Frascos', extra:'mL extra', total:'Total mL', formula:'Fórmula: (mL por frasco × frascos) + mL extra.'};
+      var custom=mxDoseState.custom.find(function(row){return row.id===t;});
+      if(custom){var unit=custom.name.toLowerCase();return {unit:unit,per:custom.name+' por envase',containers:'Envases',extra:custom.name+' extra',total:'Total '+unit,formula:'Fórmula: ('+unit+' por envase × envases) + '+unit+' extra.'};}
       return {unit:'ampollas', per:'Ampollas por caja', containers:'Cajas', extra:'Ampollas extra', total:'Total ampollas', formula:'Fórmula: (ampollas por caja × cajas) + ampollas extra.'};
     }
     function mxDoseFormat(n,type){
@@ -14456,6 +14588,7 @@ boot();
     function mxBindAmpulasInlineCalc(){
       try{
         ['cpmAmpPorCaja','cpmAmpNumCajas','cpmDoseFactor','cpmAmpExtra'].forEach(function(id){var el=document.getElementById(id);if(!el)return;if(id==='cpmAmpPorCaja')el.addEventListener('input',function(){this.dataset.autoDetected='';this.title='';this.style.background='';this.style.borderColor='';mxCalcAmpulasInline();});else el.addEventListener('input',mxCalcAmpulasInline);});
+        mxDoseManageBind();
         var typeSel=document.getElementById('cpmDoseType');if(typeSel)typeSel.addEventListener('change',function(){mxClearAmpulasInlineCalc();mxRefreshDoseUi();mxAutoDetectAmpulasPorCaja(false);});
         var toggle=document.getElementById('cpmAmpCalcToggle');if(toggle)toggle.addEventListener('click',function(){var body=document.getElementById('cpmAmpCalcBody'),expanded=!(body&&body.style.display==='none');mxSetAmpulasInlineCalcExpanded(!expanded);});
         var clearBtn=document.getElementById('cpmAmpClear');if(clearBtn)clearBtn.addEventListener('click',function(){mxClearAmpulasInlineCalc();try{document.getElementById('cpmAmpPorCaja')?.focus();}catch(e){}});
@@ -16383,6 +16516,25 @@ function mxInvEditPatchMemory(updated, originalId){
   }catch(_e){}
   return target;
 }
+// v266: la vista previa usa el mismo normalizador que Inventario, Entradas y exportaciones.
+function mxInvEditUpdateFinancePreview(){
+  const preview = document.getElementById('invFinancePreview');
+  if(!preview) return;
+  const val = id => Number(document.getElementById(id)?.value || 0);
+  const data = {costo:val('invCosto'),precio_venta:val('invPrecio'),iva_pct:val('invIva'),ieps_pct:val('invIeps')};
+  if(Object.values(data).some(x=>!Number.isFinite(x)||x<0) || data.iva_pct>100 || data.ieps_pct>100){
+    preview.textContent='Revisa los importes y porcentajes.';
+    return;
+  }
+  const f = typeof window.mxFinancialNormalizeRecord==='function'
+    ? window.mxFinancialNormalizeRecord(data,{force:true}) : null;
+  if(!f){preview.textContent='';return;}
+  const fmt = v => '$'+Number(v||0).toLocaleString('es-MX',{minimumFractionDigits:2,maximumFractionDigits:4});
+  preview.textContent=`IEPS unitario: ${fmt(f.ieps)} · IVA unitario: ${fmt(f.iva)} · Costo final: ${fmt(f.costo_final)} · Margen: ${Number(f.margen_ganancia||0).toFixed(2)}%`;
+}
+for(const id of ['invCosto','invPrecio','invIva','invIeps']){
+  document.getElementById(id)?.addEventListener('input',mxInvEditUpdateFinancePreview);
+}
 function mxInvEditFillModal(item){
   if(!item) return false;
   const set = (id, value)=>{ const el = document.getElementById(id); if(el) el.value = value == null ? '' : value; };
@@ -16404,6 +16556,14 @@ function mxInvEditFillModal(item){
   set('invEstantes', est);
   set('invTotal', alm + est);
   set('invUbicacion', ubicRec !== '' ? ubicRec : ubicMap);
+  // v266: recuperar los valores realmente guardados, sin sustituir tasas 0 por valores predeterminados.
+  const fin = (typeof window.mxFinancialNormalizeRecord === 'function')
+    ? window.mxFinancialNormalizeRecord(item, {force:true}) : null;
+  set('invCosto', fin ? fin.costo : (item.costo ?? item.costo_unitario ?? 0));
+  set('invPrecio', fin ? fin.precio_venta : (item.precio_venta ?? item.precioVenta ?? 0));
+  set('invIva', fin ? fin.iva_pct : (item.iva_pct ?? item.ivaPct ?? 0));
+  set('invIeps', fin ? fin.ieps_pct : (item.ieps_pct ?? item.iepsPct ?? 0));
+  mxInvEditUpdateFinancePreview();
 
   window.__invEditId = item._id != null ? item._id : null;
   window.__invEditRecord = item;
@@ -16473,9 +16633,23 @@ function mxInvEditSyncVisibleRow(updated, originalId){
     tds[9].textContent = String(Number(updated.almacen || 0));
     tds[10].textContent = String(Number(updated.estantes || 0));
     tds[11].textContent = String(Number(updated.existencia ?? updated.total ?? 0));
-    tds[12].textContent = updated.clasificacion || '';
-    tds[13].textContent = updated.restriccion || '';
-    tds[14].textContent = updated.ubicacion || '';
+    // Las cinco columnas financieras son parte de la tabla incluso si están ocultas.
+    // No escribir Clasificación en Costo / Restricción en IVA / Ubicación en IEPS.
+    const finCells = Array.from(tr.querySelectorAll('td.mx-fin-col'));
+    if(finCells.length && typeof window.mxFinancialCellsHTML === 'function'){
+      const temp=document.createElement('template');
+      temp.innerHTML=window.mxFinancialCellsHTML(updated);
+      const replacement=Array.from(temp.content.querySelectorAll('td.mx-fin-col'));
+      if(replacement.length === finCells.length){
+        finCells.forEach((td,i)=>td.replaceWith(replacement[i]));
+      }
+    }
+    const metaStart=12+finCells.length;
+    if(tds.length>metaStart+2){
+      tds[metaStart].textContent = updated.clasificacion || '';
+      tds[metaStart+1].textContent = updated.restriccion || '';
+      tds[metaStart+2].textContent = updated.ubicacion || '';
+    }
     matches.forEach(other=>{ if(other !== tr) other.remove(); });
   }catch(_e){}
 }
@@ -16647,6 +16821,36 @@ if(invSaveFast) invSaveFast.onclick = async function(){
     const totalNew = almNew + estNew;
     if(document.getElementById('invTotal')) document.getElementById('invTotal').value = String(totalNew);
 
+    // Solo modificar importes cuando el establecimiento opera en modo Financiero.
+    // En modo Normal se mantienen íntegros los datos financieros previos, aunque estén ocultos.
+    const financeOn = typeof window.mxFinancialEnabled==='function' && window.mxFinancialEnabled();
+    let editedFinance = null;
+    if(financeOn){
+      const financeFields=[
+        ['invCosto','costo','Costo unitario',false],
+        ['invPrecio','precio_venta','Precio de venta',false],
+        ['invIva','iva_pct','IVA',true],
+        ['invIeps','ieps_pct','IEPS',true]
+      ];
+      const values={};
+      for(const [id,key,label,percent] of financeFields){
+        const el=document.getElementById(id);
+        if(!el){ mxAlert(`Falta el campo ${label}. No se guardó la edición.`); return; }
+        const raw=String(el.value??'').trim();
+        const n=raw===''?NaN:Number(raw);
+        if(!Number.isFinite(n) || n<0 || (percent && n>100)){
+          mxAlert(`Revisa ${label}: escribe un valor entre 0 y ${percent?'100':'un número positivo'} (0 permitido).`);
+          el.focus();return;
+        }
+        values[key]=n;
+      }
+      if(typeof window.mxFinancialNormalizeRecord!=='function'){
+        mxAlert('No está disponible el cálculo financiero. La edición no se guardó.');return;
+      }
+      editedFinance=window.mxFinancialNormalizeRecord(values,{force:true,movementQty:totalNew});
+      if(!editedFinance){mxAlert('No se pudieron calcular los importes financieros.');return;}
+    }
+
     const originalId = originalRecord._id != null ? originalRecord._id : window.__invEditId;
     let updated = Object.assign({}, originalRecord, {
       _id: originalId,
@@ -16672,7 +16876,15 @@ if(invSaveFast) invSaveFast.onclick = async function(){
       total: totalNew,
       existencia: totalNew,
       existencias: totalNew,
-      pzs_total: totalNew
+      pzs_total: totalNew,
+      ...(editedFinance ? {
+        ...editedFinance,
+        // Conservar compatibles los nombres de campo empleados por otros módulos.
+        costo_unitario: editedFinance.costo,
+        precioVenta: editedFinance.precio_venta,
+        ivaPct: editedFinance.iva_pct,
+        iepsPct: editedFinance.ieps_pct
+      } : {})
     });
     if(!(typeof mxIsModoExistMov === 'function' && mxIsModoExistMov())){
       updated.base_exist = totalNew;
@@ -18214,6 +18426,9 @@ async function showView(id,btn){
       if(viewId === 'dashboard'){
         await run('dashboard/renderDashboard', () => renderDashboard());
         await run('dashboard/renderDashboardCharts', () => renderDashboardCharts());
+      }
+      else if(viewId === 'resurtido'){
+        await run('resurtido/refresh', () => window.mxResurtidoRefresh?.());
       }
       else if(viewId === 'inventario'){
         // Primero dibuja con la memoria disponible; la sincronización se hace después y solo una vez.
@@ -21965,7 +22180,7 @@ function installConfigCard(){
   function srFocusBusca(clearValue){ const inp=document.getElementById('srBusca'); const drop=document.getElementById('srDrop'); if(!inp) return; if(clearValue) inp.value=''; if(drop){ drop.style.display='none'; drop.innerHTML=''; } requestAnimationFrame(()=>{ try{ inp.focus(); inp.select(); }catch(e){} }); }
   function srFlashError(){ const root=document.getElementById('view-salidasrapidas') || document.body; if(!root) return; root.classList.remove('mx-sr-flash-error'); void root.offsetWidth; root.classList.add('mx-sr-flash-error'); setTimeout(()=>{ try{ root.classList.remove('mx-sr-flash-error'); }catch(e){} }, 650); }
   function srHandleMiss(message){ try{ mxAlert(message || '❌ Sin existencia o producto no encontrado.'); }catch(e){} srFlashError(); srFocusBusca(true); }
-  async function srRenderDrop(list, term){ const drop=document.getElementById('srDrop'); const inp=document.getElementById('srBusca'); if(!drop||!inp) return; if(!term||!list.length){ drop.style.display='none'; drop.innerHTML=''; return; } const r=inp.getBoundingClientRect(); drop.style.left=(r.left+window.scrollX)+'px'; drop.style.top=(r.bottom+window.scrollY)+'px'; drop.style.width=r.width+'px'; drop.innerHTML=list.slice(0,25).map((x,idx)=>{ const cb=x.codigo_barras||x.codigoBarras||x.barcode||''; const ex=srPickExis(x); const cad=String(x.caducidad||x.cad||'').slice(0,10); return `<div class="sr-item" data-srpick="${idx}"><div><b>${srEsc(x.clave||'')}</b>${cb?` · CB: ${srEsc(cb)}`:''} — ${srEsc(x.descripcion||x.nombre||'')}</div><div class="sr-meta">Lote: ${srEsc(x.lote||'-')} · Cad: ${srEsc(cad||'-')} · Disponible: ${ex}</div></div>`; }).join(''); drop.style.display='block'; drop.querySelectorAll('[data-srpick]').forEach(el=>el.onclick=async()=>{ const idx=Number(el.dataset.srpick); const item=list[idx]; if(!item) return; const res=await srAddByScan(item.codigo_barras||item.codigoBarras||item.barcode||item.clave||''); if(res&&res.ok){ srFocusBusca(true); } else { srHandleMiss(res&&res.reason==='no_stock' ? '❌ Sin existencia disponible para ese producto.' : '❌ Producto no encontrado.'); } }); }
+  async function srRenderDrop(list, term){ const drop=document.getElementById('srDrop'); const inp=document.getElementById('srBusca'); if(!drop||!inp) return; if(!term||!list.length){ drop.style.display='none'; drop.innerHTML=''; return; } const r=inp.getBoundingClientRect(); drop.style.left=(r.left+window.scrollX)+'px'; drop.style.top=(r.bottom+window.scrollY)+'px'; drop.style.width=r.width+'px'; drop.innerHTML=list.slice(0,25).map((x,idx)=>{ const cb=x.codigo_barras||x.codigoBarras||x.barcode||''; const ex=srPickExis(x); const cad=String(x.caducidad||x.cad||'').slice(0,10); return `<div class="sr-item" data-srpick="${idx}"><div><b>${srEsc(x.clave||'')}</b>${cb?` · CB: ${srEsc(cb)}`:''} — ${srEsc(x.descripcion||x.nombre||'')}</div><div class="sr-meta">Lote: ${srEsc(x.lote||'-')} · Cad: ${srEsc(cad||'-')} · Disponible: ${ex} · ${mxInventorySearchFinHTMLV270(x)}</div></div>`; }).join(''); drop.style.display='block'; drop.querySelectorAll('[data-srpick]').forEach(el=>el.onclick=async()=>{ const idx=Number(el.dataset.srpick); const item=list[idx]; if(!item) return; const res=await srAddByScan(item.codigo_barras||item.codigoBarras||item.barcode||item.clave||''); if(res&&res.ok){ srFocusBusca(true); } else { srHandleMiss(res&&res.reason==='no_stock' ? '❌ Sin existencia disponible para ese producto.' : '❌ Producto no encontrado.'); } }); }
   async function mxRenderSalidaRapida(){ srRenderCart(); try{ await refreshCacheInv(); }catch(e){} }
   window.mxRenderSalidaRapida = mxRenderSalidaRapida;
   document.addEventListener('DOMContentLoaded', ()=>{ const inp=document.getElementById('srBusca'); if(inp && !inp.dataset.boundSr){ inp.dataset.boundSr='1'; let tmr=null; inp.addEventListener('input', (e)=>{ const inputType=String(e?.inputType||''); if(!String(inp.value||'').trim() || inputType.includes('delete')){ clearTimeout(tmr); srRenderDrop([], ''); if(!String(inp.value||'').trim()) return; return; } clearTimeout(tmr); tmr=setTimeout(async()=>{ const term=String(inp.value||'').trim(); if(!term) return srRenderDrop([], ''); try{ if(/^299\d{10}$/.test(term) && typeof window.mxQxLookupLoanByEan==='function' && await window.mxQxLookupLoanByEan(term)){ srFocusBusca(true); return srRenderDrop([], ''); } }catch(_e){} const list=await srFindCandidates(term); const exact=list.some(x=>srNorm(x.codigo_barras||x.codigoBarras||x.barcode||'')===srNorm(term)); if(exact){ const res=await srAddByScan(term); if(res&&res.ok){ srFocusBusca(true); return srRenderDrop([], ''); } srHandleMiss(res&&res.reason==='no_stock' ? '❌ Sin existencia disponible para ese producto.' : '❌ Producto no encontrado.'); return srRenderDrop([], ''); } await srRenderDrop(list, term); },120); }); inp.addEventListener('keydown', async (e)=>{ if(e.key==='Enter'){ e.preventDefault(); const term=String(inp.value||'').trim(); if(!term) return; try{ if(typeof window.mxQxLookupLoanByEan==='function' && await window.mxQxLookupLoanByEan(term)){ clearTimeout(tmr); srFocusBusca(true); srRenderDrop([], ''); return; } }catch(_e){} const res=await srAddByScan(term); if(res&&res.ok){ srFocusBusca(true); srRenderDrop([], ''); } else { srHandleMiss(res&&res.reason==='no_stock' ? '❌ Sin existencia disponible para ese producto.' : '❌ Producto no encontrado.'); srRenderDrop([], ''); } } }); }
@@ -26009,11 +26224,18 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     row.lote = txt(row.lote).toUpperCase();
     row.caducidad = cadDMY(row.caducidad ?? row.cad);
     row.pzs = num(row.pzs ?? row.cantidad ?? row.piezas);
-    row.tipo_doc = txt(row.tipo_doc ?? row.tipoDocumento) || 'Alta';
+    row.tipo_doc = txt(row.tipo_doc ?? row.tipoDocumento);
     row.folio = txt(row.folio ?? row.folio_doc ?? row.documento);
     row.proveedor = txt(row.proveedor ?? row.supplier ?? row.distribuidor);
     row.proveedor_id = txt(row.proveedor_id ?? row.proveedorId);
     row.proveedor_rfc = txt(row.proveedor_rfc ?? row.proveedorRfc ?? row.rfc_proveedor);
+    // La comprobación aquí protege también la importación masiva, no solo el buscador.
+    if(typeof window.mxFinancialEnabled==='function' && window.mxFinancialEnabled()){
+      if(!row.tipo_doc)throw new Error('Entrada no guardada: selecciona el tipo de documento.');
+      if(!row.folio)throw new Error('Entrada no guardada: el folio es obligatorio en modo Financiero.');
+      if(!row.proveedor || !row.proveedor_id)throw new Error('Entrada no guardada: selecciona un proveedor del catálogo en modo Financiero.');
+    }
+    if(!row.tipo_doc)row.tipo_doc='Alta';
     row.clasificacion = txt(row.clasificacion ?? row['clasificación']);
     row.restriccion = txt(row.restriccion ?? row['restricción']);
     row.ubicacion = txt(row.ubicacion ?? row['ubicación']);
@@ -26056,9 +26278,16 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     if(!txt(inv.codigo_barras)) inv.codigo_barras = row.codigo_barras;
     if(!txt(inv.descripcion)) inv.descripcion = row.descripcion;
     if(!txt(inv.unidad)) inv.unidad = row.unidad;
-    if(txt(row.clasificacion)) inv.clasificacion = row.clasificacion;
-    if(txt(row.restriccion)) inv.restriccion = row.restriccion;
-    if(txt(row.ubicacion)) inv.ubicacion = row.ubicacion;
+    if(row._mxEditarMetadataEntrada === true){
+      inv.clasificacion=txt(row.clasificacion);
+      inv.restriccion=txt(row.restriccion);
+      inv.ubicacion=txt(row.ubicacion);
+    }else{
+      if(txt(row.clasificacion)) inv.clasificacion = row.clasificacion;
+      if(txt(row.restriccion)) inv.restriccion = row.restriccion;
+      if(txt(row.ubicacion)) inv.ubicacion = row.ubicacion;
+    }
+    delete row._mxEditarMetadataEntrada;
     inv.lote = row.lote;
     inv.caducidad = row.caducidad;
     try{
@@ -26474,7 +26703,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       item.className = 'chip mx-sal-search-item' + (total<=0 ? ' mx-zero-row' : '');
       item.setAttribute('role','option');
       item.setAttribute('aria-selected','false');
-      item.innerHTML = `${typeof _mxSemDotHTML==='function' ? _mxSemDotHTML(product?.caducidad ?? product?.cad ?? '') : ''}<b>${txt(product.clave)}</b>${txt(product?.codigo_barras ?? product?.codigoBarras ?? product?.barcode) ? ' · CB: '+txt(product?.codigo_barras ?? product?.codigoBarras ?? product?.barcode) : ''} — ${txt(product.descripcion || product.nombre)} — <span class="mx-ent-lot">Lote: ${txt(product.lote)||'-'}</span> — Cad: ${cadDMY(product.caducidad ?? product.cad)||'-'} — <span class="mx-ent-stock">Alm: ${alm} | Est: ${est} | Total: ${total}</span>`;
+      item.innerHTML = `${typeof _mxSemDotHTML==='function' ? _mxSemDotHTML(product?.caducidad ?? product?.cad ?? '') : ''}<b>${txt(product.clave)}</b>${txt(product?.codigo_barras ?? product?.codigoBarras ?? product?.barcode) ? ' · CB: '+txt(product?.codigo_barras ?? product?.codigoBarras ?? product?.barcode) : ''} — ${txt(product.descripcion || product.nombre)} — <span class="mx-ent-lot">Lote: ${txt(product.lote)||'-'}</span> — Cad: ${cadDMY(product.caducidad ?? product.cad)||'-'} — <span class="mx-ent-stock">Alm: ${alm} | Est: ${est} | Total: ${total}</span> — ${mxInventorySearchFinHTMLV270(product)}`;
       item.addEventListener('mouseenter', () => setActive(index), {passive:true});
       item.addEventListener('click', ev => { ev.preventDefault(); pickProduct(input, product); });
       searchBox.appendChild(item);
@@ -26503,12 +26732,13 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     if(!valid.ok){ mxAlert(valid.msg); return; }
     const amp = (typeof mxGetAmpulaCatalogRecord === 'function') ? mxGetAmpulaCatalogRecord({ clave:product.clave, descripcion:product.descripcion }) : null;
     if(amp){ try{ mxAlert(mxBuildAmpulaAlertText(product, 'entrada')); }catch(_e){} }
-    let qty=0, finance={};
+    let qty=0, finance={}, metadata=null;
     if(typeof window.mxFinancialEnabled==='function' && window.mxFinancialEnabled() && typeof window.mxFinancialPromptEntrada==='function'){
       const captured=await window.mxFinancialPromptEntrada(product,{ampula:!!amp});
       if(!captured) return;
       qty=num(captured.pzs);
       finance=captured.finance||{};
+      metadata=captured.metadata||null;
     }else{
       const answer = await mxPrompt(amp ? '⚠️ ESTE PRODUCTO SE MANEJA POR AMPULA.\nCAPTURA LA CANTIDAD EN AMPULAS.\n\nPiezas a ingresar:' : 'Piezas a ingresar:');
       qty = num(answer);
@@ -26524,6 +26754,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
         clasificacion:txt(product.clasificacion ?? product['clasificación']),
         restriccion:txt(product.restriccion ?? product['restricción']),
         ubicacion:txt(product.ubicacion ?? product['ubicación']),
+        ...(metadata?{...metadata,_mxEditarMetadataEntrada:true}:{}),
         ...finance,
         ...(typeof window.mxEntradaProveedorSnapshot==='function' ? window.mxEntradaProveedorSnapshot() : {}),
         tipo_doc:txt(document.getElementById('entTipoDoc')?.value), folio:txt(document.getElementById('entFolioDoc')?.value)
@@ -26639,16 +26870,21 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       if(!clave || !descripcion || !unidad || !lote || !caducidad || !(pzs > 0)){
         mxAlert('⚠️ Completa clave, descripción, unidad, lote, caducidad y piezas.'); return;
       }
-      let folio = txt(document.getElementById('entFolioDoc')?.value);
-      if(!folio){
-        const d = new Date();
-        folio = `${String(d.getDate()).padStart(2,'0')}${String(d.getMonth()+1).padStart(2,'0')}${d.getFullYear()}-alta`;
-        const folioInput = document.getElementById('entFolioDoc'); if(folioInput) folioInput.value = folio;
-      }
-      const tipo_doc = txt(document.getElementById('entTipoDoc')?.value) || 'Alta';
+      const validCabecera = validarEntradasPrev();
+      if(!validCabecera.ok){mxAlert(validCabecera.msg);return;}
+      const folio=txt(document.getElementById('entFolioDoc')?.value);
+      const tipo_doc=txt(document.getElementById('entTipoDoc')?.value);
       if(typeof window.mxFinancialEnabled==='function' && window.mxFinancialEnabled()){
         const prov = (typeof window.mxEntradaProveedorSnapshot==='function') ? window.mxEntradaProveedorSnapshot() : {};
         if(!txt(prov.proveedor)){ mxAlert('En modo Financiero selecciona un proveedor antes de registrar la Entrada.'); return; }
+      }
+      // v268: en nuevo insumo financiero ambos importes son obligatorios.
+      // 0 puede ser un valor explícito (por ejemplo donación), pero nunca se acepta en blanco.
+      if(typeof window.mxFinancialEnabled==='function' && window.mxFinancialEnabled()){
+        const check=typeof window.mxFinancialValidateNewItem==='function'
+          ? window.mxFinancialValidateNewItem()
+          : {ok:false,msg:'No se pudo validar el costo y precio de venta. Recarga el formulario.'};
+        if(!check.ok){mxAlert(check.msg);if(check.element)check.element.focus();return;}
       }
       const amp = (typeof mxGetAmpulaCatalogRecord === 'function') ? mxGetAmpulaCatalogRecord({ clave, descripcion }) : null;
       if(amp){
@@ -26782,7 +27018,7 @@ async function existingEntrySignatures(){const set=new Set();try{const rows=awai
 function ensureUi(){if($('mxEntImportModal'))return;const style=document.createElement('style');style.id='mxEntImportStyle';style.textContent=`
 .mx-ent-title-row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px}.mx-ent-title-row small{display:block;color:#64748b;margin-top:3px}.mx-ent-title-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 #mxEntImportModal{position:fixed;inset:0;z-index:2147482600;display:none;align-items:center;justify-content:center;padding:14px;background:rgba(5,20,40,.72);backdrop-filter:blur(5px)}#mxEntImportModal.open{display:flex}.mx-ei-card{width:min(1500px,98vw);max-height:96vh;display:flex;flex-direction:column;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 30px 90px rgba(0,0,0,.42)}.mx-ei-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:15px 18px;background:linear-gradient(135deg,#073e70,#0c6cb7);color:#fff}.mx-ei-head h3{margin:0;color:#fff;font-size:19px}.mx-ei-head p{margin:4px 0 0;color:#dbeafe;font-size:11px}.mx-ei-close{border:0;background:rgba(255,255,255,.18);color:#fff;border-radius:10px;width:38px;height:38px;font-size:20px;cursor:pointer}.mx-ei-toolbar{padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#f8fafc;display:grid;grid-template-columns:minmax(210px,1fr) minmax(170px,.55fr) minmax(180px,.65fr) minmax(145px,.45fr) auto auto;gap:9px;align-items:end}.mx-ei-toolbar label{display:block;font-size:10px;font-weight:900;color:#475569;margin-bottom:4px}.mx-ei-summary{display:flex;gap:8px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid #e2e8f0}.mx-ei-summary span{padding:6px 9px;border-radius:999px;background:#eef2ff;color:#3730a3;font-size:11px;font-weight:850}.mx-ei-table-wrap{overflow:auto;flex:1;min-height:260px}.mx-ei-table{width:100%;border-collapse:separate;border-spacing:0;font-size:11px;min-width:1080px}.mx-financial-on .mx-ei-table{min-width:1450px}.mx-ei-table th{position:sticky;top:0;z-index:2;background:#dbeafe;color:#123e6b;padding:8px 6px;text-align:left;border-bottom:1px solid #bfdbfe}.mx-ei-table td{padding:6px;border-bottom:1px solid #e5e7eb;vertical-align:top}.mx-ei-table tr.invalid{background:#fff1f2}.mx-ei-table tr.duplicate{background:#fff7ed}.mx-ei-fin-col{display:none}.mx-financial-on .mx-ei-fin-col{display:table-cell}.mx-ei-table input,.mx-ei-table textarea{width:100%;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:8px;padding:6px;font:inherit;background:#fff}.mx-ei-table textarea{resize:vertical;min-height:44px}.mx-ei-table input[type=checkbox]{width:18px;height:18px}.mx-ei-status{font-weight:850;font-size:10px;line-height:1.3}.mx-ei-status.ok{color:#166534}.mx-ei-status.warn{color:#9a3412}.mx-ei-status.bad{color:#b91c1c}.mx-ei-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:12px 16px;border-top:1px solid #e2e8f0;background:#f8fafc}.mx-ei-progress{display:none;flex:1;min-width:240px}.mx-ei-progress.show{display:block}.mx-ei-track{height:10px;border-radius:999px;background:#dbe5ef;overflow:hidden}.mx-ei-bar{height:100%;width:0;background:linear-gradient(90deg,#2563eb,#7c3aed);transition:width .2s}.mx-ei-progress small{display:block;margin-top:5px;color:#475569}.mx-ei-btns{display:flex;gap:8px;flex-wrap:wrap}.mx-ei-empty{padding:40px;text-align:center;color:#64748b}.mx-ei-remove{border:0;background:#fee2e2;color:#b91c1c;border-radius:8px;padding:7px 9px;cursor:pointer;font-weight:900}@media(max-width:760px){.mx-ent-title-row{align-items:stretch}.mx-ent-title-actions,.mx-ent-title-actions button{width:100%}.mx-ei-toolbar{grid-template-columns:1fr}.mx-ei-card{max-height:98vh}.mx-ei-head h3{font-size:16px}}
-`;document.head.appendChild(style);document.body.insertAdjacentHTML('beforeend',`<div id="mxEntImportModal" aria-hidden="true"><div class="mx-ei-card"><div class="mx-ei-head"><div><h3>📥 Importar Excel a Entradas</h3><p id="mxEiSubtitle">Acepta pedidos, la Plantilla de Inventario Macroxel y la hoja INVENTARIO del Excel general.</p></div><button class="mx-ei-close" id="mxEiClose" type="button">✕</button></div><div class="mx-ei-toolbar"><div><label>BUSCAR EN EL CARRITO</label><input class="input" id="mxEiSearch" placeholder="Clave, descripción o lote"></div><div><label>TIPO DE DOCUMENTO</label><select class="select" id="mxEiType"><option>Pedido ordinario</option><option>Pedido extraordinario</option><option>Vale de entrada</option><option>Vale devolución</option><option>Traslado</option></select></div><div><label>FOLIO (OPCIONAL)</label><input class="input" id="mxEiFolio" placeholder="Puedes dejarlo vacío o asignarlo a la carga"></div><div><label>FECHA DE ENTREGA</label><input class="input" id="mxEiDate" type="date"></div><button class="btn" id="mxEiAdd" type="button">＋ Agregar fila</button><button class="btn danger" id="mxEiClear" type="button">🗑 Vaciar carrito</button></div><div class="mx-ei-summary" id="mxEiSummary"></div><div class="mx-ei-table-wrap"><table class="mx-ei-table"><thead><tr><th style="width:34px"><input id="mxEiSelectAll" type="checkbox" checked></th><th>#</th><th style="width:155px">Folio (opcional)</th><th style="width:155px">Clave</th><th style="min-width:330px">Descripción</th><th style="min-width:250px">Presentación / unidad</th><th style="width:135px">Lote</th><th style="width:135px">Caducidad</th><th style="width:90px">Pzs</th><th class="mx-ei-fin-col" style="width:105px">Costo</th><th class="mx-ei-fin-col" style="width:105px">Precio venta</th><th class="mx-ei-fin-col" style="width:85px">IVA %</th><th class="mx-ei-fin-col" style="width:85px">IEPS %</th><th style="width:125px">Estado</th><th style="width:50px"></th></tr></thead><tbody id="mxEiBody"></tbody></table></div><div class="mx-ei-actions"><div class="mx-ei-progress" id="mxEiProgress"><div class="mx-ei-track"><div class="mx-ei-bar" id="mxEiBar"></div></div><small id="mxEiProgressText"></small></div><div class="mx-ei-btns"><button class="btn" id="mxEiCancel" type="button">Cancelar</button><button class="btn ok" id="mxEiSave" type="button">✅ Guardar entradas seleccionadas</button></div></div></div></div>`);
+`;document.head.appendChild(style);document.body.insertAdjacentHTML('beforeend',`<div id="mxEntImportModal" aria-hidden="true"><div class="mx-ei-card"><div class="mx-ei-head"><div><h3>📥 Importar Excel a Entradas</h3><p id="mxEiSubtitle">Acepta pedidos, la Plantilla de Inventario Macroxel y la hoja INVENTARIO del Excel general.</p></div><button class="mx-ei-close" id="mxEiClose" type="button">✕</button></div><div class="mx-ei-toolbar"><div><label>BUSCAR EN EL CARRITO</label><input class="input" id="mxEiSearch" placeholder="Clave, descripción o lote"></div><div><label>TIPO DE DOCUMENTO</label><select class="select" id="mxEiType"><option value="">Selecciona documento *</option><option>Pedido ordinario</option><option>Pedido extraordinario</option><option>Vale de entrada</option><option>Vale devolución</option><option>Traslado</option></select></div><div><label>FOLIO DEL DOCUMENTO *</label><input class="input" id="mxEiFolio" placeholder="Folio general o folio por fila del Excel"></div><div><label>FECHA DE ENTREGA</label><input class="input" id="mxEiDate" type="date"></div><button class="btn" id="mxEiAdd" type="button">＋ Agregar fila</button><button class="btn danger" id="mxEiClear" type="button">🗑 Vaciar carrito</button></div><div class="mx-ei-summary" id="mxEiSummary"></div><div class="mx-ei-table-wrap"><table class="mx-ei-table"><thead><tr><th style="width:34px"><input id="mxEiSelectAll" type="checkbox" checked></th><th>#</th><th style="width:155px">Folio (opcional)</th><th style="width:155px">Clave</th><th style="min-width:330px">Descripción</th><th style="min-width:250px">Presentación / unidad</th><th style="width:135px">Lote</th><th style="width:135px">Caducidad</th><th style="width:90px">Pzs</th><th class="mx-ei-fin-col" style="width:105px">Costo</th><th class="mx-ei-fin-col" style="width:105px">Precio venta</th><th class="mx-ei-fin-col" style="width:85px">IVA %</th><th class="mx-ei-fin-col" style="width:85px">IEPS %</th><th style="width:125px">Estado</th><th style="width:50px"></th></tr></thead><tbody id="mxEiBody"></tbody></table></div><div class="mx-ei-actions"><div class="mx-ei-progress" id="mxEiProgress"><div class="mx-ei-track"><div class="mx-ei-bar" id="mxEiBar"></div></div><small id="mxEiProgressText"></small></div><div class="mx-ei-btns"><button class="btn" id="mxEiCancel" type="button">Cancelar</button><button class="btn ok" id="mxEiSave" type="button">✅ Guardar entradas seleccionadas</button></div></div></div></div>`);
 $('mxEiClose').onclick=close;$('mxEiCancel').onclick=close;$('mxEiSearch').oninput=e=>{filterText=norm(e.target.value);render();};$('mxEiType').onchange=e=>{const ent=$('entTipoDoc');if(ent)ent.value=e.target.value;};$('mxEiFolio').oninput=()=>syncCommonFields(false);$('mxEiDate').onchange=()=>syncCommonFields(false);$('mxEiAdd').onclick=addBlank;$('mxEiClear').onclick=clearCart;$('mxEiSave').onclick=saveCart;$('mxEiSelectAll').onchange=e=>{cart.forEach(r=>r.selected=e.target.checked);render();};$('mxEiBody').addEventListener('click',e=>{const b=e.target.closest('[data-remove]');if(!b)return;cart=cart.filter(r=>r.id!==b.dataset.remove);render();});$('mxEiBody').addEventListener('input',updateFromInput);$('mxEiBody').addEventListener('change',updateFromInput);
 }
 function open(){ensureUi();$('mxEntImportModal').classList.add('open');$('mxEntImportModal').setAttribute('aria-hidden','false');}
@@ -26832,15 +27068,15 @@ async function loadFile(file){
   cart=rows;
   meta={fileName:file.name,sheetName:best.sheetName,headerRow:best.headerRow+1,headers:best.headers,mode:best.mode};
   const folios=[...new Set(cart.map(r=>txt(r.folio)).filter(Boolean))],fechas=[...new Set(cart.map(r=>txt(r.fechaYmd)).filter(Boolean))],folioComun=folios.length===1?folios[0]:defaultFolio,fechaComun=fechas[0]||defaultDate;
-  if($('entTipoDoc')&&!$('entTipoDoc').value)$('entTipoDoc').value='Pedido ordinario';
+  if(!financeMode()&&$('entTipoDoc')&&!$('entTipoDoc').value)$('entTipoDoc').value='Pedido ordinario';
   open();
-  $('mxEiType').value=$('entTipoDoc')?.value||'Pedido ordinario';
+  $('mxEiType').value=$('entTipoDoc')?.value||(financeMode()?'':'Pedido ordinario');
   $('mxEiFolio').value=folioComun;
   $('mxEiDate').value=fechaComun;
   syncCommonFields(false);
   const finCols=financeMode()&&['costo','precio_venta','iva_pct','ieps_pct'].filter(k=>best.map[k]!=null);const finMsg=finCols.length?` · Datos financieros detectados: ${finCols.map(k=>({costo:'Costo',precio_venta:'Precio venta',iva_pct:'IVA',ieps_pct:'IEPS'}[k])).join(', ')}`:'';
-  if(best.mode==='inventory')$('mxEiSubtitle').textContent=`${file.name} · hoja ${best.sheetName} · ${rows.length} registro(s) con existencia detectado(s). El folio es opcional: puedes dejarlo vacío o asignar uno a toda la carga.${finMsg}`;
-  else $('mxEiSubtitle').textContent=`${file.name} · ${rows.length} producto(s) detectado(s) · ${folios.length} folio(s). Si el Excel no trae folio, puedes dejarlo vacío o asignar uno general.${finMsg}`;
+  if(best.mode==='inventory')$('mxEiSubtitle').textContent=`${file.name} · hoja ${best.sheetName} · ${rows.length} registro(s) con existencia detectado(s). En modo Financiero el folio es obligatorio: captura uno general o por fila.${finMsg}`;
+  else $('mxEiSubtitle').textContent=`${file.name} · ${rows.length} producto(s) detectado(s) · ${folios.length} folio(s). En modo Financiero, asigna un folio general o completa uno por fila.${finMsg}`;
   render();
 }
 async function saveCart(){
@@ -26848,13 +27084,18 @@ async function saveCart(){
   const selected=cart.filter(r=>r.selected),bad=selected.filter(r=>validateRow(r).length),fechaYmd=commonDateYmd();
   if(!selected.length)return mxAlert('Selecciona al menos un producto.');
   if(!fechaYmd)return mxAlert('Captura la fecha de entrega.');
-  if(bad.length){render();return mxAlert(`Hay ${bad.length} producto(s) con campos incompletos. Revisa fecha, clave, descripción, presentación, lote, caducidad y piezas. El folio es opcional.`);}
+  if(bad.length){render();return mxAlert(`Hay ${bad.length} producto(s) con campos incompletos. Revisa fecha, clave, descripción, presentación, lote, caducidad y piezas.`);}
   const proveedorComun=(typeof window.mxEntradaProveedorSnapshot==='function'?window.mxEntradaProveedorSnapshot():{});
-  if(typeof window.mxFinancialEnabled==='function' && window.mxFinancialEnabled() && selected.some(r=>!txt(r.proveedor||proveedorComun.proveedor))) return mxAlert('En modo Financiero todas las Entradas deben conservar proveedor. Selecciona un proveedor en Entradas o incluye la columna PROVEEDOR en el Excel.');
+  if(financeMode()){
+    const tipoSeleccionado=txt($('mxEiType')?.value||$('entTipoDoc')?.value);
+    if(!tipoSeleccionado)return mxAlert('Selecciona el tipo de documento para importar Entradas financieras.');
+    if(!txt(proveedorComun.proveedor_id)||!txt(proveedorComun.proveedor))return mxAlert('Selecciona un proveedor del catálogo en Entradas antes de importar en modo Financiero.');
+    if(selected.some(r=>!txt(r.folio||commonFolio())))return mxAlert('Todas las Entradas financieras deben tener folio. Captura el folio general o completa el folio por producto en Excel.');
+  }
   const total=selected.reduce((s,r)=>s+num(r.pzs),0),folios=[...new Set(selected.map(r=>txt(r.folio)).filter(Boolean))],preview=folios.slice(0,6).join(', ')+(folios.length>6?'…':'');
   if(typeof mxConfirm==='function'&&!await mxConfirm(`¿Guardar ${selected.length} producto(s) y ${total} piezas?
 
-${folios.length?`Folio(s): ${folios.length}${preview?` (${preview})`:''}`:'Folio: sin folio (opcional)'}
+${folios.length?`Folio(s): ${folios.length}${preview?` (${preview})`:''}`:'Folio general: '+(commonFolio()||'sin folio')}
 Fecha de entrega: ${ymdToDmy(fechaYmd)}.
 
 Cada producto conservará el folio de su propia fila.`))return;
@@ -26862,9 +27103,9 @@ Cada producto conservará el folio de su propia fila.`))return;
   const occurrences=new Map(),tipo=txt($('mxEiType')?.value||$('entTipoDoc')?.value)||'Pedido ordinario',usuario=txt(typeof getLoggedUserLabel==='function'?getLoggedUserLabel():'');
   const payload=selected.map(r=>{
     r.fechaYmd=fechaYmd;
-    const folioFila=txt(r.folio),base=signature(r),occ=(occurrences.get(base)||0)+1;
+    const folioFila=txt(r.folio||commonFolio()),base=signature(r),occ=(occurrences.get(base)||0)+1;
     occurrences.set(base,occ);
-    return{fecha:ymdToDmy(fechaYmd),createdAt:new Date().toISOString(),usuario,codigo_barras:r.codigo_barras||'',clave:txt(r.clave),descripcion:cleanDescription(r.descripcion),unidad:txt(r.unidad)||extractPresentation(r.descripcion,''),lote:txt(r.lote).toUpperCase(),caducidad:ymdToDmy(r.cadYmd),pzs:Math.round(num(r.pzs)),tipo_doc:tipo,folio:folioFila,proveedor:txt(r.proveedor||proveedorComun.proveedor),proveedor_id:txt(r.proveedor?'':proveedorComun.proveedor_id),proveedor_rfc:txt(r.proveedor?'':proveedorComun.proveedor_rfc),institucion:txt(r.institucion),clasificacion:txt(r.clasificacion),restriccion:txt(r.restriccion),ubicacion:txt(r.ubicacion),...(financeMode()?{costo:Math.max(0,financeNum(r.costo)),costo_unitario:Math.max(0,financeNum(r.costo)),precio_venta:Math.max(0,financeNum(r.precio_venta)),iva_pct:Math.max(0,financeNum(r.iva_pct)),ieps_pct:Math.max(0,financeNum(r.ieps_pct))}:{}),archivo_origen:meta?.fileName||'',fila_origen:r.sourceRow||'',_mxOpId:`ENT_IMPORT:${hashString(base)}:${occ}`};
+    return{fecha:ymdToDmy(fechaYmd),createdAt:new Date().toISOString(),usuario,codigo_barras:r.codigo_barras||'',clave:txt(r.clave),descripcion:cleanDescription(r.descripcion),unidad:txt(r.unidad)||extractPresentation(r.descripcion,''),lote:txt(r.lote).toUpperCase(),caducidad:ymdToDmy(r.cadYmd),pzs:Math.round(num(r.pzs)),tipo_doc:tipo,folio:folioFila,proveedor:financeMode()?txt(proveedorComun.proveedor):txt(r.proveedor||proveedorComun.proveedor),proveedor_id:txt(proveedorComun.proveedor_id),proveedor_rfc:txt(proveedorComun.proveedor_rfc),proveedor_archivo:financeMode()?txt(r.proveedor):'',institucion:txt(r.institucion),clasificacion:txt(r.clasificacion),restriccion:txt(r.restriccion),ubicacion:txt(r.ubicacion),...(financeMode()?{costo:Math.max(0,financeNum(r.costo)),costo_unitario:Math.max(0,financeNum(r.costo)),precio_venta:Math.max(0,financeNum(r.precio_venta)),iva_pct:Math.max(0,financeNum(r.iva_pct)),ieps_pct:Math.max(0,financeNum(r.ieps_pct))}:{}),archivo_origen:meta?.fileName||'',fila_origen:r.sourceRow||'',_mxOpId:`ENT_IMPORT:${hashString(base)}:${occ}`};
   });
   try{
     const saveFn=window.mxEntradaPersistirLoteNueva||(async(list,onProgress)=>{const saved=[],skipped=[];for(let i=0;i<list.length;i++){saved.push(await window.mxEntradaPersistirNueva(list[i]));onProgress?.({index:i+1,total:list.length,saved:saved.length,skipped:0});}return{saved,skipped};});
@@ -33075,15 +33316,15 @@ Se marcarán como CERRADO POR EL SERVICIO FARMACIA y dejarán de aparecer como t
 })();
 
 
-/* ===== MACROXEL CANONICAL SOURCE: mx-census-principal-notifier-v120 ===== */
+/* ===== MACROXEL CANONICAL SOURCE: mx-census-principal-notifier-v121 ===== */
 (()=>{'use strict';
   /*
    * Censo -> Sistema Principal v1.0.20
    * IMPORTANTE: este monitor nunca participa en el inicio de sesión ni en el
    * failover de Firebase. Solo se activa después de que el usuario ya entró.
    */
-  if(window.__mxCensusPrincipalNotifierV120)return;
-  window.__mxCensusPrincipalNotifierV120=true;
+  if(window.__mxCensusPrincipalNotifierV121)return;
+  window.__mxCensusPrincipalNotifierV121=true;
   const POLL_MS=30000, INITIAL_RECENT_MS=180000, MAX_SEEN=160, READ_TIMEOUT_MS=3500, WRITE_TIMEOUT_MS=2500;
   const txt=v=>String(v??'').trim();
   const norm=v=>txt(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase();
@@ -33102,7 +33343,18 @@ Se marcarán como CERRADO POR EL SERVICIO FARMACIA y dejarán de aparecer como t
 
   function readSeen(){try{const a=JSON.parse(localStorage.getItem(seenKey())||'[]');return new Set(Array.isArray(a)?a:[])}catch(_e){return new Set()}}
   function saveSeen(set){try{localStorage.setItem(seenKey(),JSON.stringify([...set].slice(-MAX_SEEN)))}catch(_e){}}
-  function stampOf(r){const raw=r?.deliveredAt||r?.updatedAt||r?.createdAt||'';const n=Date.parse(raw);return Number.isFinite(n)?n:0}
+  // La hora de notificación/actualización no convierte un censo viejo en entrega nueva.
+  function stampOf(r){const raw=r?.deliveredAt||r?.createdAt||'';const n=Date.parse(raw);return Number.isFinite(n)&&n>0?n:0}
+  function localDay(value){const d=new Date(value);if(!Number.isFinite(d.getTime()))return'';const two=n=>String(n).padStart(2,'0');return `${d.getFullYear()}-${two(d.getMonth()+1)}-${two(d.getDate())}`}
+  function deliveredToday(r,now){const at=stampOf(r),date=localDay(now);return at>0&&at<=now+60000&&localDay(at)===date&&(!txt(r?.censusDate)||txt(r.censusDate)===date)}
+  function activeCensusToday(active,now){
+    const m=active?.meta||{},date=localDay(now),n=Object.values(active?.patients||{}).filter(p=>p&&typeof p==='object').length;
+    // El historial /submissions persiste; solo /active, fechado hoy y no vaciado,
+    // confirma un censo vigente. Nunca borrar entregas o registros históricos.
+    if(!n||norm(m.status)!=='ACTIVE'||txt(m.censusDate)!==date||localDay(Date.parse(m.lastDeliveredAt||''))!==date)return false;
+    const cleared=Date.parse(m.manuallyClearedAt||'')||0,latest=Date.parse(m.lastDeliveredAt||'')||0;
+    return !cleared||latest>cleared;
+  }
   function servicesOf(r){const a=Array.isArray(r?.services)?r.services:[];return [...new Set(a.map(txt).filter(Boolean))]}
   function statusOk(r){const s=norm(r?.status||r?.estado||'VALIDATED');return !s||/VALID|DELIVER|ENTREG|ACTIVE|ACTIV/.test(s)}
   function messageFor(r){const sv=servicesOf(r),label=sv.length?sv.join(', '):'Servicio no identificado',n=Number(r?.patientCount||0),files=Array.isArray(r?.files)?r.files.length:0,upd=norm(r?.deliveryType)==='ACTUALIZACION_DIA',added=Number(r?.addedPatientCount||0);return `🏥 ${upd?'Censo actualizado':'Censo cargado'} · ${label}${n?` · ${n} paciente${n===1?'':'s'}`:''}${upd&&added?` · ${added} nuevo${added===1?'':'s'}`:''}${files>1?` · ${files} archivos`:''}`}
@@ -33155,10 +33407,29 @@ Se marcarán como CERRADO POR EL SERVICIO FARMACIA y dejarán de aparecer como t
       if(!force&&vsig&&last===vsig)return;
       const raw=await get(`/hospital_census/${encodeURIComponent(br)}/submissions`).catch(()=>null);
       const entries=Object.entries(raw&&typeof raw==='object'?raw:{}).filter(([,r])=>r&&typeof r==='object'&&statusOk(r)).sort((a,b)=>stampOf(a[1])-stampOf(b[1]));
-      const seen=readSeen(),initialized=(()=>{try{return localStorage.getItem(initKey())==='1'}catch(_e){return false}})(),now=Date.now(),fresh=[];
-      for(const [id,r] of entries){if(seen.has(id))continue;if(initialized||!stampOf(r)||now-stampOf(r)<=INITIAL_RECENT_MS)fresh.push({...r,__id:id});seen.add(id)}
+      const seen=readSeen(),initialized=(()=>{try{return localStorage.getItem(initKey())==='1'}catch(_e){return false}})(),now=Date.now(),pending=[],fresh=[];
+      for(const [id,r] of entries){
+        if(seen.has(id))continue;
+        // En un equipo nuevo solo avisar si se acaba de recibir la entrega.
+        // En equipos habituales, permitir nuevos ID únicamente del día actual.
+        if(deliveredToday(r,now)&&(initialized||now-stampOf(r)<=INITIAL_RECENT_MS))pending.push({...r,__id:id});
+        else seen.add(id); // Los censos anteriores se marcan vistos SIN anunciarlos.
+      }
+      let verifyFailed=false;
+      if(pending.length){
+        // Un borrado manual o censo sin carga vigente debe apagar los avisos,
+        // incluso si /submissions conserva datos históricos del mismo día.
+        try{
+          const active=await get(`/hospital_census/${encodeURIComponent(br)}/active`);
+          if(activeCensusToday(active,now)){
+            const cleared=Date.parse(active.meta?.manuallyClearedAt||'')||0;
+            for(const r of pending){if(stampOf(r)>cleared)fresh.push(r)}
+          }
+          for(const r of pending)seen.add(r.__id);
+        }catch(_e){verifyFailed=true; /* no anunciar ni perder entregas actuales si falla Firebase */}
+      }
       const recentIds=entries.slice(-MAX_SEEN).map(([id])=>id),trimmed=new Set(recentIds.filter(id=>seen.has(id)));saveSeen(trimmed);
-      try{localStorage.setItem(initKey(),'1');if(vsig)localStorage.setItem(versionKey(),vsig)}catch(_e){}
+      try{localStorage.setItem(initKey(),'1');if(vsig&&!verifyFailed)localStorage.setItem(versionKey(),vsig)}catch(_e){}
       if(fresh.length){announce(fresh);for(const r of fresh)ack(br,r.__id);try{if(window.__currentViewId==='censo')window.mxRefreshCensoRegistro?.()}catch(_e){}}
     }catch(e){console.warn('[CENSO][PRINCIPAL] Monitor omitido sin afectar al sistema:',e?.message||e)}finally{busy=false}
   }
@@ -33921,7 +34192,7 @@ let invCatalogV148 = [];
 let invCatalogAtV148 = 0;
 let kitSearchSeqV148 = 0;
 let serviceBusy = false;
-let serviceState = {folio:'', selectedKits:[], doctorId:null, anestId:null, anestCedula:'', serviceName:'', serviceInitials:''};
+let serviceState = {folio:'', selectedKits:[], soloProducts:[], doctorId:null, anestId:null, anestCedula:'', serviceName:'', serviceInitials:''};
 let doctorCache = [];
 let doctorCacheAt = 0;
 let serviceHistoryGroups = [];
@@ -34037,6 +34308,7 @@ function injectStyles(){
   .mx-qx-modal{position:fixed;inset:0;z-index:100200;background:rgba(15,23,42,.58);display:flex;align-items:center;justify-content:center;padding:16px}.mx-qx-modal.hidden{display:none!important}
   .mx-qx-service-card{width:min(1380px,98vw);height:94vh;max-height:94vh;background:#f8fafc;border-radius:18px;box-shadow:0 28px 80px rgba(2,6,23,.32);display:flex;flex-direction:column;overflow:hidden;border:1px solid rgba(255,255,255,.45)}
   .mx-qx-service-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:15px 18px;background:linear-gradient(135deg,#0b4f7d,#123b68);color:#fff}.mx-qx-service-head h3{margin:0;font-size:18px;color:#fff}.mx-qx-service-head small{display:block;margin-top:3px;opacity:.88;color:rgba(255,255,255,.92)}.mx-qx-x{width:42px;height:42px;border:0;border-radius:12px;background:rgba(255,255,255,.16);color:#fff;font-size:25px;font-weight:900;cursor:pointer}
+  .mx-qx-solo-picker{margin:10px 0;padding:10px;background:#fff;border:1px dashed #cbd5e1;border-radius:10px}.mx-qx-solo-picker .mx-qx-relative{position:relative;margin-top:6px}.mx-qx-solo-picker .mx-qx-solo-results{position:absolute;top:100%;left:0;right:0;z-index:35;max-height:240px;overflow-y:auto;background:#fff;border:1px solid #94a3b8;border-radius:8px;box-shadow:0 8px 18px #0002}.mx-qx-solo-picker .mx-qx-solo-results>button{width:100%;display:block;border:0;border-bottom:1px solid #e2e8f0;padding:8px;text-align:left;background:#fff;cursor:pointer;color:#0f172a}.mx-qx-solo-picker .mx-qx-solo-results>button:hover,.mx-qx-solo-picker .mx-qx-solo-results>button:focus{background:#f1f5f9!important;color:#0f172a!important}.mx-qx-solo-picker #mxQxSrvSoloDrop>button{background:#fff!important;color:#0f172a!important;text-shadow:none!important;box-shadow:none!important}.mx-qx-solo-picker #mxQxSrvSoloDrop>button:hover,.mx-qx-solo-picker #mxQxSrvSoloDrop>button:focus{background:#f1f5f9!important;color:#0f172a!important}.mx-qx-solo-picker #mxQxSrvSoloDrop>button small{color:#475569!important}.mx-qx-solo-picker #mxQxSrvSoloDrop>button b{color:#0f172a!important}.mx-qx-solo-picker small{display:block;color:#52647a;margin-top:4px}.mx-qx-solo-picker .mx-qx-solo-results small{color:#475569}.mx-qx-srv-solo{background:#eef8ff}.mx-qx-srv-solo .mx-qx-kit-divider-content{border-left:3px solid #0284c7;padding-left:9px}
   .mx-qx-service-body{padding:10px 12px;overflow:hidden;display:flex;flex-direction:column;flex:1;min-height:0}.mx-qx-service-sec{background:#fff;border:1px solid #dbe5f3;border-radius:14px;padding:10px 12px;margin-bottom:7px;transition:padding .14s ease,background .14s ease}.mx-qx-service-sec.mx-qx-service-compact{padding:9px 12px}.mx-qx-service-sec h4{margin:0;font-size:13px;color:#0f172a}.mx-qx-sec-head{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:10px;min-height:28px;cursor:pointer;user-select:none}.mx-qx-sec-summary{min-width:0;text-align:right;color:#64748b;font-size:11px;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mx-qx-sec-chevron{font-size:15px;font-weight:950;color:#2563eb;transition:transform .15s ease}.mx-qx-service-sec.is-collapsed{padding:7px 12px;background:#fbfdff}.mx-qx-service-sec.is-collapsed .mx-qx-sec-content{display:none}.mx-qx-service-sec.is-collapsed .mx-qx-sec-chevron{transform:rotate(-90deg)}.mx-qx-service-sec:not(.is-collapsed) .mx-qx-sec-content{margin-top:8px}#mxQxSecKits{display:flex;flex-direction:column;flex:1;min-height:300px;margin-bottom:0;overflow:hidden;background:#fff}#mxQxSecKits .mx-qx-sec-head{cursor:default}#mxQxSecKits .mx-qx-sec-content{display:flex;flex-direction:column;flex:1;min-height:0;margin-top:7px}#mxQxSrvSelected{flex:1;min-height:250px;overflow:auto;padding-right:2px;padding-bottom:4px}
   .mx-qx-doctor-grid{display:grid;grid-template-columns:minmax(220px,1.15fr) 135px 145px minmax(220px,1.15fr) auto;gap:8px;align-items:end}
   .mx-qx-anesthesiologist-field{grid-column:1 / 3;min-width:210px}.mx-qx-anesthesiologist-field input{width:100%}.mx-qx-anesthesiologist-field small{display:block;color:#64748b;font-size:10px;margin-top:3px}@media(max-width:900px){.mx-qx-doctor-grid .mx-qx-anesthesiologist-field{grid-column:1/-1;min-width:0}}.mx-qx-patient-grid{display:grid;grid-template-columns:minmax(220px,1.5fr) 100px 140px 150px 170px;gap:8px}.mx-qx-relative{position:relative}
@@ -34253,8 +34525,8 @@ function updateServiceSectionSummaries(){
   const dest=selectedDestinationService?.(),folio=qTxt($q('mxQxSrvFolio')?.value),doctor=qTxt($q('mxQxSrvMedName')?.value),ced=qTxt($q('mxQxSrvMedCed')?.value),patient=qTxt($q('mxQxSrvPatient')?.value),age=qTxt($q('mxQxSrvAge')?.value),sex=qTxt($q('mxQxSrvSex')?.value),eye=qTxt($q('mxQxSrvEye')?.value);
   const d=$q('mxQxSumDestination');if(d)d.textContent=dest?`${dest.nombre}${dest.iniciales?' ('+dest.iniciales+')':''}${folio?' · '+folio:''}`:'Pendiente';
   const m=$q('mxQxSumDoctor'),anest=qTxt($q('mxQxSrvAnestName')?.value);if(m)m.textContent=doctor?`${doctor}${ced?' · Céd. '+ced:''}${anest?' · Anest.: '+anest:''}`:'Pendiente';
-  const p=$q('mxQxSumPatient');if(p)p.textContent=patient?`${patient}${age?' · '+age+' años':''}${sex?' · '+sex:''}${eye?' · Ojo: '+eye:''}`:'Pendiente';
-  const k=$q('mxQxSumKits');if(k){const rows=serviceAggregate?.()||[],qty=rows.reduce((a,x)=>a+qInt(x.cantidad),0);k.textContent=`${serviceState?.selectedKits?.length||0} kits · ${rows.length} productos · ${qty} pzs`;}
+  const expediente=qTxt($q('mxQxSrvExpediente')?.value);const p=$q('mxQxSumPatient');if(p)p.textContent=patient?`${patient}${expediente?' · Exp. '+expediente:''}${age?' · '+age+' años':''}${sex?' · '+sex:''}${eye?' · Ojo: '+eye:''}`:'Pendiente';
+  const k=$q('mxQxSumKits');if(k){const rows=serviceAggregate?.()||[],qty=rows.reduce((a,x)=>a+qInt(x.cantidad),0);k.textContent=`${serviceState?.selectedKits?.length||0} kits · ${serviceState?.soloProducts?.length||0} sueltos · ${rows.length} productos · ${qty} pzs`;}
 }
 function setServiceSection(step,focus=false){
   const ids={destination:'mxQxSecDestination',doctor:'mxQxSecDoctor',patient:'mxQxSecPatient'};
@@ -34267,20 +34539,22 @@ function bindServiceProgressiveSections(){
   modal.querySelectorAll('[data-qx-sec-toggle]').forEach(h=>h.addEventListener('click',()=>setServiceSection(h.dataset.qxSecToggle,true)));
   [['mxQxSecDestination','destination'],['mxQxSecDoctor','doctor'],['mxQxSecPatient','patient']].forEach(([id,step])=>{$q(id)?.addEventListener('focusin',()=>setServiceSection(step,false));});
   $q('mxQxSrvKitSelect')?.addEventListener('focus',()=>setServiceSection('kits',false));
-  ['mxQxSrvMedName','mxQxSrvMedCed','mxQxSrvMedTel','mxQxSrvMedDom','mxQxSrvAnestName','mxQxSrvPatient','mxQxSrvAge','mxQxSrvSex','mxQxSrvEye','mxQxSrvPatientTel'].forEach(id=>$q(id)?.addEventListener('input',updateServiceSectionSummaries));
+  ['mxQxSrvMedName','mxQxSrvMedCed','mxQxSrvMedTel','mxQxSrvMedDom','mxQxSrvAnestName','mxQxSrvPatient','mxQxSrvExpediente','mxQxSrvBirthDate','mxQxSrvAge','mxQxSrvSex','mxQxSrvEye','mxQxSrvPatientTel'].forEach(id=>$q(id)?.addEventListener('input',updateServiceSectionSummaries));
   $q('mxQxSrvSex')?.addEventListener('change',()=>{updateServiceSectionSummaries();const ready=qTxt($q('mxQxSrvPatient')?.value)&&qTxt($q('mxQxSrvAge')?.value)&&qTxt($q('mxQxSrvSex')?.value)&&qTxt($q('mxQxSrvEye')?.value);if(ready)setServiceSection('kits',true);});
   $q('mxQxSrvEye')?.addEventListener('change',()=>{updateServiceSectionSummaries();const ready=qTxt($q('mxQxSrvPatient')?.value)&&qTxt($q('mxQxSrvAge')?.value)&&qTxt($q('mxQxSrvSex')?.value)&&qTxt($q('mxQxSrvEye')?.value);if(ready)setServiceSection('kits',true);});
+  $q('mxQxSrvBirthDate')?.addEventListener('change',()=>{const dob=qTxt($q('mxQxSrvBirthDate')?.value),ageEl=$q('mxQxSrvAge');if(dob){const d=new Date(dob+'T12:00:00'),now=new Date();if(Number.isNaN(d.getTime())||d>now){qAlert('La fecha de nacimiento no puede ser futura.');$q('mxQxSrvBirthDate').value='';return;}const a=now.getFullYear()-d.getFullYear()-(now.getMonth()<d.getMonth()||(now.getMonth()===d.getMonth()&&now.getDate()<d.getDate())?1:0);if(ageEl&&(!ageEl.value||ageEl.dataset.qxFromBirth==='1')){ageEl.value=Math.max(0,a);ageEl.dataset.qxFromBirth='1';}}updateServiceSectionSummaries();});
+  $q('mxQxSrvAge')?.addEventListener('input',e=>{if(e.isTrusted)e.currentTarget.dataset.qxFromBirth='0';});
   $q('mxQxSrvAge')?.addEventListener('change',()=>{updateServiceSectionSummaries();const ready=qTxt($q('mxQxSrvPatient')?.value)&&qTxt($q('mxQxSrvAge')?.value)&&qTxt($q('mxQxSrvSex')?.value)&&qTxt($q('mxQxSrvEye')?.value);if(ready)setServiceSection('kits',true);});
 }
 function ensureServiceModal(){
   let modal=$q('mxQxServiceModal');if(modal)return modal;
-  modal=document.createElement('div');modal.id='mxQxServiceModal';modal.className='mx-qx-modal hidden';modal.innerHTML=`<div class="mx-qx-service-card" role="dialog" aria-modal="true" aria-labelledby="mxQxServiceTitle"><div class="mx-qx-service-head"><div><h3 id="mxQxServiceTitle">🩺 Servicio quirúrgico · Kits de quirófano</h3><small>Completa los datos por pasos. Los apartados terminados se minimizan para dejar más espacio a los kits.</small></div><button class="mx-qx-x" id="mxQxServiceClose" type="button">×</button></div><div class="mx-qx-service-body"><div class="mx-qx-service-sec mx-qx-service-compact" id="mxQxSecDestination" data-qx-section="destination"><div class="mx-qx-sec-head" data-qx-sec-toggle="destination"><h4>🏥 Destino y folio del servicio</h4><div class="mx-qx-sec-summary" id="mxQxSumDestination">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-formgrid"><div class="mx-qx-field"><label>Servicio de destino</label><select class="select" id="mxQxSrvService"><option value="">Selecciona servicio de destino</option></select><small id="mxQxSrvServiceHelp">Servicios cargados desde Configuración &gt; Servicios.</small></div><div class="mx-qx-field"><label>Fecha</label><input class="input" id="mxQxSrvDate" readonly></div><div class="mx-qx-field mx-qx-folio-field"><label>Folio automático</label><input class="input" id="mxQxSrvFolio" readonly placeholder="0001-DDMMAAAA-SRV"></div></div></div></div><div class="mx-qx-service-sec is-collapsed" id="mxQxSecDoctor" data-qx-section="doctor"><div class="mx-qx-sec-head" data-qx-sec-toggle="doctor"><h4>👨‍⚕️ Médico solicitante</h4><div class="mx-qx-sec-summary" id="mxQxSumDoctor">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-doctor-grid"><div class="mx-qx-field mx-qx-relative"><label>Nombre del médico</label><input class="input" id="mxQxSrvMedName" placeholder="Buscar o capturar médico"><div class="mx-qx-med-drop" id="mxQxSrvMedDrop"></div></div><div class="mx-qx-field"><label>Cédula</label><input class="input" id="mxQxSrvMedCed" placeholder="Cédula"></div><div class="mx-qx-field"><label>Teléfono</label><input class="input" id="mxQxSrvMedTel" placeholder="Teléfono"></div><div class="mx-qx-field"><label>Domicilio</label><input class="input" id="mxQxSrvMedDom" placeholder="Domicilio del médico"></div><button class="btn" id="mxQxSrvSaveMed" type="button">💾 Médico</button><div class="mx-qx-field mx-qx-anesthesiologist-field"><label for="mxQxSrvAnestName">Anestesiólogo (Médicos)</label><input class="input" id="mxQxSrvAnestName" list="mxQxSrvAnestList" placeholder="Buscar anestesiólogo en Médicos" autocomplete="off"><datalist id="mxQxSrvAnestList"></datalist><small id="mxQxSrvAnestHelp">Opcional · Selecciona un nombre del catálogo de Médicos.</small></div></div></div></div><div class="mx-qx-service-sec is-collapsed" id="mxQxSecPatient" data-qx-section="patient"><div class="mx-qx-sec-head" data-qx-sec-toggle="patient"><h4>🧑 Paciente</h4><div class="mx-qx-sec-summary" id="mxQxSumPatient">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-patient-grid"><div class="mx-qx-field"><label>Nombre del paciente</label><input class="input" id="mxQxSrvPatient" placeholder="Nombre completo"></div><div class="mx-qx-field"><label>Edad</label><input class="input" id="mxQxSrvAge" type="number" min="0" max="130" placeholder="Edad"></div><div class="mx-qx-field"><label>Sexo</label><select class="select" id="mxQxSrvSex"><option value="">Selecciona</option><option>Femenino</option><option>Masculino</option><option>Otro</option><option>No especificado</option></select></div><div class="mx-qx-field"><label>Ojo a operar</label><select class="select" id="mxQxSrvEye"><option value="">Selecciona</option><option>Derecho</option><option>Izquierdo</option><option>Ambos</option></select></div><div class="mx-qx-field"><label>Teléfono</label><input class="input" id="mxQxSrvPatientTel" placeholder="Teléfono del paciente"></div></div></div></div><div class="mx-qx-service-sec" id="mxQxSecKits" data-qx-section="kits"><div class="mx-qx-sec-head"><h4>🧰 Kits requeridos</h4><div class="mx-qx-sec-summary" id="mxQxSumKits">Área de preparación</div><span></span></div><div class="mx-qx-sec-content"><div class="mx-qx-kit-add"><select class="select" id="mxQxSrvKitSelect"><option value="">Selecciona un kit</option></select><button class="btn ok" id="mxQxSrvAddKit" type="button">＋ Agregar kit</button><span class="badge">Agrega kits, ajusta cantidades o retira productos individuales.</span></div><div class="mx-qx-selected" id="mxQxSrvSelected"></div></div></div></div><div class="mx-qx-service-foot"><div class="mx-qx-service-summary" id="mxQxSrvSummary">0 kits · 0 productos · 0 pzs</div><div class="mx-qx-foot-actions"><button class="btn" id="mxQxSrvCancel" type="button">Cancelar</button><button class="btn" id="mxQxSrvPdf" type="button">📄 Enviar a PDF</button><button class="btn mx-qx-loan-btn" id="mxQxSrvLoan" type="button">💼 Registrar préstamo</button><button class="btn ok" id="mxQxSrvFinish" type="button">✅ Finalizar salida</button></div></div></div>`;
+  modal=document.createElement('div');modal.id='mxQxServiceModal';modal.className='mx-qx-modal hidden';modal.innerHTML=`<div class="mx-qx-service-card" role="dialog" aria-modal="true" aria-labelledby="mxQxServiceTitle"><div class="mx-qx-service-head"><div><h3 id="mxQxServiceTitle">🩺 Servicio quirúrgico · Kits de quirófano</h3><small>Completa los datos por pasos. Los apartados terminados se minimizan para dejar más espacio a los kits.</small></div><button class="mx-qx-x" id="mxQxServiceClose" type="button">×</button></div><div class="mx-qx-service-body"><div class="mx-qx-service-sec mx-qx-service-compact" id="mxQxSecDestination" data-qx-section="destination"><div class="mx-qx-sec-head" data-qx-sec-toggle="destination"><h4>🏥 Destino y folio del servicio</h4><div class="mx-qx-sec-summary" id="mxQxSumDestination">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-formgrid"><div class="mx-qx-field"><label>Servicio de destino</label><select class="select" id="mxQxSrvService"><option value="">Selecciona servicio de destino</option></select><small id="mxQxSrvServiceHelp">Servicios cargados desde Configuración &gt; Servicios.</small></div><div class="mx-qx-field"><label>Fecha</label><input class="input" id="mxQxSrvDate" readonly></div><div class="mx-qx-field mx-qx-folio-field"><label>Folio automático</label><input class="input" id="mxQxSrvFolio" readonly placeholder="0001-DDMMAAAA-SRV"></div></div></div></div><div class="mx-qx-service-sec is-collapsed" id="mxQxSecDoctor" data-qx-section="doctor"><div class="mx-qx-sec-head" data-qx-sec-toggle="doctor"><h4>👨‍⚕️ Médico solicitante</h4><div class="mx-qx-sec-summary" id="mxQxSumDoctor">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-doctor-grid"><div class="mx-qx-field mx-qx-relative"><label>Nombre del médico</label><input class="input" id="mxQxSrvMedName" placeholder="Buscar o capturar médico"><div class="mx-qx-med-drop" id="mxQxSrvMedDrop"></div></div><div class="mx-qx-field"><label>Cédula</label><input class="input" id="mxQxSrvMedCed" placeholder="Cédula"></div><div class="mx-qx-field"><label>Teléfono</label><input class="input" id="mxQxSrvMedTel" placeholder="Teléfono"></div><div class="mx-qx-field"><label>Domicilio</label><input class="input" id="mxQxSrvMedDom" placeholder="Domicilio del médico"></div><button class="btn" id="mxQxSrvSaveMed" type="button">💾 Médico</button><div class="mx-qx-field mx-qx-anesthesiologist-field"><label for="mxQxSrvAnestName">Anestesiólogo (Médicos)</label><input class="input" id="mxQxSrvAnestName" list="mxQxSrvAnestList" placeholder="Buscar anestesiólogo en Médicos" autocomplete="off"><datalist id="mxQxSrvAnestList"></datalist><small id="mxQxSrvAnestHelp">Opcional · Selecciona un nombre del catálogo de Médicos.</small></div></div></div></div><div class="mx-qx-service-sec is-collapsed" id="mxQxSecPatient" data-qx-section="patient"><div class="mx-qx-sec-head" data-qx-sec-toggle="patient"><h4>🧑 Paciente</h4><div class="mx-qx-sec-summary" id="mxQxSumPatient">Pendiente</div><span class="mx-qx-sec-chevron">⌄</span></div><div class="mx-qx-sec-content"><div class="mx-qx-patient-grid"><div class="mx-qx-field"><label>Nombre del paciente</label><input class="input" id="mxQxSrvPatient" placeholder="Nombre completo"></div><div class="mx-qx-field"><label>Expediente</label><input class="input" id="mxQxSrvExpediente" placeholder="Número de expediente" autocomplete="off"></div><div class="mx-qx-field"><label>Fecha de nacimiento</label><input class="input" id="mxQxSrvBirthDate" type="date" aria-label="Fecha de nacimiento del paciente"></div><div class="mx-qx-field"><label>Edad</label><input class="input" id="mxQxSrvAge" type="number" min="0" max="130" placeholder="Edad"></div><div class="mx-qx-field"><label>Sexo</label><select class="select" id="mxQxSrvSex"><option value="">Selecciona</option><option>Femenino</option><option>Masculino</option><option>Otro</option><option>No especificado</option></select></div><div class="mx-qx-field"><label>Ojo a operar</label><select class="select" id="mxQxSrvEye"><option value="">Selecciona</option><option>Derecho</option><option>Izquierdo</option><option>Ambos</option></select></div><div class="mx-qx-field"><label>Teléfono</label><input class="input" id="mxQxSrvPatientTel" placeholder="Teléfono del paciente"></div></div></div></div><div class="mx-qx-service-sec" id="mxQxSecKits" data-qx-section="kits"><div class="mx-qx-sec-head"><h4>🧰 Armar kit / Productos individuales</h4><div class="mx-qx-sec-summary" id="mxQxSumKits">Área de preparación</div><span></span></div><div class="mx-qx-sec-content"><div class="mx-qx-kit-add"><select class="select" id="mxQxSrvKitSelect"><option value="">Selecciona un kit</option></select><button class="btn ok" id="mxQxSrvAddKit" type="button">＋ Agregar kit</button><span class="badge">Puedes combinar kits con artículos sueltos.</span></div><div class="mx-qx-solo-picker"><label for="mxQxSrvSoloSearch"><b>＋ Producto individual desde Inventario</b></label><div class="mx-qx-relative"><input class="input" id="mxQxSrvSoloSearch" autocomplete="off" placeholder="🔎 Buscar clave, código de barras o descripción (sin kit)" aria-label="Buscar producto individual en inventario"><div class="mx-qx-med-drop mx-qx-solo-results" id="mxQxSrvSoloDrop" role="listbox" style="display:none"></div></div><small>Se agrega a esta hoja como producto suelto, sin modificar los kits guardados. Se permiten productos sin existencia.</small></div><div class="mx-qx-selected" id="mxQxSrvSelected"></div></div></div></div><div class="mx-qx-service-foot"><div class="mx-qx-service-summary" id="mxQxSrvSummary">0 kits · 0 productos · 0 pzs</div><div class="mx-qx-foot-actions"><button class="btn" id="mxQxSrvCancel" type="button">Cancelar</button><button class="btn" id="mxQxSrvPdf" type="button">📄 Enviar a PDF</button><button class="btn mx-qx-loan-btn" id="mxQxSrvLoan" type="button">💼 Registrar préstamo</button><button class="btn ok" id="mxQxSrvFinish" type="button">✅ Finalizar salida</button></div></div></div>`;
   document.body.appendChild(modal);
   $q('mxQxServiceClose').onclick=closeServiceModal;$q('mxQxSrvCancel').onclick=closeServiceModal;$q('mxQxSrvAddKit').onclick=addServiceKit;$q('mxQxSrvSaveMed').onclick=saveServiceDoctor;$q('mxQxSrvPdf').onclick=generateCurrentServiceOrderPdf;$q('mxQxSrvLoan').onclick=registerServiceLoan;$q('mxQxSrvFinish').onclick=finalizeService;
   $q('mxQxSrvService')?.addEventListener('change',async()=>{await refreshServiceFolioPreview().catch(()=>{});updateServiceSectionSummaries();if(qTxt($q('mxQxSrvService')?.value))setServiceSection('doctor',true);});
   window.addEventListener('mx-servicios-change',()=>{const prev=$q('mxQxSrvService')?.value||serviceState.serviceInitials;renderDestinationServices(prev);refreshServiceFolioPreview().catch(()=>{});});
   modal.addEventListener('mousedown',e=>{if(e.target===modal&&!serviceBusy)closeServiceModal();});
-  bindDoctorSearch();bindServiceAnestesiologoV261();bindServiceProgressiveSections();updateServiceSectionSummaries();
+  bindDoctorSearch();bindServiceAnestesiologoV261();bindServiceSoloSearchV265();bindServiceProgressiveSections();updateServiceSectionSummaries();
   return modal;
 }
 async function loadDoctors(force=false){const now=Date.now();if(!force&&doctorCache.length&&now-doctorCacheAt<60000)return doctorCache;doctorCache=await idbAll('medicos').catch(()=>[]);doctorCacheAt=now;return doctorCache;}
@@ -34325,6 +34599,41 @@ function renderServiceKitSelect(){
   const sel=$q('mxQxSrvKitSelect');if(!sel)return;const selected=new Set((serviceState.selectedKits||[]).map(k=>String(k.id)));sel.innerHTML='<option value="">Selecciona un kit</option>'+kitRows.map(k=>`<option value="${qEsc(k._id)}" ${selected.has(String(k._id))?'disabled':''}>${qEsc(k.nombre)} · ${qEsc(kitSummary(k))}</option>`).join('');
 }
 function addServiceKit(){const id=$q('mxQxSrvKitSelect')?.value;if(!id)return qAlert('Selecciona un kit para agregar.');if(serviceState.selectedKits.some(k=>String(k.id)===String(id)))return;const k=kitRows.find(x=>String(x._id)===String(id));if(!k)return;serviceState.selectedKits.push({id:k._id,nombre:qTxt(k.nombre),descripcion:qTxt(k.descripcion),anestesiologo:qTxt(k.anestesiologo),anestesiologo_cedula:qTxt(k.anestesiologo_cedula),productos:qClone(k.productos||[])||[]});setServiceSection('kits',false);renderServiceKits();renderServiceKitSelect();updateServiceSectionSummaries();}
+let soloSearchTokenV265=0;
+function renderSoloSearchResultsV265(rows=[],message=''){
+  const host=$q('mxQxSrvSoloDrop');if(!host)return;
+  if(!rows.length&&!message){host.style.display='none';host.innerHTML='';return;}
+  if(!rows.length){host.innerHTML=`<div style="padding:10px;color:#64748b">${qEsc(message)}</div>`;host.style.display='block';return;}
+  host.innerHTML=rows.map((r,i)=>`<button type="button" data-qx-solo-pick="${i}" role="option"><b>${qEsc(r.clave||r.codigo_barras||'SIN CLAVE')} · ${qEsc(r.descripcion||'Producto')}</b><small>Inventario · ${qEsc(r.unidad||'PIEZA')} · ${qInt(r.disponible)>0?'Disponibles: '+qInt(r.disponible):'⚠️ Sin existencia'} · ${mxInventorySearchFinHTMLV270(r)}</small></button>`).join('');host.style.display='block';
+  host.querySelectorAll('[data-qx-solo-pick]').forEach(btn=>btn.onclick=()=>{
+    const r=rows[Number(btn.dataset.qxSoloPick)];if(!r)return;
+    const key=qProdKey(r),found=serviceState.soloProducts.find(p=>qProdKey(p)===key);
+    if(found)found.cantidad=Math.max(1,qInt(found.cantidad))+1;
+    else serviceState.soloProducts.push({clave:qTxt(r.clave),codigo_barras:qTxt(r.codigo_barras),descripcion:qTxt(r.descripcion),unidad:qTxt(r.unidad)||'PIEZA',cantidad:1,costo_unitario:Math.max(0,qNum(r.costo_unitario)),precio_venta:Math.max(0,qNum(r.precio_venta)),fuente:'INVENTARIO',producto_suelto:true});
+    const input=$q('mxQxSrvSoloSearch');if(input){input.value='';input.focus();}
+    renderSoloSearchResultsV265();renderServiceKits();
+  });
+}
+function bindServiceSoloSearchV265(){
+  const input=$q('mxQxSrvSoloSearch');if(!input||input.dataset.qxSoloBound)return;input.dataset.qxSoloBound='1';
+  let timer=null;
+  const search=async()=>{
+    const seq=++soloSearchTokenV265,term=qNorm(input.value);
+    if(term.length<2){renderSoloSearchResultsV265();return;}
+    try{
+      const rows=await qInventoryCatalog(false);if(seq!==soloSearchTokenV265||input.value.trim()==='')return;
+      const results=rows.filter(r=>qNorm([r.clave,r.codigo_barras,r.descripcion].join(' ')).includes(term)).sort((a,b)=>{
+        const rank=r=>qNorm(r.clave)===term||qNorm(r.codigo_barras)===term?0:qNorm(r.clave).startsWith(term)?1:qNorm(r.descripcion).startsWith(term)?2:3;
+        return rank(a)-rank(b)||qTxt(a.descripcion).localeCompare(qTxt(b.descripcion),'es',{sensitivity:'base'});
+      }).slice(0,25);
+      renderSoloSearchResultsV265(results,results.length?'':'No se encontró el producto en Inventario.');
+    }catch(e){if(seq===soloSearchTokenV265)renderSoloSearchResultsV265([], 'No fue posible consultar Inventario.');console.warn('[Pedido · Productos sueltos]',e);}
+  };
+  input.addEventListener('input',()=>{clearTimeout(timer);if(qTxt(input.value).length<2){++soloSearchTokenV265;renderSoloSearchResultsV265();return;}timer=setTimeout(search,150);});
+  input.addEventListener('focus',()=>{if(qTxt(input.value).length>=2)search();});
+  input.addEventListener('keydown',e=>{if(e.key==='Escape'){renderSoloSearchResultsV265();}else if(e.key==='Enter'){const first=$q('mxQxSrvSoloDrop')?.querySelector('[data-qx-solo-pick]');if(first){e.preventDefault();first.click();}}});
+  document.addEventListener('pointerdown',e=>{const drop=$q('mxQxSrvSoloDrop');if(drop&&!drop.contains(e.target)&&e.target!==input)renderSoloSearchResultsV265();});
+}
 function serviceAggregate(){
   const map=new Map();
   for(const k of serviceState.selectedKits||[]){
@@ -34336,6 +34645,14 @@ function serviceAggregate(){
       if(!prev.costo_unitario&&cu>0)prev.costo_unitario=cu;if(!prev.precio_venta&&pv>0)prev.precio_venta=pv;
       map.set(key,prev);
     }
+  }
+  for(const p of serviceState.soloProducts||[]){
+    const qty=qInt(p.cantidad),key=qProdKey(p);if(!key||qty<=0)continue;
+    const prev=map.get(key)||{clave:qTxt(p.clave),codigo_barras:qTxt(p.codigo_barras),descripcion:qTxt(p.descripcion),unidad:qTxt(p.unidad)||'PIEZA',cantidad:0,costo_unitario:0,precio_venta:0,kits:new Set()};
+    prev.cantidad+=qty;prev.producto_suelto=true;
+    const cu=Math.max(0,qNum(p.costo_unitario)),pv=Math.max(0,qNum(p.precio_venta));
+    if(!prev.costo_unitario&&cu)prev.costo_unitario=cu;if(!prev.precio_venta&&pv)prev.precio_venta=pv;
+    map.set(key,prev);
   }
   return[...map.values()].map(x=>({...x,kits:[...x.kits]}));
 }
@@ -34364,18 +34681,34 @@ async function renderServiceKits(){
     const section=`<tr class="mx-qx-kit-divider"><td colspan="9"><div class="mx-qx-kit-divider-content"><div><b>🧰 KIT ${ki+1}: ${qEsc(k.nombre)}</b><small>${qEsc(k.descripcion||'')}${qTxt(k.anestesiologo)?` · Anestesiólogo: ${qEsc(k.anestesiologo)}`:''}<span class="mx-qx-financial-only"> · Costo ${qMoney(kitCost)} · Venta ref. ${qMoney(kitSale)}</span></small></div><button class="btn danger" type="button" data-qx-srv-del-kit="${ki}">Quitar kit</button></div></td></tr>`;
     return section+rows;
   });
+  const solo=serviceState.soloProducts||[];
+  if(solo.length){
+    let soloCost=0,soloSale=0;
+    const rows=solo.map((p,pi)=>{
+      const a=av?.get(qProdKey(p)),qty=Math.max(1,qInt(p.cantidad)||1),cost=Math.max(0,qNum(a?.costo_unitario??p.costo_unitario)),price=Math.max(0,qNum(a?.precio_venta??p.precio_venta));
+      const stock=av?Math.max(0,qInt(a?.disponible)):null,total=requested.get(qProdKey(p))||qty,missing=stock===null?null:Math.max(0,total-stock);
+      const css=stock===0?'mx-qx-kit-stock-none':missing>0?'mx-qx-kit-stock-low':'';
+      p.costo_unitario=cost;p.precio_venta=price;soloCost+=cost*qty;soloSale+=price*qty;
+      const status=stock===null?'Sin comprobar':stock===0?'SIN EXISTENCIA':missing>0?'INSUFICIENTE':'Disponible';
+      return `<tr class="mx-qx-kit-product-row ${css}"><td><b>${qEsc(p.clave||p.codigo_barras||'')}</b></td><td>${qEsc(p.descripcion||'')}<div><span class="mx-qx-stock-badge">${status}</span>${missing>0?` <small>Faltan ${missing} pzs · pedido permitido</small>`:''}</div></td><td style="font-weight:900">${stock===null?'—':stock}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price)}</td><td><input class="input" type="number" min="1" step="1" value="${qty}" aria-label="Cantidad producto individual ${qEsc(p.descripcion||p.clave||'')}" data-qx-solo-qty="${pi}"></td><td class="mx-qx-financial-only mx-qx-money">${qMoney(cost*qty)}</td><td class="mx-qx-financial-only mx-qx-money">${qMoney(price*qty)}</td><td><button class="btn danger" type="button" data-qx-solo-del="${pi}">Quitar</button></td></tr>`;
+    }).join('');
+    allCost+=soloCost;allSale+=soloSale;
+    blocks.push(`<tr class="mx-qx-kit-divider mx-qx-srv-solo"><td colspan="9"><div class="mx-qx-kit-divider-content"><div><b>📦 PRODUCTOS SUELTOS · SIN KIT</b><small>Productos elegidos directamente de Inventario${qFinancialOn()?` · Costo ${qMoney(soloCost)} · Venta ref. ${qMoney(soloSale)}`:''}</small></div></div></td></tr>`+rows);
+  }
   const alert=blocks.length?`<div class="mx-qx-srv-stock-notice" role="status">${av?(problems.length?`⚠️ ${problems.length} producto(s) con faltante (${zero} sin existencia); faltan ${shortage} piezas en total. El armado y préstamo quedan habilitados sin descontar inventario hasta finalizar.`:'✅ Disponibilidad suficiente para los kits seleccionados.'):'No se pudo verificar el inventario en este momento; el armado de kits continúa habilitado.'}</div>`:'';
-  host.innerHTML=blocks.length?`<div class="mx-qx-srv-unified-scroll"><table class="mx-qx-srv-table mx-qx-srv-unified-table"><thead><tr><th>Clave</th><th>Producto</th><th>Disponible</th><th class="mx-qx-financial-only">Costo unit.</th><th class="mx-qx-financial-only">Precio venta</th><th>Cantidad</th><th class="mx-qx-financial-only">Costo</th><th class="mx-qx-financial-only">Venta ref.</th><th>Acciones</th></tr></thead><tbody>${blocks.join('')}</tbody></table></div>${alert}`:'<div class="badge">Agrega uno o más kits configurados para preparar el servicio.</div>';
+  host.innerHTML=blocks.length?`<div class="mx-qx-srv-unified-scroll"><table class="mx-qx-srv-table mx-qx-srv-unified-table"><thead><tr><th>Clave</th><th>Producto</th><th>Disponible</th><th class="mx-qx-financial-only">Costo unit.</th><th class="mx-qx-financial-only">Precio venta</th><th>Cantidad</th><th class="mx-qx-financial-only">Costo</th><th class="mx-qx-financial-only">Venta ref.</th><th>Acciones</th></tr></thead><tbody>${blocks.join('')}</tbody></table></div>${alert}`:'<div class="badge">Agrega kits o productos individuales del inventario para preparar el pedido.</div>';
   host.querySelectorAll('[data-qx-srv-del-kit]').forEach(b=>b.onclick=()=>{serviceState.selectedKits.splice(Number(b.dataset.qxSrvDelKit),1);renderServiceKits();renderServiceKitSelect();updateServiceSectionSummaries();});
   host.querySelectorAll('[data-qx-srv-del-prod]').forEach(b=>b.onclick=()=>{const [ki,pi]=String(b.dataset.qxSrvDelProd).split(':').map(Number);serviceState.selectedKits[ki]?.productos?.splice(pi,1);renderServiceKits();updateServiceSectionSummaries();});
   host.querySelectorAll('[data-qx-srv-qty]').forEach(inp=>inp.onchange=()=>{const [ki,pi]=String(inp.dataset.qxSrvQty).split(':').map(Number),p=serviceState.selectedKits[ki]?.productos?.[pi];if(!p)return;p.cantidad=Math.max(1,qInt(inp.value)||1);inp.value=p.cantidad;renderServiceKits();updateServiceSectionSummaries();});
+  host.querySelectorAll('[data-qx-solo-del]').forEach(b=>b.onclick=()=>{serviceState.soloProducts.splice(Number(b.dataset.qxSoloDel),1);renderServiceKits();});
+  host.querySelectorAll('[data-qx-solo-qty]').forEach(inp=>inp.onchange=()=>{const p=serviceState.soloProducts[Number(inp.dataset.qxSoloQty)];if(!p)return;p.cantidad=Math.max(1,qInt(inp.value)||1);inp.value=p.cantidad;renderServiceKits();});
   updateServiceSummary({cost:allCost,sale:allSale});
 }
 
-function updateServiceSummary(fin={}){const rows=serviceAggregate(),qty=rows.reduce((s,x)=>s+qInt(x.cantidad),0),kits=serviceState.selectedKits.length;const el=$q('mxQxSrvSummary');if(el){let text=`${kits} kit${kits===1?'':'s'} · ${rows.length} producto${rows.length===1?'':'s'} · ${qty} pzs`;if(qFinancialOn())text+=` · Costo ${qMoney(fin.cost||0)} · Venta ref. ${qMoney(fin.sale||0)}`;el.textContent=text;}const k=$q('mxQxSumKits');if(k)k.textContent=`${kits} kits · ${rows.length} productos · ${qty} pzs`;updateServiceSectionSummaries();}
+function updateServiceSummary(fin={}){const rows=serviceAggregate(),qty=rows.reduce((s,x)=>s+qInt(x.cantidad),0),kits=serviceState.selectedKits.length;const el=$q('mxQxSrvSummary');if(el){let text=`${kits} kit${kits===1?'':'s'} · ${rows.length} producto${rows.length===1?'':'s'} · ${qty} pzs`;if(qFinancialOn())text+=` · Costo ${qMoney(fin.cost||0)} · Venta ref. ${qMoney(fin.sale||0)}`;el.textContent=text;}const k=$q('mxQxSumKits');if(k)k.textContent=`${kits} kits · ${serviceState.soloProducts?.length||0} sueltos · ${rows.length} productos · ${qty} pzs`;updateServiceSectionSummaries();}
 async function openServiceModal(){
-  ensureServiceModal();await loadKits();serviceState={folio:'',selectedKits:[],doctorId:null,anestId:null,anestCedula:'',serviceName:'',serviceInitials:''};
-  const ids=['mxQxSrvMedName','mxQxSrvMedCed','mxQxSrvMedTel','mxQxSrvMedDom','mxQxSrvAnestName','mxQxSrvPatient','mxQxSrvAge','mxQxSrvPatientTel'];ids.forEach(id=>{const e=$q(id);if(e)e.value='';});if($q('mxQxSrvSex'))$q('mxQxSrvSex').value='';if($q('mxQxSrvEye'))$q('mxQxSrvEye').value='';renderDestinationServices('');if($q('mxQxSrvService'))$q('mxQxSrvService').value='';$q('mxQxSrvDate').value=new Date().toLocaleString('es-MX');if($q('mxQxSrvAnestHelp'))$q('mxQxSrvAnestHelp').textContent='Opcional · Selecciona un nombre del catálogo de Médicos.';loadServiceAnestListV261().catch(()=>{});await refreshServiceFolioPreview();renderServiceKitSelect();renderServiceKits();updateServiceSectionSummaries();setServiceSection('destination',false);$q('mxQxServiceModal').classList.remove('hidden');setTimeout(()=>$q('mxQxSrvService')?.focus(),40);
+  ensureServiceModal();await loadKits();serviceState={folio:'',selectedKits:[],soloProducts:[],doctorId:null,anestId:null,anestCedula:'',serviceName:'',serviceInitials:''};
+  const ids=['mxQxSrvMedName','mxQxSrvMedCed','mxQxSrvMedTel','mxQxSrvMedDom','mxQxSrvAnestName','mxQxSrvPatient','mxQxSrvExpediente','mxQxSrvBirthDate','mxQxSrvAge','mxQxSrvPatientTel'];ids.forEach(id=>{const e=$q(id);if(e)e.value='';});if($q('mxQxSrvSex'))$q('mxQxSrvSex').value='';if($q('mxQxSrvEye'))$q('mxQxSrvEye').value='';renderDestinationServices('');if($q('mxQxSrvService'))$q('mxQxSrvService').value='';$q('mxQxSrvDate').value=new Date().toLocaleString('es-MX');if($q('mxQxSrvAnestHelp'))$q('mxQxSrvAnestHelp').textContent='Opcional · Selecciona un nombre del catálogo de Médicos.';loadServiceAnestListV261().catch(()=>{});await refreshServiceFolioPreview();renderServiceKitSelect();renderServiceKits();++soloSearchTokenV265;renderSoloSearchResultsV265();if($q('mxQxSrvSoloSearch'))$q('mxQxSrvSoloSearch').value='';if($q('mxQxSrvBirthDate'))$q('mxQxSrvBirthDate').max=qLocalYmd();if($q('mxQxSrvAge'))delete $q('mxQxSrvAge').dataset.qxFromBirth;updateServiceSectionSummaries();setServiceSection('destination',false);$q('mxQxServiceModal').classList.remove('hidden');setTimeout(()=>$q('mxQxSrvService')?.focus(),40);
 }
 function closeServiceModal(){if(serviceBusy)return;$q('mxQxServiceModal')?.classList.add('hidden');renderDoctorDrop([]);}
 async function hydrateExactDoctor(){
@@ -34405,7 +34738,7 @@ function serviceShortageText(shortages=[]){return (shortages||[]).filter(x=>qInt
 async function saveServiceShortageRows({shortages=[],fecha,usuario,kits=[],folio,destino,medico,paciente,eanPrestamo='',anestesiologo={}}){
   for(const s of shortages||[]){
     const missing=Math.max(0,qInt(s?.missing));if(!missing)continue;const p=s.item||{},needed=Math.max(missing,qInt(s?.needed)),fin=qFinanceOf(p||{}),unitCost=Math.max(0,qNum(p.costo_unitario||p.costo||fin?.costo_final||fin?.costo)),unitPrice=Math.max(0,qNum(p.precio_venta||p.precioVenta||fin?.precio_venta));
-    const reg={fecha,usuario,clave:qTxt(p.clave),codigo_barras:qTxt(p.codigo_barras||p.codigoBarras||p.barcode),descripcion:qTxt(p.descripcion||p.nombre),unidad:qTxt(p.unidad)||'PIEZA',lote:'',caducidad:'',costo_unitario:unitCost,costo:unitCost,precio_venta:unitPrice,valor_costo:0,valor_venta:0,valor_venta_solicitada:unitPrice*missing,pzs:0,cantidad:0,pzs_solicitadas:missing,cantidad_solicitada:missing,pzs_prestadas:0,pzs_surtidas_iniciales:0,pzs_utilizadas:0,pzs_devueltas:0,pzs_faltantes:missing,cantidad_faltante:missing,pzs_requeridas_kit:needed,pzs_surtidas_kit:Math.max(0,qInt(s?.supplied)),ex_ini:Math.max(0,qInt(s?.supplied)),ex_fin:0,tipo_doc:'Servicio quirúrgico',estado:'Faltante',prestamo_activo:false,ean_prestamo:qTxt(eanPrestamo),folio,servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(anestesiologo.nombre),anestesiologo_cedula:qTxt(anestesiologo.cedula),anestesiologo_id:anestesiologo.id??null,paciente:paciente.nombre,expediente:'',observaciones:`Servicio quirúrgico · Destino: ${destino.nombre} (${destino.iniciales}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')} · FALTANTE ${missing} PZS POR EXISTENCIA`,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,kits_quirurgicos:kits,servicio_quirurgico:true,kit_faltante:true,registro_sin_existencia:true,createdAt:new Date().toISOString()};
+    const reg={fecha,usuario,clave:qTxt(p.clave),codigo_barras:qTxt(p.codigo_barras||p.codigoBarras||p.barcode),descripcion:qTxt(p.descripcion||p.nombre),unidad:qTxt(p.unidad)||'PIEZA',lote:'',caducidad:'',costo_unitario:unitCost,costo:unitCost,precio_venta:unitPrice,valor_costo:0,valor_venta:0,valor_venta_solicitada:unitPrice*missing,pzs:0,cantidad:0,pzs_solicitadas:missing,cantidad_solicitada:missing,pzs_prestadas:0,pzs_surtidas_iniciales:0,pzs_utilizadas:0,pzs_devueltas:0,pzs_faltantes:missing,cantidad_faltante:missing,pzs_requeridas_kit:needed,pzs_surtidas_kit:Math.max(0,qInt(s?.supplied)),ex_ini:Math.max(0,qInt(s?.supplied)),ex_fin:0,tipo_doc:'Servicio quirúrgico',estado:'Faltante',prestamo_activo:false,producto_suelto:!!p.producto_suelto,ean_prestamo:qTxt(eanPrestamo),folio,servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(anestesiologo.nombre),anestesiologo_cedula:qTxt(anestesiologo.cedula),anestesiologo_id:anestesiologo.id??null,paciente:paciente.nombre,expediente:qTxt(paciente.expediente),fecha_nacimiento_paciente:qTxt(paciente.fecha_nacimiento),observaciones:`Servicio quirúrgico · Destino: ${destino.nombre} (${destino.iniciales}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')||'Ninguno (productos individuales)'} · FALTANTE ${missing} PZS POR EXISTENCIA`,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,producto_suelto:!!p.producto_suelto,kits_quirurgicos:kits,servicio_quirurgico:true,kit_faltante:true,registro_sin_existencia:true,createdAt:new Date().toISOString()};
     await saveSalida(reg);
   }
 }
@@ -34447,7 +34780,7 @@ function qPdfHtml(data,logos={}){
   const summary=isOrder?`<b>TOTAL SOLICITADO:</b> ${data.totalSolicitado||0} PIEZAS &nbsp;&nbsp;&nbsp; <b>TOTAL VENTA REFERENCIAL:</b> ${esc(qMoney(data.totalVenta||0))}`:`<b>SOLICITADO:</b> ${data.totalSolicitado||0} PIEZAS &nbsp;&nbsp; <b>SURTIDO:</b> ${data.totalSurtido||0} &nbsp;&nbsp; <b>FALTANTE:</b> ${data.totalFaltante||0} &nbsp;&nbsp; <b>PRESTADO INICIAL:</b> ${data.totalPrestadoInicial??data.totalSurtido??0} &nbsp;&nbsp; <b>DEVUELTO:</b> ${data.totalDevuelto??0} &nbsp;&nbsp; <b>TOTAL VENTA REFERENCIAL:</b> ${esc(qMoney(data.totalVenta||0))}`;
   const patientLine=`Nombre: ${data?.paciente?.nombre||'—'} · Edad: ${data?.paciente?.edad||'—'} · Sexo: ${data?.paciente?.sexo||'—'} · Ojo: ${data?.paciente?.ojo||'—'} · Tel: ${data?.paciente?.telefono||'—'}`;
   const doctorLine=`Médico: ${data?.medico?.nombre||'—'} · Céd.: ${data?.medico?.cedula||'—'}${data?.anestesiologo?.nombre?` · Anestesiólogo: ${data.anestesiologo.nombre}${data.anestesiologo.cedula?' · Céd.: '+data.anestesiologo.cedula:''}`:''} · Tel: ${data?.medico?.telefono||'—'}`;
-  return `<!doctype html><html><head><meta charset="utf-8"><style>@page{size:Letter landscape;margin:7mm}*{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#111;margin:0;font-size:8.2px}.official{position:relative;min-height:16mm;text-align:center;padding-top:1mm}.official .lg{position:absolute;left:0;top:0;width:62mm;height:16mm;object-fit:contain;object-position:left top}.official .rg{position:absolute;right:0;top:0;width:50mm;height:18mm;object-fit:contain;object-position:right top}.official .t3{font-weight:900;font-size:10px;margin-top:1px}.official .doc{font-weight:900;font-size:12px;margin-top:3px}.official .sub{font-size:7px;margin-top:2px}.info{width:100%;border-collapse:collapse;margin-top:1.5mm;table-layout:fixed}.info td{border:1px solid #111;padding:2px 3px;vertical-align:middle;height:5.2mm}.info .lab{font-weight:800;font-size:6.5px;width:14%}.info .val{font-size:7.2px}.info .wide{font-size:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tbl{width:100%;border-collapse:collapse;margin-top:3mm;table-layout:fixed}.tbl th,.tbl td{border:1px solid #111;padding:2.4px;vertical-align:top;word-break:break-word}.tbl th{background:#d7d7d7;text-align:center;font-size:6.7px}.tbl td{font-size:7px}.tbl .c{text-align:center}.tbl .money{text-align:right;white-space:nowrap}.tbl tr.blank td{height:6.5mm}.sum{text-align:right;font-size:8.8px;margin-top:3mm}.sign{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5mm;margin-top:10mm}.sig{border:1px solid #111;text-align:center;min-height:15mm;padding:2mm 2mm 1mm;font-size:6.7px}.sig .name{font-weight:800;min-height:5mm}.sig .line{border-top:1px solid #111;margin:2mm 2mm 1mm}.footer{display:flex;align-items:end;gap:3mm;margin-top:3mm;color:#555;font-size:6.2px}.footer img{width:58mm;height:6mm;object-fit:contain;object-position:left bottom}.footer span{flex:1;text-align:right}</style></head><body><div class="official">${leftLogo?`<img class="lg" src="${esc(leftLogo)}">`:''}${rightLogo?`<img class="rg" src="${esc(rightLogo)}">`:''}<div class="t3">${esc((est.nombre||'MACROXEL HOSPITALES').toUpperCase())}</div><div class="doc">${esc(docTitle)}</div><div class="sub">${esc(docSubtitle)}</div></div><table class="info"><tr><td class="lab">HOSPITAL</td><td class="val">${esc(est.nombre||'—')}</td><td class="lab">CLAVE DE LA UNIDAD</td><td class="val">${esc(unitKey||'—')}</td></tr><tr><td class="lab">SERVICIO</td><td class="val">${esc(service)}</td><td class="lab">FECHA</td><td class="val">${esc(data?.fechaTexto||'—')}</td></tr><tr><td class="lab">FOLIO</td><td class="val"><b>${esc(data?.folio||'—')}</b></td><td class="lab">DOCUMENTO</td><td class="val">${esc(isOrder?'PEDIDO':'SOLICITUD')}</td></tr><tr><td class="lab">PACIENTE</td><td class="wide" colspan="3">${esc(patientLine)}</td></tr><tr><td class="lab">MÉDICO SOLICITANTE</td><td class="wide" colspan="3">${esc(doctorLine)}</td></tr><tr><td class="lab">USUARIO FARMACIA</td><td class="val">${esc(data?.usuario||'—')}</td><td class="lab">ESTADO</td><td class="val">${esc(isOrder?'PEDIDO PREVIO · SIN AFECTAR INVENTARIO':'SOLICITUD REGISTRADA')}</td></tr></table><table class="tbl"><colgroup><col style="width:3%"><col style="width:9%"><col style="width:27%"><col style="width:12%"><col style="width:7%"><col style="width:7%"><col style="width:15%"><col style="width:9%"><col style="width:11%"></colgroup><thead><tr><th>#</th><th>CLAVE</th><th>PRODUCTO</th><th>PRESENTACIÓN</th><th>SOLIC.</th><th>SURT.</th><th>LOTE / CADUCIDAD</th><th>PRECIO VENTA</th><th>TOTAL</th></tr></thead><tbody>${rows}${blankRows}</tbody></table><div class="sum">${summary}</div><div class="sign"><div class="sig"><div class="name">${esc(data?.medico?.nombre||'')}</div><div class="line"></div><b>MÉDICO SOLICITANTE · FIRMA</b></div><div class="sig"><div class="name">${esc(data?.paciente?.nombre||'')}</div><div class="line"></div><b>PACIENTE / RESPONSABLE · RECIBE</b></div><div class="sig"><div class="name">${esc(data?.usuario||'')}</div><div class="line"></div><b>FARMACIA · SURTE</b></div></div><div class="footer">${footerLogo?`<img src="${esc(footerLogo)}">`:''}<span>${esc(isOrder?`Pedido para servicio ${qServicePdfDestinationName(data)} generado por Macroxel Hospitales. No modifica inventario.`:`Solicitud para servicio ${qServicePdfDestinationName(data)} generada por Macroxel Hospitales.`)}</span></div></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><style>@page{size:Letter landscape;margin:7mm}*{box-sizing:border-box}body{font-family:Arial,sans-serif;color:#111;margin:0;font-size:8.2px}.official{position:relative;min-height:16mm;text-align:center;padding-top:1mm}.official .lg{position:absolute;left:0;top:0;width:62mm;height:16mm;object-fit:contain;object-position:left top}.official .rg{position:absolute;right:0;top:0;width:50mm;height:18mm;object-fit:contain;object-position:right top}.official .t3{font-weight:900;font-size:10px;margin-top:1px}.official .doc{font-weight:900;font-size:12px;margin-top:3px}.official .sub{font-size:7px;margin-top:2px}.info{width:100%;border-collapse:collapse;margin-top:1.5mm;table-layout:fixed}.info td{border:1px solid #111;padding:2px 3px;vertical-align:middle;height:5.2mm}.info .lab{font-weight:800;font-size:6.5px;width:14%}.info .val{font-size:7.2px}.info .wide{font-size:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tbl{width:100%;border-collapse:collapse;margin-top:3mm;table-layout:fixed}.tbl th,.tbl td{border:1px solid #111;padding:2.4px;vertical-align:top;word-break:break-word}.tbl th{background:#d7d7d7;text-align:center;font-size:6.7px}.tbl td{font-size:7px}.tbl .c{text-align:center}.tbl .money{text-align:right;white-space:nowrap}.tbl tr.blank td{height:6.5mm}.sum{text-align:right;font-size:8.8px;margin-top:3mm}.sign{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5mm;margin-top:10mm}.sig{border:1px solid #111;text-align:center;min-height:15mm;padding:2mm 2mm 1mm;font-size:6.7px}.sig .name{font-weight:800;min-height:5mm}.sig .line{border-top:1px solid #111;margin:2mm 2mm 1mm}.footer{display:flex;align-items:end;gap:3mm;margin-top:3mm;color:#555;font-size:6.2px}.footer img{width:58mm;height:6mm;object-fit:contain;object-position:left bottom}.footer span{flex:1;text-align:right}</style></head><body><div class="official">${leftLogo?`<img class="lg" src="${esc(leftLogo)}">`:''}${rightLogo?`<img class="rg" src="${esc(rightLogo)}">`:''}<div class="t3">${esc((est.nombre||'MACROXEL HOSPITALES').toUpperCase())}</div><div class="doc">${esc(docTitle)}</div><div class="sub">${esc(docSubtitle)}</div></div><table class="info"><tr><td class="lab">HOSPITAL</td><td class="val">${esc(est.nombre||'—')}</td><td class="lab">CLAVE DE LA UNIDAD</td><td class="val">${esc(unitKey||'—')}</td></tr><tr><td class="lab">SERVICIO</td><td class="val">${esc(service)}</td><td class="lab">FECHA</td><td class="val">${esc(data?.fechaTexto||'—')}</td></tr><tr><td class="lab">FOLIO</td><td class="val"><b>${esc(data?.folio||'—')}</b></td><td class="lab">DOCUMENTO</td><td class="val">${esc(isOrder?'PEDIDO':'SOLICITUD')}</td></tr><tr><td class="lab">PACIENTE</td><td class="wide" colspan="3">${esc(patientLine)}</td></tr><tr><td class="lab">EXPEDIENTE</td><td class="val">${esc(data?.paciente?.expediente||'—')}</td><td class="lab">FECHA NACIMIENTO</td><td class="val">${esc(data?.paciente?.fecha_nacimiento?qDateDisplay(data.paciente.fecha_nacimiento):'—')}</td></tr><tr><td class="lab">MÉDICO SOLICITANTE</td><td class="wide" colspan="3">${esc(doctorLine)}</td></tr><tr><td class="lab">USUARIO FARMACIA</td><td class="val">${esc(data?.usuario||'—')}</td><td class="lab">ESTADO</td><td class="val">${esc(isOrder?'PEDIDO PREVIO · SIN AFECTAR INVENTARIO':'SOLICITUD REGISTRADA')}</td></tr></table><table class="tbl"><colgroup><col style="width:3%"><col style="width:9%"><col style="width:27%"><col style="width:12%"><col style="width:7%"><col style="width:7%"><col style="width:15%"><col style="width:9%"><col style="width:11%"></colgroup><thead><tr><th>#</th><th>CLAVE</th><th>PRODUCTO</th><th>PRESENTACIÓN</th><th>SOLIC.</th><th>SURT.</th><th>LOTE / CADUCIDAD</th><th>PRECIO VENTA</th><th>TOTAL</th></tr></thead><tbody>${rows}${blankRows}</tbody></table><div class="sum">${summary}</div><div class="sign"><div class="sig"><div class="name">${esc(data?.medico?.nombre||'')}</div><div class="line"></div><b>MÉDICO SOLICITANTE · FIRMA</b></div><div class="sig"><div class="name">${esc(data?.paciente?.nombre||'')}</div><div class="line"></div><b>PACIENTE / RESPONSABLE · RECIBE</b></div><div class="sig"><div class="name">${esc(data?.usuario||'')}</div><div class="line"></div><b>FARMACIA · SURTE</b></div></div><div class="footer">${footerLogo?`<img src="${esc(footerLogo)}">`:''}<span>${esc(isOrder?`Pedido para servicio ${qServicePdfDestinationName(data)} generado por Macroxel Hospitales. No modifica inventario.`:`Solicitud para servicio ${qServicePdfDestinationName(data)} generada por Macroxel Hospitales.`)}</span></div></body></html>`;
 }
 function drawQxBlankGrid(doc,startY,endY,startNo,widths){const left=8,rowH=7,rows=Math.max(0,Math.floor((endY-startY)/rowH));if(!rows)return startY;const xs=[left];widths.forEach(w=>xs.push(xs.at(-1)+w));doc.setDrawColor(0);doc.setLineWidth(.22);for(let i=0;i<rows;i++){const y=startY+i*rowH;doc.rect(left,y,widths.reduce((a,b)=>a+b,0),rowH);for(let c=1;c<xs.length-1;c++)doc.line(xs[c],y,xs[c],y+rowH);doc.setFont('helvetica','normal');doc.setFontSize(5.2);doc.text(String(startNo+i),left+widths[0]/2,y+4.5,{align:'center'});}return startY+rows*rowH;}
 
@@ -34476,7 +34809,7 @@ function qServicePdfFallbackBuild(data,assets={}){
   const text=(x,yy,size,value,bold=false,align='left')=>{let tx=x;if(align==='center')tx=x-(String(value||'').length*size*.25);if(align==='right')tx=x-(String(value||'').length*size*.5);c+=`BT /${bold?'F2':'F1'} ${f(size)} Tf ${f(tx)} ${f(yy)} Td (${qServicePdfFallbackEsc(value)}) Tj ET\n`;},line=(x1,y1,x2,y2)=>{c+=`${f(x1)} ${f(y1)} m ${f(x2)} ${f(y2)} l S\n`;},rect=(x,yy,w,h,fill=false)=>{c+=`${fill?'.92 g ':''}${f(x)} ${f(yy)} ${f(w)} ${f(h)} re ${fill?'f 0 g':'S'}\n`;};
   const imgCmd=(name,img,x,top,maxW,maxH,align='left')=>{if(!img?.width||!img?.height)return;const sc=Math.min(maxW/img.width,maxH/img.height),iw=img.width*sc,ih=img.height*sc,ix=align==='right'?x+maxW-iw:x,iy=PH-top-ih;c+=`q ${f(iw)} 0 0 ${f(ih)} ${f(ix)} ${f(iy)} cm /${name} Do Q\n`;};
   const money=v=>'$'+n(v).toFixed(2),tableHead=()=>{const h=18;rect(M,y-h,TW,h,true);for(let i=1;i<xs.length-1;i++)line(xs[i],y-h,xs[i],y);['#','CLAVE','PRODUCTO','PRESENT.','SOLIC.','SURT.','LOTE / CAD.','P. VENTA','TOTAL'].forEach((v,i)=>text(xs[i]+3,y-12,6.3,v,true));y-=h;};
-  const begin=(cont=false)=>{c='0 G 0 g 0.55 w\n';imgCmd('ImL',assets.left,M,7,175,44,'left');imgCmd('ImR',assets.right,PW-M-155,5,155,50,'right');y=PH-M-12;text(PW/2,y,Math.max(7,Math.min(11,380/Math.max(1,title.length)*1.9)),title,true,'center');y-=32;text(M,y,7,`Servicio: ${data?.destino?.nombre||'—'}${data?.destino?.iniciales?' ('+data.destino.iniciales+')':''}`);text(420,y,7,`Fecha: ${data?.fechaTexto||'—'}`);text(575,y,7,cont?`Continuacion · Folio: ${data?.folio||''}`:`Folio: ${data?.folio||''}`,true,'left');y-=12;text(M,y,6.8,`Paciente: ${data?.paciente?.nombre||'—'} · Edad: ${data?.paciente?.edad||'—'} · Sexo: ${data?.paciente?.sexo||'—'} · Ojo: ${data?.paciente?.ojo||'—'} · Tel: ${data?.paciente?.telefono||'—'}`);y-=12;text(M,y,6.6,`Medico: ${data?.medico?.nombre||'—'} · Cedula: ${data?.medico?.cedula||'—'}${data?.anestesiologo?.nombre?` · Anestesiologo: ${data.anestesiologo.nombre}`:''} · Tel: ${data?.medico?.telefono||'—'}`);y-=8;line(M,y,PW-M,y);y-=8;tableHead();};
+  const begin=(cont=false)=>{c='0 G 0 g 0.55 w\n';imgCmd('ImL',assets.left,M,7,175,44,'left');imgCmd('ImR',assets.right,PW-M-155,5,155,50,'right');y=PH-M-12;text(PW/2,y,Math.max(7,Math.min(11,380/Math.max(1,title.length)*1.9)),title,true,'center');y-=32;text(M,y,7,`Servicio: ${data?.destino?.nombre||'—'}${data?.destino?.iniciales?' ('+data.destino.iniciales+')':''}`);text(420,y,7,`Fecha: ${data?.fechaTexto||'—'}`);text(575,y,7,cont?`Continuacion · Folio: ${data?.folio||''}`:`Folio: ${data?.folio||''}`,true,'left');y-=12;text(M,y,6.8,`Paciente: ${data?.paciente?.nombre||'—'} · Edad: ${data?.paciente?.edad||'—'} · Sexo: ${data?.paciente?.sexo||'—'} · Ojo: ${data?.paciente?.ojo||'—'} · Tel: ${data?.paciente?.telefono||'—'}`);y-=12;text(M,y,6.8,`Expediente: ${data?.paciente?.expediente||'—'} · Fecha de nacimiento: ${data?.paciente?.fecha_nacimiento?qDateDisplay(data.paciente.fecha_nacimiento):'—'}`);y-=12;text(M,y,6.6,`Medico: ${data?.medico?.nombre||'—'} · Cedula: ${data?.medico?.cedula||'—'}${data?.anestesiologo?.nombre?` · Anestesiologo: ${data.anestesiologo.nombre}`:''} · Tel: ${data?.medico?.telefono||'—'}`);y-=8;line(M,y,PW-M,y);y-=8;tableHead();};
   const finish=()=>{imgCmd('ImF',assets.footer,M,PH-18,165,13,'left');pages.push(c)},need=h=>{if(y-h<78){finish();begin(true)}};begin(false);const items=Array.isArray(data?.items)?data.items:[];
   items.forEach((it,idx)=>{let parts={name:it?.descripcion||'',presentation:it?.unidad||''};try{if(typeof mxOrderPackagingParts==='function')parts=mxOrderPackagingParts(it)||parts}catch(_e){}const product=qServicePdfFallbackWrap(parts.name||it?.descripcion||'',34),lot=qServicePdfFallbackWrap(it?.lotes||'',18),pres=qServicePdfFallbackWrap(parts.presentation||it?.unidad||'',12),lines=Math.max(product.length,lot.length,pres.length,1),rh=Math.max(18,lines*8+6);need(rh);rect(M,y-rh,TW,rh,false);for(let i=1;i<xs.length-1;i++)line(xs[i],y-rh,xs[i],y);const req=qServicePdfRequestedQty(it),sup=qServicePdfSuppliedQty(it,isOrder),price=n(it?.precio_venta),total=price*(isOrder?req:sup);text(xs[0]+6,y-12,6.2,String(idx+1));text(xs[1]+3,y-12,6.2,it?.clave||it?.codigo_barras||'');product.forEach((v,j)=>text(xs[2]+3,y-12-j*8,5.8,v));pres.forEach((v,j)=>text(xs[3]+3,y-12-j*8,5.6,v));text(xs[4]+12,y-12,6.2,String(req||''));text(xs[5]+12,y-12,6.2,isOrder?'':String(sup||0));lot.forEach((v,j)=>text(xs[6]+3,y-12-j*8,5.6,v));text(xs[7]+4,y-12,6.0,money(price));text(xs[8]+4,y-12,6.0,money(total),true);y-=rh;});
   need(70);y-=14;text(M,y,8,isOrder?`TOTAL SOLICITADO: ${data?.totalSolicitado||0} PIEZAS`:`SOLICITADO: ${data?.totalSolicitado||0} · SURTIDO: ${data?.totalSurtido||0} · FALTANTE: ${data?.totalFaltante||0}`,true);text(PW-M,y,8,`TOTAL VENTA: ${money(data?.totalVenta||0)}`,true,'right');y-=25;const sigW=220;[M,M+258,M+516].forEach(x=>line(x,y,x+sigW,y));y-=11;text(M+10,y,6.2,'MEDICO SOLICITANTE · FIRMA',true);text(M+268,y,6.2,'PACIENTE / RESPONSABLE · RECIBE',true);text(M+526,y,6.2,'FARMACIA · SURTE',true);finish();
@@ -34499,12 +34832,13 @@ async function printServicePdf(rawData){
   const drawFooterLogo=()=>{addImageFit(logos?.footer||'',8,h-11.1,58,6.2,'left')};
   const fitLine=(value,x,y,maxW,size=5.45,style='normal')=>{let s=safe(value||'—'),fs=size;doc.setFont('helvetica',style);while(fs>4.15){doc.setFontSize(fs);if(doc.getTextWidth(s)<=maxW)break;fs-=.18}if(doc.getTextWidth(s)>maxW){let cut=s;while(cut.length>5&&doc.getTextWidth(cut+'...')>maxW)cut=cut.slice(0,-1);s=cut+'...'}doc.text(s,x,y)};
   const drawHeader=(continuation=false)=>{drawConfiguredLogos();doc.setTextColor(0);doc.setFont('helvetica','bold');doc.setFontSize(9);doc.text(safe(String(est.nombre||'MACROXEL HOSPITALES').toUpperCase()),w/2,14,{align:'center'});doc.setFontSize(Math.max(6.3,Math.min(8.6,8.6*36/Math.max(36,pdfTitle.length))));doc.text(continuation?`${pdfTitle} · CONTINUACION`:pdfTitle,w/2,19,{align:'center'});if(continuation){doc.setFontSize(5.8);doc.text(`Folio ${safe(data.folio||'')}`,w-60,24.2,{align:'left'})}};
-  drawHeader(false);const topY=29,rowH=5.6,rowsN=6,boxH=rowH*rowsN,mid=w/2;doc.setDrawColor(0);doc.setLineWidth(.3);doc.rect(8,topY,w-16,boxH);for(let i=1;i<rowsN;i++)mxOrderPdfLine(doc,8,topY+i*rowH,w-8,topY+i*rowH,.18);[0,1,2,5].forEach(i=>mxOrderPdfLine(doc,mid,topY+i*rowH,mid,topY+(i+1)*rowH,.18));
+  drawHeader(false);const topY=29,rowH=5.6,rowsN=7,boxH=rowH*rowsN,mid=w/2;doc.setDrawColor(0);doc.setLineWidth(.3);doc.rect(8,topY,w-16,boxH);for(let i=1;i<rowsN;i++)mxOrderPdfLine(doc,8,topY+i*rowH,w-8,topY+i*rowH,.18);[0,1,2,6].forEach(i=>mxOrderPdfLine(doc,mid,topY+i*rowH,mid,topY+(i+1)*rowH,.18));
   const pair=(row,lbl1,val1,lbl2,val2)=>{const yy=topY+3.85+row*rowH;doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text(lbl1,10,yy);fitLine(val1,34,yy,mid-36,5.55);doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text(lbl2,mid+2,yy);fitLine(val2,mid+29,yy,w-8-(mid+31),5.55)};
   pair(0,'HOSPITAL',est.nombre||'—','CLAVE UNIDAD',unitKey||'—');pair(1,'SERVICIO',service,'FECHA',data.fechaTexto||'—');pair(2,'FOLIO',data.folio||'—','DOCUMENTO',isOrder?'PEDIDO':'SOLICITUD');
   const patientLine=`Nombre: ${data?.paciente?.nombre||'—'} · Edad: ${data?.paciente?.edad||'—'} · Sexo: ${data?.paciente?.sexo||'—'} · Ojo: ${data?.paciente?.ojo||'—'} · Tel: ${data?.paciente?.telefono||'—'}`;doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text('PACIENTE',10,topY+3.85+3*rowH);fitLine(patientLine,31,topY+3.85+3*rowH,w-41,5.45);
-  const doctorLine=`Médico: ${data?.medico?.nombre||'—'} · Céd.: ${data?.medico?.cedula||'—'}${data?.anestesiologo?.nombre?` · Anestesiólogo: ${data.anestesiologo.nombre}${data.anestesiologo.cedula?' · Céd.: '+data.anestesiologo.cedula:''}`:''} · Tel: ${data?.medico?.telefono||'—'}`;doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text('MÉDICO',10,topY+3.85+4*rowH);fitLine(doctorLine,31,topY+3.85+4*rowH,w-41,5.35);
-  pair(5,'USUARIO',data.usuario||'—','ESTADO',isOrder?'PEDIDO PREVIO · SIN AFECTAR INVENTARIO':'SOLICITUD REGISTRADA');
+  const patientExtra=`Expediente: ${data?.paciente?.expediente||'—'} · Fecha de nacimiento: ${data?.paciente?.fecha_nacimiento?qDateDisplay(data.paciente.fecha_nacimiento):'—'}`;doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text('DATOS',10,topY+3.85+4*rowH);fitLine(patientExtra,31,topY+3.85+4*rowH,w-41,5.45);
+  const doctorLine=`Médico: ${data?.medico?.nombre||'—'} · Céd.: ${data?.medico?.cedula||'—'}${data?.anestesiologo?.nombre?` · Anestesiólogo: ${data.anestesiologo.nombre}${data.anestesiologo.cedula?' · Céd.: '+data.anestesiologo.cedula:''}`:''} · Tel: ${data?.medico?.telefono||'—'}`;doc.setFont('helvetica','bold');doc.setFontSize(5.1);doc.text('MÉDICO',10,topY+3.85+5*rowH);fitLine(doctorLine,31,topY+3.85+5*rowH,w-41,5.35);
+  pair(6,'USUARIO',data.usuario||'—','ESTADO',isOrder?'PEDIDO PREVIO · SIN AFECTAR INVENTARIO':'SOLICITUD REGISTRADA');
   const widths=[7,23,70,30,18,18,39,28,30.4],body=data.items.map((it,i)=>{let parts={name:it.descripcion,presentation:it.unidad||'PIEZA'};try{if(typeof mxOrderPackagingParts==='function')parts=mxOrderPackagingParts(it)||parts}catch(_e){}const req=qServicePdfRequestedQty(it),sup=qServicePdfSuppliedQty(it,isOrder),price=qNum(it.precio_venta),lineTotal=price*(isOrder?req:sup);return[String(i+1),safe(it.clave||it.codigo_barras||''),safe(parts.name||it.descripcion),safe(parts.presentation||it.unidad||'PIEZA'),String(req||''),isOrder?'':String(sup||0),safe(it.lotes||''),safe(qMoney(price)),safe(qMoney(lineTotal))]});
   doc.autoTable({startY:topY+boxH+4,head:[['#','CLAVE','PRODUCTO','PRESENTACION','SOLIC.','SURT.','LOTE / CADUCIDAD','PRECIO VENTA','TOTAL']],body:body.length?body:[['','','','','','','','','']],theme:'grid',margin:{left:8,right:8,top:28,bottom:39},styles:{font:'helvetica',fontSize:5.45,cellPadding:.8,textColor:[0,0,0],lineColor:[0,0,0],lineWidth:.22,overflow:'linebreak',valign:'middle'},headStyles:{fillColor:[215,215,215],textColor:[0,0,0],fontStyle:'bold',halign:'center',fontSize:5.0},columnStyles:{0:{cellWidth:widths[0],halign:'center'},1:{cellWidth:widths[1]},2:{cellWidth:widths[2]},3:{cellWidth:widths[3]},4:{cellWidth:widths[4],halign:'center'},5:{cellWidth:widths[5],halign:'center'},6:{cellWidth:widths[6]},7:{cellWidth:widths[7],halign:'right'},8:{cellWidth:widths[8],halign:'right',fontStyle:'bold'}},didDrawPage:d=>{if((d?.pageNumber||1)>1)drawHeader(true)}});
   let last=doc.internal.getNumberOfPages();doc.setPage(last);const sigY=h-27.5,totalY=sigY-4.4,safeTop=totalY-6;let fy=doc.lastAutoTable?.finalY||(topY+boxH+4);if(fy<safeTop)drawQxBlankGrid(doc,fy,safeTop,data.items.length+1,widths);else{doc.addPage();last=doc.internal.getNumberOfPages();doc.setPage(last);drawHeader(true);drawQxBlankGrid(doc,29,safeTop,data.items.length+1,widths)}drawFooterLogo();doc.setFont('helvetica','bold');doc.setFontSize(6.5);if(isOrder){doc.text(`TOTAL SOLICITADO: ${data.totalSolicitado||0} PIEZAS`,9,totalY);doc.text(`TOTAL VENTA REFERENCIAL: ${safe(qMoney(data.totalVenta||0))}`,w-9,totalY,{align:'right'})}else{doc.text(`SOLICITADO: ${data.totalSolicitado||0} · SURTIDO: ${data.totalSurtido||0} · FALTANTE: ${data.totalFaltante||0}`,9,totalY);doc.text(`TOTAL VENTA REFERENCIAL: ${safe(qMoney(data.totalVenta||0))}`,w-9,totalY,{align:'right'})}try{mxOrderPdfSignatureBoxes?.(doc,w,sigY,[{label:'MEDICO SOLICITANTE · NOMBRE Y FIRMA',value:safe(data?.medico?.nombre||'')},{label:'PACIENTE / RESPONSABLE · NOMBRE Y FIRMA',value:safe(data?.paciente?.nombre||'')},{label:'FARMACIA SURTE · NOMBRE Y FIRMA',value:safe(data?.usuario||'')}],15.2)}catch(_e){}
@@ -34545,7 +34879,7 @@ function qGroupServiceRows(rows){
       (Array.isArray(x.kits_quirurgicos)?x.kits_quirurgicos:[]).forEach(k=>{if(qTxt(k))it.kits.add(qTxt(k));});itemsMap.set(key,it);
     }
     const prestamoActivo=rows.some(x=>x?.prestamo_activo===true)||positiveRows.some(x=>qNorm(x?.estado)==='prestado'),recuperado=!positiveRows.length&&!faltantes&&rows.some(x=>qNorm(x?.estado)==='recuperado'),estado=prestamoActivo?(rows.some(x=>x.prestamo_sin_descontar===true)?'Préstamo pendiente':(faltantes>0?'Prestado parcial':'Prestado')):(faltantes>0?(total>0?'Parcial':'Faltante'):(recuperado?'Recuperado':(qTxt(r.estado)||'Completa')));
-    out.push({folio:g.folio,rows,stamp:g.stamp,fecha:qDateYmd(r.fecha||r.createdAt),eanPrestamo:qTxt(rows.find(x=>qTxt(x.ean_prestamo||x.eanPrestamo))?.ean_prestamo||rows.find(x=>qTxt(x.ean_prestamo||x.eanPrestamo))?.eanPrestamo),medico:{nombre:qTxt(r.medico),cedula:qTxt(r.cedula),telefono:qTxt(r.telefono_medico),domicilio:qTxt(r.domicilio_medico)},anestesiologo:{nombre:qTxt(r.anestesiologo),cedula:qTxt(r.anestesiologo_cedula),id:r.anestesiologo_id??null},paciente:{nombre:qTxt(r.paciente),edad:qTxt(r.edad_paciente),sexo:qTxt(r.sexo_paciente),ojo:qTxt(r.ojo_operacion||r.ojo_operado||r.ojo||r.lateralidad),telefono:qTxt(r.telefono_paciente)},destino:{nombre:qTxt(r.servicio_destino||r.servicio||r.destino),iniciales:qTxt(r.servicio_iniciales)},kits:[...kits],total,faltantes,solicitadas,prestadas,devueltas,estado,prestamoActivo,usuario:qTxt(r.usuario),items:[...itemsMap.values()].map(it=>({...it,lotes:[...it.lotes].join(', '),kits:[...it.kits],cantidad_surtida:it.cantidad,prestada_inicial:it.prestada}))});
+    out.push({folio:g.folio,rows,stamp:g.stamp,fecha:qDateYmd(r.fecha||r.createdAt),eanPrestamo:qTxt(rows.find(x=>qTxt(x.ean_prestamo||x.eanPrestamo))?.ean_prestamo||rows.find(x=>qTxt(x.ean_prestamo||x.eanPrestamo))?.eanPrestamo),medico:{nombre:qTxt(r.medico),cedula:qTxt(r.cedula),telefono:qTxt(r.telefono_medico),domicilio:qTxt(r.domicilio_medico)},anestesiologo:{nombre:qTxt(r.anestesiologo),cedula:qTxt(r.anestesiologo_cedula),id:r.anestesiologo_id??null},paciente:{nombre:qTxt(r.paciente),expediente:qTxt(r.expediente),fecha_nacimiento:qTxt(r.fecha_nacimiento_paciente||r.fecha_nacimiento),edad:qTxt(r.edad_paciente),sexo:qTxt(r.sexo_paciente),ojo:qTxt(r.ojo_operacion||r.ojo_operado||r.ojo||r.lateralidad),telefono:qTxt(r.telefono_paciente)},destino:{nombre:qTxt(r.servicio_destino||r.servicio||r.destino),iniciales:qTxt(r.servicio_iniciales)},kits:[...kits],total,faltantes,solicitadas,prestadas,devueltas,estado,prestamoActivo,usuario:qTxt(r.usuario),items:[...itemsMap.values()].map(it=>({...it,lotes:[...it.lotes].join(', '),kits:[...it.kits],cantidad_surtida:it.cantidad,prestada_inicial:it.prestada}))});
   }
   return out.sort((a,b)=>b.stamp-a.stamp||b.folio.localeCompare(a.folio));
 }
@@ -34582,7 +34916,7 @@ function renderServiceHistory(){
     const date=qDateYmd(g.fecha||g.stamp);
     if(from&&date<from)return false;
     if(to&&date>to)return false;
-    return !term||qNorm([g.folio,g.destino?.nombre,g.destino?.iniciales,g.medico?.nombre,g.medico?.cedula,g.paciente?.nombre,g.paciente?.ojo,(g.kits||[]).join(' '),g.estado,g.eanPrestamo].join(' ')).includes(term);
+    return !term||qNorm([g.folio,g.destino?.nombre,g.destino?.iniciales,g.medico?.nombre,g.medico?.cedula,g.paciente?.nombre,g.paciente?.expediente,g.paciente?.fecha_nacimiento,g.paciente?.ojo,(g.kits||[]).join(' '),g.estado,g.eanPrestamo].join(' ')).includes(term);
   });
   $q('mxQxHistCount').textContent=`${rows.length} servicio${rows.length===1?'':'s'}`;
   body.innerHTML=rows.length?rows.slice(0,150).map(g=>{const buttons=[`<button class="btn" type="button" data-qx-hist-edit="${qEsc(g.folio)}">✏️ Editar</button>`];if(g.items.length||g.faltantes>0)buttons.push(`<button class="btn ok" type="button" data-qx-hist-pdf="${qEsc(g.folio)}">📄 PDF</button>`);if(g.eanPrestamo)buttons.push(`<button class="btn" type="button" data-qx-hist-label="${qEsc(g.folio)}">🏷️ Etiqueta</button>`);if(g.prestamoActivo){buttons.push(`<button class="btn" type="button" data-qx-hist-adjust="${qEsc(g.folio)}">↩️ Ajustar préstamo</button>`);buttons.push(`<button class="btn ok" type="button" data-qx-hist-finalize="${qEsc(g.folio)}">✅ Finalizar</button>`);}return `<tr><td><b>${qEsc(qDateDisplay(g.fecha))}</b></td><td><b>${qEsc(g.folio)}</b>${g.eanPrestamo?`<span class="mx-qx-ean-badge mx-qx-ean-text">${qEsc(g.eanPrestamo)}</span>`:''}</td><td>${qEsc(g.destino?.nombre||'—')}<small style="display:block;color:#64748b">${qEsc(g.destino?.iniciales||'')}</small></td><td>${qEsc(g.medico?.nombre||'—')}<small style="display:block;color:#64748b">Cédula: ${qEsc(g.medico?.cedula||'—')}${g.anestesiologo?.nombre?` · Anest.: ${qEsc(g.anestesiologo.nombre)}`:''}</small></td><td>${qEsc(g.paciente?.nombre||'—')}<small style="display:block;color:#64748b">${qEsc(g.paciente?.edad?g.paciente.edad+' años':'')} ${qEsc(g.paciente?.sexo||'')}${g.paciente?.ojo?' · Ojo: '+qEsc(g.paciente.ojo):''}</small></td><td><b>${g.items.length} producto${g.items.length===1?'':'s'} · ${g.solicitadas} solicitadas · ${g.prestadas} prestadas · ${g.total} surtidas finales${g.devueltas>0?' · '+g.devueltas+' devueltas':''}${g.faltantes>0?' · '+g.faltantes+' faltantes':''}</b><small style="display:block;color:#64748b">${qEsc((g.kits||[]).join(', ')||'Sin kit')}</small>${serviceHistoryStatusHtml(g)}</td><td><div class="mx-qx-history-actions">${buttons.join('')}</div></td></tr>`;}).join(''):'<tr><td colspan="7" class="mx-qx-history-empty">No hay servicios quirúrgicos con este filtro.</td></tr>';
@@ -34594,17 +34928,17 @@ function renderServiceHistory(){
 }
 async function loadServiceHistory(force=false){if(serviceHistoryBusy)return;serviceHistoryBusy=true;const b=$q('mxQxHistRefresh');if(b){b.disabled=true;b.textContent='Actualizando…';}try{serviceHistoryGroups=qGroupServiceRows(await qSurgicalRows(force));renderServiceHistory();}catch(e){console.error('[HISTORIAL SERVICIO QUIRURGICO]',e);const body=$q('mxQxHistBody');if(body)body.innerHTML=`<tr><td colspan="7" class="mx-qx-history-empty">No se pudo cargar el historial: ${qEsc(e?.message||e)}</td></tr>`;}finally{serviceHistoryBusy=false;if(b){b.disabled=false;b.textContent='↻ Actualizar';}}}
 function openServiceHistoryEdit(folio){
-  const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el servicio.');$q('mxQxHistEditModal')?.remove();const modal=document.createElement('div');modal.id='mxQxHistEditModal';modal.className='mx-qx-modal';const services=qConfiguredServices(),opts=services.map(s=>`<option value="${qEsc(s.iniciales)}" data-name="${qEsc(s.nombre)}" ${s.iniciales===g.destino?.iniciales?'selected':''}>${qEsc(s.nombre)} (${qEsc(s.iniciales)})</option>`).join('');modal.innerHTML=`<div class="mx-qx-edit-card"><div class="mx-qx-edit-head"><div><h3>✏️ Editar servicio quirúrgico</h3><small>Folio ${qEsc(g.folio)} · el folio asignado no cambia.</small></div><button class="mx-qx-x" id="mxQxHistEditX" type="button">×</button></div><div class="mx-qx-edit-body"><div class="mx-qx-edit-grid"><div class="mx-qx-field"><label>Fecha</label><input class="input" id="mxQxEditDate" type="date" value="${qEsc(g.fecha)}"></div><div class="mx-qx-field"><label>Servicio de destino</label><select class="select" id="mxQxEditService"><option value="">Selecciona servicio</option>${opts}</select></div><div class="mx-qx-field"><label>Nombre del médico</label><input class="input" id="mxQxEditMedName" value="${qEsc(g.medico?.nombre)}"></div><div class="mx-qx-field"><label>Cédula</label><input class="input" id="mxQxEditMedCed" value="${qEsc(g.medico?.cedula)}"></div><div class="mx-qx-field"><label>Anestesiólogo</label><input class="input" id="mxQxEditAnestName" list="mxQxEditAnestList" value="${qEsc(g.anestesiologo?.nombre||'')}" placeholder="Buscar en Médicos"><datalist id="mxQxEditAnestList"></datalist></div><div class="mx-qx-field"><label>Teléfono médico</label><input class="input" id="mxQxEditMedTel" value="${qEsc(g.medico?.telefono)}"></div><div class="mx-qx-field"><label>Domicilio médico</label><input class="input" id="mxQxEditMedDom" value="${qEsc(g.medico?.domicilio)}"></div><div class="mx-qx-field"><label>Nombre del paciente</label><input class="input" id="mxQxEditPatient" value="${qEsc(g.paciente?.nombre)}"></div><div class="mx-qx-field"><label>Edad</label><input class="input" id="mxQxEditAge" type="number" min="0" max="130" value="${qEsc(g.paciente?.edad)}"></div><div class="mx-qx-field"><label>Sexo</label><select class="select" id="mxQxEditSex"><option value="">Selecciona</option>${['Femenino','Masculino','Otro','No especificado'].map(v=>`<option ${qNorm(v)===qNorm(g.paciente?.sexo)?'selected':''}>${v}</option>`).join('')}</select></div><div class="mx-qx-field"><label>Ojo a operar</label><select class="select" id="mxQxEditEye"><option value="">Selecciona</option>${['Derecho','Izquierdo','Ambos'].map(v=>`<option ${qNorm(v)===qNorm(g.paciente?.ojo)?'selected':''}>${v}</option>`).join('')}</select></div><div class="mx-qx-field"><label>Teléfono paciente</label><input class="input" id="mxQxEditPatientTel" value="${qEsc(g.paciente?.telefono)}"></div><div class="mx-qx-edit-wide badge">Los productos y cantidades se ajustan en la opción préstamo cuando el folio sigue prestado. Aquí solo cambias los datos generales.</div></div></div><div class="mx-qx-edit-foot"><button class="btn" id="mxQxHistEditCancel" type="button">Cancelar</button><button class="btn ok" id="mxQxHistEditSave" type="button">💾 Guardar cambios</button></div></div>`;document.body.appendChild(modal);const close=()=>modal.remove();$q('mxQxHistEditX').onclick=close;$q('mxQxHistEditCancel').onclick=close;modal.addEventListener('mousedown',e=>{if(e.target===modal)close()});loadDoctors().then(all=>{const l=$q('mxQxEditAnestList');if(l)l.innerHTML=all.filter(m=>qTxt(m.nombre)).map(m=>`<option value="${qEsc(m.nombre)}"></option>`).join('');}).catch(()=>{});$q('mxQxHistEditSave').onclick=()=>saveServiceHistoryEdit(g,modal);
+  const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el servicio.');$q('mxQxHistEditModal')?.remove();const modal=document.createElement('div');modal.id='mxQxHistEditModal';modal.className='mx-qx-modal';const services=qConfiguredServices(),opts=services.map(s=>`<option value="${qEsc(s.iniciales)}" data-name="${qEsc(s.nombre)}" ${s.iniciales===g.destino?.iniciales?'selected':''}>${qEsc(s.nombre)} (${qEsc(s.iniciales)})</option>`).join('');modal.innerHTML=`<div class="mx-qx-edit-card"><div class="mx-qx-edit-head"><div><h3>✏️ Editar servicio quirúrgico</h3><small>Folio ${qEsc(g.folio)} · el folio asignado no cambia.</small></div><button class="mx-qx-x" id="mxQxHistEditX" type="button">×</button></div><div class="mx-qx-edit-body"><div class="mx-qx-edit-grid"><div class="mx-qx-field"><label>Fecha</label><input class="input" id="mxQxEditDate" type="date" value="${qEsc(g.fecha)}"></div><div class="mx-qx-field"><label>Servicio de destino</label><select class="select" id="mxQxEditService"><option value="">Selecciona servicio</option>${opts}</select></div><div class="mx-qx-field"><label>Nombre del médico</label><input class="input" id="mxQxEditMedName" value="${qEsc(g.medico?.nombre)}"></div><div class="mx-qx-field"><label>Cédula</label><input class="input" id="mxQxEditMedCed" value="${qEsc(g.medico?.cedula)}"></div><div class="mx-qx-field"><label>Anestesiólogo</label><input class="input" id="mxQxEditAnestName" list="mxQxEditAnestList" value="${qEsc(g.anestesiologo?.nombre||'')}" placeholder="Buscar en Médicos"><datalist id="mxQxEditAnestList"></datalist></div><div class="mx-qx-field"><label>Teléfono médico</label><input class="input" id="mxQxEditMedTel" value="${qEsc(g.medico?.telefono)}"></div><div class="mx-qx-field"><label>Domicilio médico</label><input class="input" id="mxQxEditMedDom" value="${qEsc(g.medico?.domicilio)}"></div><div class="mx-qx-field"><label>Nombre del paciente</label><input class="input" id="mxQxEditPatient" value="${qEsc(g.paciente?.nombre)}"></div><div class="mx-qx-field"><label>Expediente</label><input class="input" id="mxQxEditExpediente" value="${qEsc(g.paciente?.expediente)}"></div><div class="mx-qx-field"><label>Fecha de nacimiento</label><input class="input" type="date" id="mxQxEditBirthDate" max="${qLocalYmd()}" value="${qEsc(g.paciente?.fecha_nacimiento)}"></div><div class="mx-qx-field"><label>Edad</label><input class="input" id="mxQxEditAge" type="number" min="0" max="130" value="${qEsc(g.paciente?.edad)}"></div><div class="mx-qx-field"><label>Sexo</label><select class="select" id="mxQxEditSex"><option value="">Selecciona</option>${['Femenino','Masculino','Otro','No especificado'].map(v=>`<option ${qNorm(v)===qNorm(g.paciente?.sexo)?'selected':''}>${v}</option>`).join('')}</select></div><div class="mx-qx-field"><label>Ojo a operar</label><select class="select" id="mxQxEditEye"><option value="">Selecciona</option>${['Derecho','Izquierdo','Ambos'].map(v=>`<option ${qNorm(v)===qNorm(g.paciente?.ojo)?'selected':''}>${v}</option>`).join('')}</select></div><div class="mx-qx-field"><label>Teléfono paciente</label><input class="input" id="mxQxEditPatientTel" value="${qEsc(g.paciente?.telefono)}"></div><div class="mx-qx-edit-wide badge">Los productos y cantidades se ajustan en la opción préstamo cuando el folio sigue prestado. Aquí solo cambias los datos generales.</div></div></div><div class="mx-qx-edit-foot"><button class="btn" id="mxQxHistEditCancel" type="button">Cancelar</button><button class="btn ok" id="mxQxHistEditSave" type="button">💾 Guardar cambios</button></div></div>`;document.body.appendChild(modal);const close=()=>modal.remove();$q('mxQxHistEditX').onclick=close;$q('mxQxHistEditCancel').onclick=close;modal.addEventListener('mousedown',e=>{if(e.target===modal)close()});loadDoctors().then(all=>{const l=$q('mxQxEditAnestList');if(l)l.innerHTML=all.filter(m=>qTxt(m.nombre)).map(m=>`<option value="${qEsc(m.nombre)}"></option>`).join('');}).catch(()=>{});$q('mxQxHistEditSave').onclick=()=>saveServiceHistoryEdit(g,modal);
 }
 async function saveServiceHistoryEdit(group,modal){
-  const btn=$q('mxQxHistEditSave');if(btn){btn.disabled=true;btn.textContent='Guardando…';}try{const date=qTxt($q('mxQxEditDate')?.value)||group.fecha,sel=$q('mxQxEditService'),code=qTxt(sel?.value)||group.destino?.iniciales,name=qTxt(sel?.options?.[sel.selectedIndex]?.dataset?.name||group.destino?.nombre),medico={nombre:qTxt($q('mxQxEditMedName')?.value),cedula:qTxt($q('mxQxEditMedCed')?.value),telefono:qTxt($q('mxQxEditMedTel')?.value),domicilio:qTxt($q('mxQxEditMedDom')?.value)},paciente={nombre:qTxt($q('mxQxEditPatient')?.value),edad:qTxt($q('mxQxEditAge')?.value),sexo:qTxt($q('mxQxEditSex')?.value),ojo:qTxt($q('mxQxEditEye')?.value),telefono:qTxt($q('mxQxEditPatientTel')?.value)};const anestName=qTxt($q('mxQxEditAnestName')?.value),anestMatches=anestName?(await loadDoctors(true)).filter(m=>qNorm(m.nombre)===qNorm(anestName)):[];if(anestName&&anestMatches.length!==1)throw new Error('Selecciona un anestesiólogo único del catálogo de Médicos.');const anest=anestMatches[0]||null;if(!medico.nombre)throw new Error('Captura el nombre del médico.');if(!paciente.nombre)throw new Error('Captura el nombre del paciente.');if(!paciente.ojo)throw new Error('Selecciona el ojo a operar.');const now=new Date().toISOString(),kits=group.kits||[],updates=group.rows.map(r=>({...r,fecha:qDateDisplay(date),servicio:name||r.servicio,servicio_destino:name||r.servicio_destino,servicio_iniciales:code||r.servicio_iniciales,destino:name||r.destino,medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(anest?.nombre),anestesiologo_cedula:qTxt(anest?.cedula),anestesiologo_id:anest?._id??null,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,paciente:paciente.nombre,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,observaciones:`Servicio quirúrgico · Destino: ${name||group.destino?.nombre||'—'} (${code||group.destino?.iniciales||'—'}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}`,updatedAt:now}));if(window.electronSql?.transactionDurable)await window.electronSql.transactionDurable(updates.map(value=>({type:'put',store:'salidas',value})));else for(const value of updates)await window.idbPut('salidas',value);try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true;}catch(_e){}serviceHistoryRowsCache=[];serviceHistoryLoadedAt=0;try{await drawSalidas?.();}catch(_e){}await loadServiceHistory(true);modal.remove();qAlert(`✅ Servicio ${group.folio} actualizado. Los cambios ya se reflejan en Salidas.`);}catch(e){qAlert('No se pudieron guardar los cambios: '+(e?.message||e));}finally{if(btn&&document.body.contains(btn)){btn.disabled=false;btn.textContent='💾 Guardar cambios';}}}
+  const btn=$q('mxQxHistEditSave');if(btn){btn.disabled=true;btn.textContent='Guardando…';}try{const date=qTxt($q('mxQxEditDate')?.value)||group.fecha,sel=$q('mxQxEditService'),code=qTxt(sel?.value)||group.destino?.iniciales,name=qTxt(sel?.options?.[sel.selectedIndex]?.dataset?.name||group.destino?.nombre),medico={nombre:qTxt($q('mxQxEditMedName')?.value),cedula:qTxt($q('mxQxEditMedCed')?.value),telefono:qTxt($q('mxQxEditMedTel')?.value),domicilio:qTxt($q('mxQxEditMedDom')?.value)},paciente={nombre:qTxt($q('mxQxEditPatient')?.value),expediente:qTxt($q('mxQxEditExpediente')?.value),fecha_nacimiento:qTxt($q('mxQxEditBirthDate')?.value),edad:qTxt($q('mxQxEditAge')?.value),sexo:qTxt($q('mxQxEditSex')?.value),ojo:qTxt($q('mxQxEditEye')?.value),telefono:qTxt($q('mxQxEditPatientTel')?.value)};const anestName=qTxt($q('mxQxEditAnestName')?.value),anestMatches=anestName?(await loadDoctors(true)).filter(m=>qNorm(m.nombre)===qNorm(anestName)):[];if(anestName&&anestMatches.length!==1)throw new Error('Selecciona un anestesiólogo único del catálogo de Médicos.');const anest=anestMatches[0]||null;if(!medico.nombre)throw new Error('Captura el nombre del médico.');if(!paciente.nombre)throw new Error('Captura el nombre del paciente.');if(!paciente.ojo)throw new Error('Selecciona el ojo a operar.');const now=new Date().toISOString(),kits=group.kits||[],updates=group.rows.map(r=>({...r,fecha:qDateDisplay(date),servicio:name||r.servicio,servicio_destino:name||r.servicio_destino,servicio_iniciales:code||r.servicio_iniciales,destino:name||r.destino,medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(anest?.nombre),anestesiologo_cedula:qTxt(anest?.cedula),anestesiologo_id:anest?._id??null,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,paciente:paciente.nombre,expediente:paciente.expediente,fecha_nacimiento_paciente:paciente.fecha_nacimiento,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,observaciones:`Servicio quirúrgico · Destino: ${name||group.destino?.nombre||'—'} (${code||group.destino?.iniciales||'—'}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}`,updatedAt:now}));if(window.electronSql?.transactionDurable)await window.electronSql.transactionDurable(updates.map(value=>({type:'put',store:'salidas',value})));else for(const value of updates)await window.idbPut('salidas',value);try{window.__mxClearSqlCache?.('salidas');if(window.__mxSalidasCache)window.__mxSalidasCache.dirty=true;}catch(_e){}serviceHistoryRowsCache=[];serviceHistoryLoadedAt=0;try{await drawSalidas?.();}catch(_e){}await loadServiceHistory(true);modal.remove();qAlert(`✅ Servicio ${group.folio} actualizado. Los cambios ya se reflejan en Salidas.`);}catch(e){qAlert('No se pudieron guardar los cambios: '+(e?.message||e));}finally{if(btn&&document.body.contains(btn)){btn.disabled=false;btn.textContent='💾 Guardar cambios';}}}
 async function generateServiceHistoryPdf(folio,button){
   const g=serviceHistoryGroups.find(x=>x.folio===folio);if(!g)return qAlert('No se encontró el servicio.');const old=button?.textContent;if(button){button.disabled=true;button.textContent='Generando…';}try{const result=await printServicePdf({folio:g.folio,fechaTexto:qDateDisplay(g.fecha),destino:g.destino,medico:g.medico,anestesiologo:g.anestesiologo,paciente:g.paciente,kits:g.kits,items:g.items,usuario:g.usuario,totalPrestadoInicial:g.prestadas,totalDevuelto:g.devueltas});qAlert(`✅ PDF generado: ${result?.filename||('SERVICIO_QUIRURGICO_'+g.folio+'.pdf')}
 
 ${window.electronSql?.savePdfHtml?'Se guardó en Descargas > Macroxel Hospitales.':'Se descargó desde el navegador.'}`);}catch(e){console.error('[PDF SERVICIO QUIRURGICO MANUAL]',e);qAlert('No se pudo generar el PDF: '+(e?.message||e));}finally{if(button){button.disabled=false;button.textContent=old||'📄 Generar PDF';}}}
-function getCurrentServiceDraft(){return {anestesiologo:{nombre:qTxt($q('mxQxSrvAnestName')?.value),cedula:qTxt(serviceState.anestCedula),id:serviceState.anestId??null},medico:{nombre:qTxt($q('mxQxSrvMedName')?.value),cedula:qTxt($q('mxQxSrvMedCed')?.value),telefono:qTxt($q('mxQxSrvMedTel')?.value),domicilio:qTxt($q('mxQxSrvMedDom')?.value)},paciente:{nombre:qTxt($q('mxQxSrvPatient')?.value),edad:qTxt($q('mxQxSrvAge')?.value),sexo:qTxt($q('mxQxSrvSex')?.value),ojo:qTxt($q('mxQxSrvEye')?.value),telefono:qTxt($q('mxQxSrvPatientTel')?.value)},items:serviceAggregate(),destino:selectedDestinationService()};}
+function getCurrentServiceDraft(){return {anestesiologo:{nombre:qTxt($q('mxQxSrvAnestName')?.value),cedula:qTxt(serviceState.anestCedula),id:serviceState.anestId??null},medico:{nombre:qTxt($q('mxQxSrvMedName')?.value),cedula:qTxt($q('mxQxSrvMedCed')?.value),telefono:qTxt($q('mxQxSrvMedTel')?.value),domicilio:qTxt($q('mxQxSrvMedDom')?.value)},paciente:{nombre:qTxt($q('mxQxSrvPatient')?.value),expediente:qTxt($q('mxQxSrvExpediente')?.value),fecha_nacimiento:qTxt($q('mxQxSrvBirthDate')?.value),edad:qTxt($q('mxQxSrvAge')?.value),sexo:qTxt($q('mxQxSrvSex')?.value),ojo:qTxt($q('mxQxSrvEye')?.value),telefono:qTxt($q('mxQxSrvPatientTel')?.value)},items:serviceAggregate(),destino:selectedDestinationService()};}
 async function generateCurrentServiceOrderPdf(){
-  if(serviceBusy)return;const btn=$q('mxQxSrvPdf'),old=btn?.textContent;try{await hydrateExactDoctor();await hydrateServiceAnestesiologoV261(true);await refreshServiceFolioPreview();const draft=getCurrentServiceDraft();if(!draft.destino)return qAlert('Selecciona el servicio de destino antes de generar el PDF.');if(!draft.paciente.ojo)return qAlert('Selecciona el ojo a operar antes de generar el PDF.');if(!draft.items.length)return qAlert('Agrega al menos un kit con productos antes de generar el PDF.');const folio=qTxt($q('mxQxSrvFolio')?.value)||qTxt(serviceState.folio)||'BORRADOR',kits=(serviceState.selectedKits||[]).map(k=>qTxt(k.nombre)).filter(Boolean),fechaTexto=qTxt($q('mxQxSrvDate')?.value)||new Date().toLocaleString('es-MX');if(btn){btn.disabled=true;btn.textContent='Generando PDF…';}const result=await printServicePdf({pdfMode:'pedido',folio,fechaTexto,destino:draft.destino,medico:draft.medico,anestesiologo:draft.anestesiologo,paciente:draft.paciente,kits,items:draft.items,usuario:getLoggedUserLabel?.()||''});qAlert(`✅ Pedido enviado a PDF${result?.filename?' · '+result.filename:''}.
+  if(serviceBusy)return;const btn=$q('mxQxSrvPdf'),old=btn?.textContent;try{await hydrateExactDoctor();await hydrateServiceAnestesiologoV261(true);await refreshServiceFolioPreview();const draft=getCurrentServiceDraft();if(!draft.destino)return qAlert('Selecciona el servicio de destino antes de generar el PDF.');if(!draft.paciente.ojo)return qAlert('Selecciona el ojo a operar antes de generar el PDF.');if(!draft.items.length)return qAlert('Agrega un kit o un producto individual antes de generar el PDF.');const folio=qTxt($q('mxQxSrvFolio')?.value)||qTxt(serviceState.folio)||'BORRADOR',kits=(serviceState.selectedKits||[]).map(k=>qTxt(k.nombre)).filter(Boolean),fechaTexto=qTxt($q('mxQxSrvDate')?.value)||new Date().toLocaleString('es-MX');if(btn){btn.disabled=true;btn.textContent='Generando PDF…';}const result=await printServicePdf({pdfMode:'pedido',folio,fechaTexto,destino:draft.destino,medico:draft.medico,anestesiologo:draft.anestesiologo,paciente:draft.paciente,kits,items:draft.items,usuario:getLoggedUserLabel?.()||''});qAlert(`✅ Pedido enviado a PDF${result?.filename?' · '+result.filename:''}.
 
 No se modificó inventario ni se registró la salida.`);}catch(e){console.error('[PDF PEDIDO SERVICIO]',e);qAlert('No se pudo generar el PDF del pedido: '+(e?.message||e));}finally{if(btn){btn.disabled=false;btn.textContent=old||'📄 Enviar a PDF';}}
 }
@@ -34619,7 +34953,7 @@ async function registerServiceLoan(){
   if(!medico.nombre)return qAlert('Captura o selecciona el nombre del médico.');
   if(!paciente.nombre)return qAlert('Captura el nombre del paciente.');
   if(!paciente.ojo)return qAlert('Selecciona el ojo a operar.');
-  if(!serviceState.selectedKits.length||!items.length)return qAlert('Agrega un kit con productos.');
+  if(!items.length)return qAlert('Agrega al menos un kit o un producto individual de Inventario.');
   await ensureServiceDoctorLinked(medico);await refreshServiceFolioPreview();
   const total=items.reduce((s,x)=>s+Math.max(0,qInt(x.cantidad)),0);
   const previewFolio=serviceState.folio||'pendiente';
@@ -34656,11 +34990,11 @@ Puedes incluir productos sin existencia y ajustar las piezas realmente usadas. N
         pzs_prestadas:0,pzs_surtidas_iniciales:0,pzs_surtidas:0,
         pzs_utilizadas:qty,pzs_devueltas:0,pzs_no_utilizadas:0,cantidad_surtida:0,
         pzs_faltantes:0,cantidad_faltante:0,ex_ini:available,ex_fin:available,
-        prestamo_sin_descontar:true,movimiento_inventario_aplicado:false,prestamo_activo:true,
+        prestamo_sin_descontar:true,movimiento_inventario_aplicado:false,prestamo_activo:true,producto_suelto:!!item.producto_suelto,
         estado:'Préstamo pendiente',tipo_doc:'Servicio quirúrgico',ean_prestamo:eanPrestamo,folio,
         servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,
         medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(draft.anestesiologo?.nombre),anestesiologo_cedula:qTxt(draft.anestesiologo?.cedula),anestesiologo_id:draft.anestesiologo?.id??null,
-        paciente:paciente.nombre,expediente:'',telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,
+        paciente:paciente.nombre,expediente:qTxt(paciente.expediente),fecha_nacimiento_paciente:qTxt(paciente.fecha_nacimiento),telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,
         observaciones:`Préstamo pendiente · Kit sin descuento de Inventario · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}`,
         kits_quirurgicos:kits,servicio_quirurgico:true,createdAt:new Date().toISOString()
       });
@@ -34789,13 +35123,14 @@ A partir de este momento las piezas restantes quedarán registradas como salida 
 }
 async function finalizeService(){
   if(serviceBusy)return;await hydrateExactDoctor();try{await hydrateServiceAnestesiologoV261(true);}catch(e){return qAlert(e.message);}const draft=getCurrentServiceDraft(),medico=draft.medico,paciente=draft.paciente,items=draft.items,destino=draft.destino;
-  if(!destino)return qAlert('Selecciona el servicio de destino.');if(!medico.nombre)return qAlert('Captura o selecciona el nombre del médico.');if(!paciente.nombre)return qAlert('Captura el nombre del paciente.');if(!paciente.ojo)return qAlert('Selecciona el ojo a operar.');if(!serviceState.selectedKits.length)return qAlert('Agrega al menos un kit al servicio.');if(!items.length)return qAlert('Los kits seleccionados no tienen productos para surtir.');
+  if(!destino)return qAlert('Selecciona el servicio de destino.');if(!medico.nombre)return qAlert('Captura o selecciona el nombre del médico.');if(!paciente.nombre)return qAlert('Captura el nombre del paciente.');if(!paciente.ojo)return qAlert('Selecciona el ojo a operar.');if(!items.length)return qAlert('Agrega un kit con productos o algún producto individual de Inventario para surtir.');
   await ensureServiceDoctorLinked(medico);await refreshServiceFolioPreview();
   const total=items.reduce((s,x)=>s+qInt(x.cantidad),0),previewFolio=serviceState.folio||'pendiente';if(!await qConfirm(`¿Finalizar el servicio quirúrgico ${previewFolio}?
 
 Destino: ${destino.nombre} (${destino.iniciales})
 Kits: ${serviceState.selectedKits.length}
-Productos: ${items.length}
+Productos sueltos: ${(serviceState.soloProducts||[]).length}
+Productos distintos: ${items.length}
 Piezas requeridas: ${total}
 
 La falta de existencia NO bloqueará el armado del kit. El sistema descontará únicamente las piezas disponibles y dejará identificados los faltantes, sin generar inventario negativo.`))return;
@@ -34808,12 +35143,12 @@ La falta de existencia NO bloqueará el armado del kit. El sistema descontará �
     for(const a of alloc){
       const r=a.match,p=a.item,qty=a.qty,prod={clave:qTxt(r.clave||p.clave),codigo_barras:qTxt(r.codigo_barras||r.codigoBarras||r.barcode||p.codigo_barras),descripcion:qTxt(r.descripcion||r.nombre||p.descripcion),unidad:qTxt(r.unidad||p.unidad),lote:qTxt(r.lote),caducidad:qTxt(r.caducidad||r.cad).slice(0,10)};const fin=qFinanceOf(r||{}),unitCost=Math.max(0,qNum(fin?.costo_final||fin?.costo||r.costo_unitario||r.costo||p.costo_unitario||p.costo)),unitPrice=Math.max(0,qNum(fin?.precio_venta||r.precio_venta||r.precioVenta||p.precio_venta||p.precioVenta));
       await upsertInventario(prod,-qty,{accion:'Servicio quirúrgico',detalle:`Servicio quirúrgico ${folio} · Destino: ${destino.nombre} (${destino.iniciales}) · ${qty} pzs · Kits: ${kits.join(', ')}`,usuario});
-      const reg={fecha,usuario,clave:prod.clave,codigo_barras:prod.codigo_barras,descripcion:prod.descripcion,unidad:prod.unidad,lote:prod.lote,caducidad:prod.caducidad,costo_unitario:unitCost,costo:unitCost,precio_venta:unitPrice,valor_costo:unitCost*qty,valor_venta:unitPrice*qty,pzs:qty,ex_ini:a.exIni,ex_fin:Math.max(0,a.exIni-qty),tipo_doc:'Servicio quirúrgico',estado:missingTotal>0?'Parcial':'Completa',folio,servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(draft.anestesiologo?.nombre),anestesiologo_cedula:qTxt(draft.anestesiologo?.cedula),anestesiologo_id:draft.anestesiologo?.id??null,paciente:paciente.nombre,expediente:'',observaciones:`Servicio quirúrgico · Destino: ${destino.nombre} (${destino.iniciales}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}${missingTotal>0?` · Faltantes del kit: ${missingTotal} pzs`:''}`,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,kits_quirurgicos:kits,servicio_quirurgico:true,createdAt:new Date().toISOString()};
+      const reg={fecha,usuario,clave:prod.clave,codigo_barras:prod.codigo_barras,descripcion:prod.descripcion,unidad:prod.unidad,lote:prod.lote,caducidad:prod.caducidad,costo_unitario:unitCost,costo:unitCost,precio_venta:unitPrice,valor_costo:unitCost*qty,valor_venta:unitPrice*qty,pzs:qty,ex_ini:a.exIni,ex_fin:Math.max(0,a.exIni-qty),tipo_doc:'Servicio quirúrgico',estado:missingTotal>0?'Parcial':'Completa',folio,servicio:destino.nombre,servicio_destino:destino.nombre,servicio_iniciales:destino.iniciales,destino:destino.nombre,medico:medico.nombre,cedula:medico.cedula,anestesiologo:qTxt(draft.anestesiologo?.nombre),anestesiologo_cedula:qTxt(draft.anestesiologo?.cedula),anestesiologo_id:draft.anestesiologo?.id??null,paciente:paciente.nombre,expediente:qTxt(paciente.expediente),fecha_nacimiento_paciente:qTxt(paciente.fecha_nacimiento),observaciones:`Servicio quirúrgico · Destino: ${destino.nombre} (${destino.iniciales}) · Ojo: ${paciente.ojo||'—'} · Kits: ${kits.join(', ')}${missingTotal>0?` · Faltantes del pedido: ${missingTotal} pzs`:''}`,telefono_medico:medico.telefono,domicilio_medico:medico.domicilio,edad_paciente:paciente.edad,sexo_paciente:paciente.sexo,ojo_operacion:paciente.ojo,telefono_paciente:paciente.telefono,producto_suelto:!!p.producto_suelto,kits_quirurgicos:kits,servicio_quirurgico:true,createdAt:new Date().toISOString()};
       await saveSalida(reg);
       try{const clas=qNorm(r.clasificacion||r.departamento||'');if(clas.includes('antibiot'))await saveAntibiotico({fecha:reg.fecha,clave:reg.clave,nombre:reg.descripcion,lote:reg.lote||'',pzs:reg.pzs||0,doctor:medico.nombre,cedula:medico.cedula,paciente:paciente.nombre,ojo_operacion:paciente.ojo,servicio:destino.nombre,servicio_iniciales:destino.iniciales,folio_doc:folio,tipo_doc:'Servicio quirúrgico',ex_ini:reg.ex_ini||0,ex_fin:reg.ex_fin||0});}catch(_e){}
     }
     if(shortages.length)await saveServiceShortageRows({shortages,fecha,usuario,kits,folio,destino,medico,paciente,anestesiologo:draft.anestesiologo});
-    await refreshServiceUiData();serviceBusy=false;if(btn){btn.disabled=false;btn.textContent='✅ Finalizar salida';}$q('mxQxServiceModal')?.classList.add('hidden');let finalMsg=`✅ Servicio quirúrgico ${folio} registrado para ${destino.nombre}.\n\nPiezas requeridas: ${total}\nPiezas surtidas: ${servedTotal}`;if(missingTotal>0)finalMsg+=`\nPiezas faltantes: ${missingTotal}\n\n⚠️ El kit se conservó aunque no hubiera existencia suficiente. No se generó inventario negativo.\n${serviceShortageText(shortages)}`;else finalMsg+='\nEstado: completo.';finalMsg+='\n\nEl PDF no se descarga automáticamente. Puedes generarlo cuando quieras desde Historial de servicios quirúrgicos.';qAlert(finalMsg);
+    await refreshServiceUiData();serviceBusy=false;if(btn){btn.disabled=false;btn.textContent='✅ Finalizar salida';}$q('mxQxServiceModal')?.classList.add('hidden');let finalMsg=`✅ Servicio quirúrgico ${folio} registrado para ${destino.nombre}.\n\nPiezas requeridas: ${total}\nPiezas surtidas: ${servedTotal}`;if(missingTotal>0)finalMsg+=`\nPiezas faltantes: ${missingTotal}\n\n⚠️ El pedido se conservó aunque no hubiera existencia suficiente. No se generó inventario negativo.\n${serviceShortageText(shortages)}`;else finalMsg+='\nEstado: completo.';finalMsg+='\n\nEl PDF no se descarga automáticamente. Puedes generarlo cuando quieras desde Historial de servicios quirúrgicos.';qAlert(finalMsg);
   }catch(e){console.error('[SERVICIO QUIRURGICO]',e);serviceBusy=false;if(btn){btn.disabled=false;btn.textContent='✅ Finalizar salida';}qAlert(e?.message||'No se pudo finalizar el servicio quirúrgico.');}
 }
 function init(){
@@ -34907,6 +35242,7 @@ function applyMode(){
   document.body?.classList.toggle('mx-financial-on',!!config.enabled);
   const entProvWrap=document.getElementById('entProveedorWrap');
   if(entProvWrap){entProvWrap.style.display=config.enabled?'flex':'none';entProvWrap.setAttribute('aria-hidden',config.enabled?'false':'true');}
+  const entradaProv=document.getElementById('entProveedor');if(entradaProv)entradaProv.required=!!config.enabled;
   const status=document.getElementById('mxFinStatus');
   if(status){
     if(config.modeLocked){
@@ -35023,33 +35359,52 @@ function defaultFinance(product={}){
   if(!has){f.iva_pct=config.ivaDefault;f.ieps_pct=config.iepsDefault;const x=normalize({costo:f.costo,iva_pct:f.iva_pct,ieps_pct:f.ieps_pct,precio_venta:f.precio_venta},{force:true});return x;}
   return f;
 }
+/* v267: campos descriptivos en Entradas financieras. */
+(function(){if(document.getElementById('mxEntryMetaV267Styles'))return;const el=document.createElement('style');el.id='mxEntryMetaV267Styles';el.textContent='.mx-fin-modal-card{max-height:calc(100dvh - 28px);overflow-y:auto}.mx-fin-entry-meta{margin:12px 0;padding:12px;border:1px solid #cbd5e1;border-radius:12px;background:#f8fafc;min-width:0}.mx-fin-entry-meta legend{font-size:12px;font-weight:800;color:#334155;padding:0 5px}.mx-fin-entry-meta-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.mx-fin-entry-meta-grid label{font-weight:700;font-size:12px;color:#334155}.mx-fin-entry-meta-grid input{width:100%;margin-top:5px;box-sizing:border-box}.mx-fin-entry-meta>small{display:block;margin-top:6px;font-size:11px;color:#475569}@media(max-width:600px){.mx-fin-entry-meta-grid{grid-template-columns:1fr}}';document.head.appendChild(el);})();
 window.mxFinancialPromptEntrada=function(product={},options={}){
   return new Promise(resolve=>{
     document.getElementById('mxFinEntryModal')?.remove();
     const d=defaultFinance(product);const modal=document.createElement('div');modal.className='mx-fin-modal';modal.id='mxFinEntryModal';
-    modal.innerHTML=`<div class="mx-fin-modal-card"><div class="mx-fin-modal-head">💰 Entrada financiera · ${esc(product.clave||'')} ${esc(product.descripcion||product.nombre||'')}</div><div class="mx-fin-modal-body"><div class="mx-financial-note">${options.ampula?'Producto manejado por ámpula. ':''}Captura la cantidad y valores unitarios. IVA e IEPS se calculan por unidad.</div><div class="mx-fin-modal-grid" style="margin-top:12px"><label>Piezas a ingresar<input class="input" id="mxFinQty" type="number" min="0.0001" step="1" value="1"></label><label>Costo unitario antes de impuestos<input class="input" id="mxFinCost" type="number" min="0" step="0.0001" value="${d.costo}"></label><label>IVA (%)<input class="input" id="mxFinIva" type="number" min="0" max="100" step="0.01" value="${d.iva_pct}"></label><label>IEPS (%)<input class="input" id="mxFinIeps" type="number" min="0" max="100" step="0.01" value="${d.ieps_pct}"></label><label>Precio de venta unitario<input class="input" id="mxFinPrice" type="number" min="0" step="0.01" value="${d.precio_venta}"></label></div><div class="mx-fin-modal-summary"><div><small>IEPS unitario</small><b id="mxFinSumIeps">$0.00</b></div><div><small>IVA unitario</small><b id="mxFinSumIva">$0.00</b></div><div><small>Costo final</small><b id="mxFinSumCost">$0.00</b></div><div><small>Margen bruto</small><b id="mxFinSumMargin">0%</b></div></div><div class="mx-fin-modal-actions"><button class="btn" id="mxFinCancel" type="button">Cancelar</button><button class="btn ok" id="mxFinAccept" type="button">Agregar entrada</button></div></div></div>`;
+    modal.innerHTML=`<div class="mx-fin-modal-card"><div class="mx-fin-modal-head">💰 Entrada financiera · ${esc(product.clave||'')} ${esc(product.descripcion||product.nombre||'')}</div><div class="mx-fin-modal-body"><div class="mx-financial-note">${options.ampula?'Producto manejado por ámpula. ':''}Captura la cantidad y valores unitarios. IVA e IEPS se calculan por unidad.</div><div class="mx-fin-modal-grid" style="margin-top:12px"><label>Piezas a ingresar<input class="input" id="mxFinQty" type="number" min="0.0001" step="1" value="1"></label><label>Costo unitario antes de impuestos<input class="input" id="mxFinCost" type="number" min="0" step="0.0001" value="${d.costo}"></label><label>IVA (%)<input class="input" id="mxFinIva" type="number" min="0" max="100" step="0.01" value="${d.iva_pct}"></label><label>IEPS (%)<input class="input" id="mxFinIeps" type="number" min="0" max="100" step="0.01" value="${d.ieps_pct}"></label><label>Precio de venta unitario<input class="input" id="mxFinPrice" type="number" min="0" step="0.01" value="${d.precio_venta}"></label></div><fieldset class="mx-fin-entry-meta"><legend>Clasificación y ubicación del producto (editable)</legend><div class="mx-fin-entry-meta-grid"><label>Clasificación<input class="input" id="mxFinClasificacion" maxlength="160" placeholder="Clasificación" value="${esc(product.clasificacion??product['clasificación']??'')}"></label><label>Restricción<input class="input" id="mxFinRestriccion" maxlength="220" placeholder="Restricción" value="${esc(product.restriccion??product['restricción']??'')}"></label><label>Ubicación<input class="input" id="mxFinUbicacion" maxlength="180" placeholder="Pasillo / estante / almacén" value="${esc(product.ubicacion??product['ubicación']??'')}"></label></div><small>Los cambios se guardarán en la Entrada y en el lote correspondiente del Inventario.</small></fieldset><div class="mx-fin-modal-summary"><div><small>IEPS unitario</small><b id="mxFinSumIeps">$0.00</b></div><div><small>IVA unitario</small><b id="mxFinSumIva">$0.00</b></div><div><small>Costo final</small><b id="mxFinSumCost">$0.00</b></div><div><small>Margen bruto</small><b id="mxFinSumMargin">0%</b></div></div><div class="mx-fin-modal-actions"><button class="btn" id="mxFinCancel" type="button">Cancelar</button><button class="btn ok" id="mxFinAccept" type="button">Agregar entrada</button></div></div></div>`;
     document.body.appendChild(modal);
     const calc=()=>{const f=normalize({costo:num(modal.querySelector('#mxFinCost').value),iva_pct:num(modal.querySelector('#mxFinIva').value),ieps_pct:num(modal.querySelector('#mxFinIeps').value),precio_venta:num(modal.querySelector('#mxFinPrice').value)},{force:true});modal.querySelector('#mxFinSumIeps').textContent=money(f.ieps);modal.querySelector('#mxFinSumIva').textContent=money(f.iva);modal.querySelector('#mxFinSumCost').textContent=money(f.costo_final);modal.querySelector('#mxFinSumMargin').textContent=pct(f.margen_ganancia);return f;};
     ['#mxFinCost','#mxFinIva','#mxFinIeps','#mxFinPrice'].forEach(sel=>modal.querySelector(sel).addEventListener('input',calc));calc();
     const done=v=>{modal.remove();resolve(v);};modal.querySelector('#mxFinCancel').onclick=()=>done(null);modal.addEventListener('click',e=>{if(e.target===modal)done(null)});
-    modal.querySelector('#mxFinAccept').onclick=()=>{const pzs=num(modal.querySelector('#mxFinQty').value);if(!(pzs>0)){try{mxAlert('La cantidad debe ser mayor a cero.')}catch(_e){}return;}const f=calc();done({pzs,finance:f});};
+    modal.querySelector('#mxFinAccept').onclick=()=>{const pzs=num(modal.querySelector('#mxFinQty').value);if(!(pzs>0)){try{mxAlert('La cantidad debe ser mayor a cero.')}catch(_e){}return;}const f=calc();done({pzs,finance:f,metadata:{clasificacion:modal.querySelector('#mxFinClasificacion').value.trim(),restriccion:modal.querySelector('#mxFinRestriccion').value.trim(),ubicacion:modal.querySelector('#mxFinUbicacion').value.trim()}});};
     setTimeout(()=>modal.querySelector('#mxFinQty')?.focus(),0);
   });
 };
 
 function mountInline(){
   const panel=document.getElementById('inlineCpmPanel');if(!panel||document.getElementById('mxFinInlineFields'))return;
-  const box=document.createElement('div');box.id='mxFinInlineFields';box.className='mx-cpm-finance-card';box.innerHTML=`<div class="mx-cpm-finance-head"><span>💰 Datos financieros</span><small>Valores unitarios del lote</small></div><div class="mx-cpm-finance-grid"><label>Costo unitario<input class="cpm-input" id="mxCpmFinCost" type="number" min="0" step="0.0001" value="0"></label><label>IVA %<input class="cpm-input" id="mxCpmFinIva" type="number" min="0" max="100" step="0.01" value="${config.ivaDefault}"></label><label>IEPS %<input class="cpm-input" id="mxCpmFinIeps" type="number" min="0" max="100" step="0.01" value="${config.iepsDefault}"></label><label>Precio de venta<input class="cpm-input" id="mxCpmFinPrice" type="number" min="0" step="0.01" value="0"></label></div><div class="mx-cpm-finance-summary" id="mxCpmFinSummary">Costo final $0.00 · Margen 0%</div>`;
+  const box=document.createElement('div');box.id='mxFinInlineFields';box.className='mx-cpm-finance-card';box.innerHTML=`<div class="mx-cpm-finance-head"><span>💰 Datos financieros</span><small>Valores unitarios del lote</small></div><div class="mx-cpm-finance-grid"><label>Costo unitario <strong style="color:#be123c">*</strong><input class="cpm-input" id="mxCpmFinCost" type="number" min="0" step="0.0001" placeholder="Obligatorio" required></label><label>IVA %<input class="cpm-input" id="mxCpmFinIva" type="number" min="0" max="100" step="0.01" value="${config.ivaDefault}"></label><label>IEPS %<input class="cpm-input" id="mxCpmFinIeps" type="number" min="0" max="100" step="0.01" value="${config.iepsDefault}"></label><label>Precio de venta <strong style="color:#be123c">*</strong><input class="cpm-input" id="mxCpmFinPrice" type="number" min="0" step="0.01" placeholder="Obligatorio" required></label></div><div class="mx-cpm-finance-summary" id="mxCpmFinSummary">Costo final $0.00 · Margen 0%</div>`;
   const actions=panel.querySelector('.cpm-inline-actions');if(actions)panel.insertBefore(box,actions);else panel.appendChild(box);
   const calc=()=>{const f=normalize({costo:num(document.getElementById('mxCpmFinCost')?.value),iva_pct:num(document.getElementById('mxCpmFinIva')?.value),ieps_pct:num(document.getElementById('mxCpmFinIeps')?.value),precio_venta:num(document.getElementById('mxCpmFinPrice')?.value)},{force:true});const s=document.getElementById('mxCpmFinSummary');if(s)s.textContent=`Costo final ${money(f.costo_final)} · Margen ${pct(f.margen_ganancia)}`;return f;};
   box.querySelectorAll('input').forEach(i=>i.addEventListener('input',calc));calc();applyMode();
 }
 window.mxFinancialResetInlineCpm=function(){
   const cost=document.getElementById('mxCpmFinCost'),iva=document.getElementById('mxCpmFinIva'),ieps=document.getElementById('mxCpmFinIeps'),price=document.getElementById('mxCpmFinPrice');
-  if(cost)cost.value='0';if(iva)iva.value=String(config.ivaDefault);if(ieps)ieps.value=String(config.iepsDefault);if(price)price.value='0';
+  if(cost)cost.value='';if(iva)iva.value=String(config.ivaDefault);if(ieps)ieps.value=String(config.iepsDefault);if(price)price.value='';
   try{cost?.dispatchEvent(new Event('input',{bubbles:true}));}catch(_e){}
 };
-window.mxFinancialReadInlineCpm=function(){if(!config.enabled)return{};return normalize({costo:num(document.getElementById('mxCpmFinCost')?.value),iva_pct:num(document.getElementById('mxCpmFinIva')?.value),ieps_pct:num(document.getElementById('mxCpmFinIeps')?.value),precio_venta:num(document.getElementById('mxCpmFinPrice')?.value)},{force:true})||{};};
+window.mxFinancialValidateNewItem=function(){
+  if(!config.enabled)return{ok:true};
+  for(const [id,label] of [['mxCpmFinCost','Costo unitario'],['mxCpmFinPrice','Precio de venta']]){
+    const field=document.getElementById(id),raw=String(field?.value??'').trim();
+    if(!field||raw===''||!Number.isFinite(Number(raw))||Number(raw)<0){
+      if(field){field.setAttribute('aria-invalid','true');field.style.borderColor='#e11d48';}
+      return{ok:false,msg:'En modo Financiero, '+label+' es obligatorio. Captura un número igual o mayor a 0.',element:field};
+    }
+    field.removeAttribute('aria-invalid');field.style.borderColor='';
+  }
+  return{ok:true};
+};
+window.mxFinancialReadInlineCpm=function(){
+  if(!config.enabled)return{};
+  const validation=window.mxFinancialValidateNewItem();
+  if(!validation.ok)throw new Error(validation.msg);
+  return normalize({costo:num(document.getElementById('mxCpmFinCost').value),iva_pct:num(document.getElementById('mxCpmFinIva')?.value),ieps_pct:num(document.getElementById('mxCpmFinIeps')?.value),precio_venta:num(document.getElementById('mxCpmFinPrice').value)},{force:true})||{};
+};
 
 function invQty(r){const a=Number(r?.almacen),e=Number(r?.estantes),x=Number(r?.existencia);if(Number.isFinite(a)||Number.isFinite(e))return Math.max(0,(Number.isFinite(a)?a:0)+(Number.isFinite(e)?e:0));return Math.max(0,Number.isFinite(x)?x:0);}
 function dateObj(v){try{if(typeof parseFechaFlexible==='function'){const d=parseFechaFlexible(v);if(d&&!isNaN(d))return d;}}catch(_e){}const s=txt(v);let m;if((m=s.match(/^(\d{2})\/(\d{2})\/(\d{4})/)))return new Date(+m[3],+m[2]-1,+m[1]);if((m=s.match(/^(\d{4})-(\d{2})-(\d{2})/)))return new Date(+m[1],+m[2]-1,+m[3]);const d=new Date(s);return isNaN(d)?null:d;}
@@ -35480,8 +35835,6 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 
 /* ===== MACROXEL V241 · SERVICIO QUIRÚRGICO: SERVICIO + OJO EN ETIQUETA Y DOCUMENTOS ===== */
 
-/* ===== MACROXEL V242 WEB SINCRONIZADO · SERVICIO + OJO + KITS SIN BLOQUEO + CACHE ===== */
-
 /* ===== MACROXEL V243 PDF WEB + HISTORIAL PDF ===== */
 
 /* ===== MACROXEL V244 · PDF QUIROFANO FORMATO CJ + PRECIOS ===== */
@@ -35602,55 +35955,329 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 })();
 
 
-/* MACROXEL V264 · AUDITORIA DE GUARDADO (SOLO LECTURA) */
-(()=>{'use strict';if(window.__mxAuditDataV264)return;window.__mxAuditDataV264=true;
+/* MACROXEL V264 · AUDITORIA DE PERSISTENCIA (SOLO LECTURA) */
+(()=>{'use strict';if(window.__mxPersistenceAuditV264)return;window.__mxPersistenceAuditV264=true;
 const txt=v=>String(v??'').trim(),upper=v=>txt(v).toUpperCase();
-window.mxAuditDataPersistenceV264=async({download=true}={})=>{
+function downloadReport(report){
+ const b=new Blob([JSON.stringify(report,null,2)],{type:'application/json;charset=utf-8'});
+ const link=document.createElement('a');link.href=URL.createObjectURL(b);
+ link.download='MACROXEL_AUDITORIA_GUARDADO_'+new Date().toISOString().slice(0,10)+'.json';
+ document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(link.href),30000);
+}
+window.mxAuditDataPersistenceV264=async function({download=true}={}){
  const report={version:'v264',readOnly:true,generatedAt:new Date().toISOString(),backend:window.electronSql?.isElectron?'SQLite':'IndexedDB',counts:{},sqlCountMismatch:{},incidents:{},warnings:[]};
- if(window.electronSql?.isElectron){await window.__mxFlushSqlWrites?.();await window.electronSql.flush?.();}
+ // No corregir ni borrar datos. Confirmar que la cola pendiente terminó antes de leer.
+ if(window.electronSql?.isElectron){
+   if(typeof window.__mxFlushSqlWrites==='function')await window.__mxFlushSqlWrites();
+   await window.electronSql.flush?.();
+ }
  await ensureDBReady();window.__mxClearSqlCache?.();
- const names=['inventory','entradas','salidas','pedidos','folios','medicos','cpm','settings','users','transferencias','antibioticos'],data={};
+ const names=['inventory','entradas','salidas','pedidos','folios','medicos','cpm','settings','users','transferencias','antibioticos'];
+ const data={};
  for(const name of names){
-  if(window.mxStoreExists&&!window.mxStoreExists(name))continue;
-  const rows=await idbAll(name);if(!Array.isArray(rows))throw Error('No se recuperó '+name);
-  data[name]=rows;report.counts[name]=rows.length;
-  if(window.electronSql?.isElectron&&typeof window.electronSql.count==='function'){
-   const count=Number(await window.electronSql.count(name));
-   if(Number.isFinite(count)&&count!==rows.length)report.sqlCountMismatch[name]={visible:rows.length,persisted:count};
-  }
+   if(typeof window.mxStoreExists==='function'&&!window.mxStoreExists(name))continue;
+   const rows=await idbAll(name);
+   if(!Array.isArray(rows))throw Error('No se pudo recuperar '+name+' de la base.');
+   data[name]=rows;report.counts[name]=rows.length;
+   if(window.electronSql?.isElectron&&typeof window.electronSql.count==='function'){
+     const count=Number(await window.electronSql.count(name));
+     if(Number.isFinite(count)&&count!==rows.length)report.sqlCountMismatch[name]={visible:rows.length,persisted:count};
+   }
  }
- function add(label,items,pick){
-  if(items.length)report.incidents[label]={count:items.length,examples:items.slice(0,15).map(pick)};
+ function incident(name,list,select){const count=list.length;if(count){report.incidents[name]={count,examples:list.slice(0,15).map(select)};}return count;}
+ const inv=data.inventory||[],ent=data.entradas||[],sal=data.salidas||[];
+ const ids=new Set(),duplicates=[];
+ for(const item of inv){
+   if(!txt(item.clave)){continue;}
+   const k=[upper(item.clave),upper(item.lote),upper(item.caducidad)].join('|');
+   if(ids.has(k))duplicates.push(item);else ids.add(k);
  }
- const inv=data.inventory||[],ent=data.entradas||[],sal=data.salidas||[],keys=new Set(),dup=[];
- for(const r of inv){if(!txt(r.clave))continue;
-  const k=[upper(r.clave),upper(r.lote),upper(r.caducidad)].join('|');if(keys.has(k))dup.push(r);else keys.add(k);
- }
- add('inventario_duplicado',dup,r=>({clave:txt(r.clave),lote:txt(r.lote),caducidad:txt(r.caducidad)}));
- add('inventario_sin_clave',inv.filter(r=>!txt(r.clave)),r=>({id:r._id,lote:txt(r.lote)}));
- add('existencias_negativas',inv.filter(r=>Number(r.existencia)<0),r=>({clave:txt(r.clave),lote:txt(r.lote),existencia:r.existencia}));
- add('entradas_sin_fecha',ent.filter(r=>!txt(r.fecha)&&!txt(r.fechaIso)&&!txt(r.createdAt)),r=>({id:r._id,clave:txt(r.clave),lote:txt(r.lote)}));
- add('entradas_sin_clave',ent.filter(r=>!txt(r.clave)),r=>({id:r._id,folio:txt(r.folio)}));
- add('salidas_sin_fecha',sal.filter(r=>!txt(r.fecha)&&!txt(r.fechaIso)&&!txt(r.createdAt)),r=>({id:r._id,folio:txt(r.folio)}));
- add('prestamos_interrumpidos',sal.filter(r=>r.prestamo_cierre_en_curso===true),r=>({id:r._id,folio:txt(r.folio)}));
- const valid=new Set(inv.filter(r=>txt(r.clave)&&txt(r.lote)).map(r=>upper(r.clave)+'|'+upper(r.lote)));
- add('entradas_sin_lote_actual',ent.filter(r=>txt(r.clave)&&txt(r.lote)&&!valid.has(upper(r.clave)+'|'+upper(r.lote))),r=>({clave:txt(r.clave),lote:txt(r.lote),folio:txt(r.folio)}));
- report.warnings.push('Entradas históricas sin lote actual no siempre son pérdida de datos: confirmar bajas y ajustes.');
- const anomalies=Object.values(report.incidents).reduce((a,b)=>a+b.count,0),sql=Object.keys(report.sqlCountMismatch).length;
- report.summary={incidents:anomalies,sqlCountMismatch:sql};
- if(download){
-  const blob=new Blob([JSON.stringify(report,null,2)],{type:'application/json;charset=utf-8'}),link=document.createElement('a');
-  link.href=URL.createObjectURL(blob);link.download='MACROXEL_AUDITORIA_GUARDADO_'+new Date().toISOString().slice(0,10)+'.json';
-  document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(link.href),30000);
- }
- mxAlert('AUDITORÍA DE GUARDADO (solo lectura)\nInventario: '+(report.counts.inventory??'—')+'\nEntradas: '+(report.counts.entradas??'—')+'\nSalidas: '+(report.counts.salidas??'—')+'\nObservaciones: '+anomalies+'\nDiferencias de lectura SQL: '+sql+'\n\nSe descargó el informe JSON. No se modificaron datos.');
+ incident('inventario_clave_lote_caducidad_duplicados',duplicates,x=>({clave:txt(x.clave),lote:txt(x.lote),caducidad:txt(x.caducidad)}));
+ incident('inventario_sin_clave',inv.filter(x=>!txt(x.clave)),x=>({lote:txt(x.lote),id:x._id}));
+ incident('inventario_existencia_negativa',inv.filter(x=>Number(x.existencia)<0),x=>({clave:txt(x.clave),lote:txt(x.lote),existencia:x.existencia}));
+ incident('entradas_sin_fecha',ent.filter(x=>!txt(x.fecha)&&!txt(x.fechaIso)&&!txt(x.createdAt)),x=>({clave:txt(x.clave),lote:txt(x.lote),folio:txt(x.folio),id:x._id}));
+ incident('entradas_sin_clave',ent.filter(x=>!txt(x.clave)),x=>({folio:txt(x.folio),id:x._id}));
+ incident('salidas_sin_fecha',sal.filter(x=>!txt(x.fecha)&&!txt(x.fechaIso)&&!txt(x.createdAt)),x=>({folio:txt(x.folio),clave:txt(x.clave),id:x._id}));
+ incident('prestamos_con_cierre_interrumpido',sal.filter(x=>x.prestamo_cierre_en_curso===true),x=>({folio:txt(x.folio),clave:txt(x.clave),id:x._id}));
+ const wanted=new Set(inv.filter(x=>txt(x.clave)&&txt(x.lote)).map(x=>upper(x.clave)+'|'+upper(x.lote)));
+ const noLot=ent.filter(x=>txt(x.clave)&&txt(x.lote)&&!wanted.has(upper(x.clave)+'|'+upper(x.lote)));
+ incident('entradas_cuyo_lote_no_esta_en_inventario',noLot,x=>({clave:txt(x.clave),lote:txt(x.lote),folio:txt(x.folio),id:x._id}));
+ if(report.incidents.entradas_cuyo_lote_no_esta_en_inventario)
+   report.warnings.push('Una entrada histórica sin ficha actual no prueba pérdida: pudo existir un ajuste, traslado o baja. Verificar antes de recuperar.');
+ if(report.incidents.inventario_existencia_negativa)
+   report.warnings.push('Existencias negativas pueden estar permitidas por configuración. Confirmar contra movimientos.');
+ const n=Object.values(report.incidents).reduce((sum,x)=>sum+x.count,0),sqlN=Object.keys(report.sqlCountMismatch).length;
+ report.summary={incidents:n,sqlCountMismatch:sqlN};
+ if(download)downloadReport(report);
+ if(typeof mxAlert==='function')mxAlert('AUDITORÍA DE DATOS (solo lectura)\n\n'+
+    'Inventario: '+(report.counts.inventory??'—')+'\nEntradas: '+(report.counts.entradas??'—')+
+    '\nSalidas: '+(report.counts.salidas??'—')+'\nMédicos: '+(report.counts.medicos??'—')+
+    '\nObservaciones: '+n+'\nDiferencias SQLite / lectura: '+sqlN+
+    '\n\nSe descargó el informe detallado. La auditoría NO modificó registros.');
  return report;
 };
-function bind(){
- const b=document.getElementById('btnMxAuditPersistenceV264');if(!b||b.dataset.mxAuditBound)return;b.dataset.mxAuditBound='1';
- b.addEventListener('click',async()=>{const t=b.textContent;b.disabled=true;b.textContent='Auditando…';
-  try{await window.mxAuditDataPersistenceV264({download:true});}catch(e){console.error('[AUDITORIA v264]',e);mxAlert('Error de auditoría: '+(e.message||e));}finally{b.disabled=false;b.textContent=t;}
- });
+function bind(){const btn=document.getElementById('btnMxAuditPersistenceV264');if(!btn||btn.dataset.mxV264)return;btn.dataset.mxV264='1';
+ btn.addEventListener('click',async()=>{const t=btn.textContent;btn.disabled=true;btn.textContent='Comprobando datos…';
+ try{await window.mxAuditDataPersistenceV264({download:true});}
+ catch(e){console.error('[AUDITORIA v264]',e);if(typeof mxAlert==='function')mxAlert('No se pudo completar la auditoría: '+(e.message||e));}
+ finally{btn.disabled=false;btn.textContent=t;}});
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bind,{once:true});else bind();
 })();
+
+/* MACROXEL WEB V265 · expediente, nacimiento y productos individuales en Armar pedido. */
+
+
+/* Macroxel HPS v269 — Resurtido inteligente. Solo lectura de inventory/salidas.
+   Las cantidades propuestas son estimaciones: no registran entradas, pedidos o salidas. */
+(function(){
+  'use strict';
+  if(window.MX_RESURTIDO) return;
+  const $ = id => document.getElementById(id);
+  const text = v => String(v == null ? '' : v).trim();
+  const norm = v => text(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/\s+/g,' ');
+  const number = v => { const n=Number(v); return Number.isFinite(n)?n:0; };
+  const fmt = v => number(v).toLocaleString('es-MX',{maximumFractionDigits:2});
+  const escapeHTML = v => text(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const asInt = (v,fallback=0) => { if(text(v)==='') return fallback; const n=Number(v); return Number.isFinite(n)?Math.max(0,Math.floor(n)):fallback; };
+  const cleanPdf = v => text(v).replace(/[\u2013\u2014]/g,'-').replace(/[^\x20-\x7E\u00A0-\u00FF]/g,' ').replace(/\s+/g,' ');
+  const today = () => new Date();
+  const stamp = () => {const d=today(), p=n=>String(n).padStart(2,'0');return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}`;};
+  const periods={7:'Semana (7 días)',15:'Quincena (15 días)',30:'Mes (30 días)',365:'Año (365 días)'};
+  let allRows=[], visibleRows=[], initialized=false, loading=false, lastLoadedAt=0, errorMessage='', draftQty=new Map(), selected=new Map();
+  const state = {min:'',max:'5',period:7,minimumTarget:5,search:'',onlyWithConsumption:false,folio:''};
+  const keyFor = r => [norm(r.clave),norm(r.unidad),norm(r.descripcion)].join('¦');
+  const stockOf = r => {
+    const hasAlm=r?.almacen!=null&&r?.almacen!=='';
+    const hasEst=r?.estantes!=null&&r?.estantes!=='';
+    const alm=Number(r?.almacen),est=Number(r?.estantes),ex=Number(r?.existencia??r?.existencias);
+    return hasAlm&&hasEst&&Number.isFinite(alm)&&Number.isFinite(est)?alm+est:(Number.isFinite(ex)?ex:0);
+  };
+  function parseDate(v){
+    if(v instanceof Date) return Number.isFinite(v.getTime())?v:null;
+    if(typeof v==='number') { const d=new Date(v); return Number.isFinite(d.getTime())?d:null; }
+    const s=text(v);if(!s)return null;
+    let m=s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);
+    if(m){const d=new Date(+m[1],+m[2]-1,+m[3]);return d.getFullYear()===+m[1]&&d.getMonth()===(+m[2]-1)&&d.getDate()===+m[3]?d:null;}
+    m=s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})/);
+    if(m){const d=new Date(+m[3],+m[2]-1,+m[1]);return d.getFullYear()===+m[3]&&d.getMonth()===(+m[2]-1)&&d.getDate()===+m[1]?d:null;}
+    const d=new Date(s);return Number.isFinite(d.getTime())?d:null;
+  }
+  function deletedSalida(s){
+    return [s.anulado,s.anulada,s.cancelado,s.cancelada,s.eliminado,s.eliminada,s.isDeleted,s.deleted].some(x=>x===true||x===1||norm(x)==='SI'||norm(x)==='TRUE') ||
+      ['CANCELADO','CANCELADA','ANULADA','ANULADO','ELIMINADO'].includes(norm(s.estatus||s.estado));
+  }
+  function buildRows(inventory,salidas,days,minimumTarget=5,asOf=today()){
+    const grouped=new Map(),byClave=new Map();
+    for(const product of inventory||[]){
+      const clave=text(product?.clave||product?.csg||product?.codigo_barras);
+      if(!clave)continue;
+      const row={clave,descripcion:text(product?.descripcion||product?.nombre)||'Sin descripción',unidad:text(product?.unidad||product?.presentacion)||'PZA', codigo_barras:text(product?.codigo_barras||product?.codigoBarras), proveedor:text(product?.proveedor||''), stock:stockOf(product)};
+      const k=keyFor(row);let g=grouped.get(k);
+      if(!g){g={...row,key:k,stock:0,consumo:0};grouped.set(k,g);
+        const ck=norm(clave),arr=byClave.get(ck)||[];arr.push(g);byClave.set(ck,arr);}
+      g.stock+=row.stock;
+      if(!g.codigo_barras)g.codigo_barras=row.codigo_barras;
+      if(!g.proveedor)g.proveedor=row.proveedor;
+    }
+    const end=new Date(asOf.getFullYear(),asOf.getMonth(),asOf.getDate()+1);
+    const start=new Date(end);start.setDate(start.getDate()-days);
+    let skippedAmbiguous=0;
+    for(const salida of salidas||[]){
+      if(!salida||deletedSalida(salida))continue;
+      const d=parseDate(salida.fecha||salida.createdAt||salida.fechahora||salida.timestamp||salida.fechaHora);
+      if(!d||d<start||d>=end)continue;
+      const p=number(salida.pzs ?? salida.piezas ?? salida.cantidad ?? salida.cant);
+      if(p<=0)continue;
+      const clave=norm(salida.clave||salida.csg||salida.codigo_barras);
+      const matches=byClave.get(clave)||[];
+      if(!matches.length)continue;
+      let match=matches.length===1?matches[0]:null;
+      if(!match){
+        const unidad=norm(salida.unidad||salida.presentacion||''),desc=norm(salida.descripcion||salida.producto||'');
+        const code=norm(salida.codigo_barras||salida.codigoBarras||'');
+        let filtered=matches;
+        if(code) {const f=filtered.filter(x=>norm(x.codigo_barras)===code);if(f.length===1)match=f[0];else if(f.length)filtered=f;}
+        if(!match && unidad){const f=filtered.filter(x=>norm(x.unidad)===unidad);if(f.length===1)match=f[0];else if(f.length)filtered=f;}
+        if(!match && desc){const f=filtered.filter(x=>norm(x.descripcion)===desc);if(f.length===1)match=f[0];}
+      }
+      if(match) match.consumo+=p; else skippedAmbiguous++;
+    }
+    const rows=[...grouped.values()].map(g=>{
+      const promedioDiario=g.consumo/days;
+      const cobertura=g.consumo>0?Math.max(0,g.stock)/promedioDiario:null;
+      const objetivo=Math.max(asInt(minimumTarget),Math.ceil(g.consumo));
+      const sugerido=Math.max(0,Math.ceil(objetivo-g.stock));
+      const urgencia=g.stock<=0?'AGOTADO':g.consumo>0&&cobertura<days?'CRITICO':g.stock<=minimumTarget?'BAJO':'MONITOREAR';
+      return {...g,consumo:Math.round(g.consumo*100)/100, promedioDiario, cobertura,objetivo,sugerido,urgencia};
+    });
+    // Primero faltantes, luego productos con mayor ritmo relativo al stock, luego mayor consumo.
+    const score=a=>a.consumo>0 ? (a.stock<=0?-1:a.cobertura) : (a.stock<=0?days*100:days*1000);
+    rows.sort((a,b)=>score(a)-score(b)||b.consumo-a.consumo||a.stock-b.stock||a.descripcion.localeCompare(b.descripcion,'es'));
+    return {rows,skippedAmbiguous,from:start,to:new Date(end.getTime()-1)};
+  }
+  function notify(msg,isError=false){const el=$('mxRsInfo');if(el){el.textContent=msg;el.classList.toggle('mx-rs-error',!!isError);}else if(isError){alert(msg);}}
+  function filters(){
+    state.min=$('mxRsMin')?.value??'';
+    state.max=$('mxRsMax')?.value??'';
+    state.period=([7,15,30,365].includes(asInt($('mxRsPeriod')?.value,7))?asInt($('mxRsPeriod')?.value,7):7);
+    state.minimumTarget=asInt($('mxRsTarget')?.value,5);
+    state.search=text($('mxRsSearch')?.value);
+    state.onlyWithConsumption=!!$('mxRsOnlyWithConsumption')?.checked;
+    state.folio=text($('mxRsFolio')?.value);
+  }
+  function render(){
+    filters();
+    const min=text(state.min)===''?null:asInt(state.min),max=text(state.max)===''?null:asInt(state.max);
+    const query=norm(state.search);
+    visibleRows=allRows.filter(r=>(min==null||r.stock>=min)&&(max==null||r.stock<=max)&&(!query||norm([r.clave,r.descripcion,r.unidad,r.codigo_barras,r.proveedor].join(' ')).includes(query))&&(!state.onlyWithConsumption||r.consumo>0));
+    const n=visibleRows.length,qty=visibleRows.reduce((s,r)=>s+r.stock,0);
+    const units=visibleRows.reduce((s,r)=>s+(selected.get(r.key)===false?0:(draftQty.has(r.key)?asInt(draftQty.get(r.key)):r.sugerido)),0);
+    if($('mxRsKpis'))$('mxRsKpis').innerHTML=`<div class="mx-rs-kpi"><span>Productos filtrados</span><b>${fmt(n)}</b></div><div class="mx-rs-kpi"><span>Agotados</span><b>${fmt(visibleRows.filter(r=>r.stock<=0).length)}</b></div><div class="mx-rs-kpi"><span>Piezas existentes</span><b>${fmt(qty)}</b></div><div class="mx-rs-kpi"><span>Propuesta seleccionada</span><b>${fmt(units)} pzs</b></div>`;
+    if($('mxRsCount'))$('mxRsCount').textContent=`${n} productos · Prioridad por cobertura/consumo de ${periods[state.period]||state.period+' días'}`;
+    const body=$('mxRsBody');if(!body)return;
+    if(!visibleRows.length){body.innerHTML='<tr><td colspan="10" class="mx-rs-empty">No hay productos para los filtros elegidos. Modifica el rango de existencias o actualiza.</td></tr>';return;}
+    body.innerHTML=visibleRows.map((r,i)=>{
+      const checked=selected.get(r.key)!==false;
+      const suggest=draftQty.has(r.key)?draftQty.get(r.key):r.sugerido;
+      const tag=r.urgencia==='AGOTADO'?'mx-rs-red':r.urgencia==='CRITICO'?'mx-rs-orange':r.urgencia==='BAJO'?'mx-rs-yellow':'mx-rs-neutral';
+      const coverage=r.cobertura==null?'Sin consumo':`${fmt(r.cobertura)} días`;
+      return `<tr data-rs-index="${i}"><td><input type="checkbox" class="mx-rs-check" data-rs-index="${i}" ${checked?'checked':''} aria-label="Incluir ${escapeHTML(r.descripcion)} en la solicitud"></td><td><span class="mx-rs-tag ${tag}">${r.urgencia}</span></td><td>${escapeHTML(r.clave)}</td><td class="mx-rs-product">${escapeHTML(r.descripcion)}<small>${escapeHTML(r.unidad)}</small></td><td class="mx-rs-num">${fmt(r.stock)}</td><td class="mx-rs-num">${fmt(r.consumo)}</td><td class="mx-rs-num">${coverage}</td><td class="mx-rs-num">${fmt(r.objetivo)}</td><td><input class="mx-rs-qty" type="number" min="0" step="1" value="${asInt(suggest)}" data-rs-index="${i}" aria-label="Piezas a solicitar de ${escapeHTML(r.descripcion)}"></td><td>${escapeHTML(r.proveedor)||'—'}</td></tr>`;
+    }).join('');
+  }
+  function adjustStockTarget(){
+    const t=asInt($('mxRsTarget')?.value,5);state.minimumTarget=t;
+    allRows.forEach(r=>{
+      r.objetivo=Math.max(t,Math.ceil(r.consumo));r.sugerido=Math.max(0,Math.ceil(r.objetivo-r.stock));
+      r.urgencia=r.stock<=0?'AGOTADO':r.consumo>0&&r.cobertura<state.period?'CRITICO':r.stock<=t?'BAJO':'MONITOREAR';
+    });
+    render();
+  }
+  function exportRows(){return visibleRows.filter(r=>selected.get(r.key)!==false).map(r=>({...r,pedir:asInt(draftQty.has(r.key)?draftQty.get(r.key):r.sugerido)})).filter(r=>r.pedir>0);}
+  function syncSelection(e){
+    const t=e.target,idx=Number(t.dataset.rsIndex),r=visibleRows[idx];if(!r)return;
+    if(t.classList.contains('mx-rs-check')){selected.set(r.key,t.checked);render();}
+    if(t.classList.contains('mx-rs-qty')){draftQty.set(r.key,asInt(t.value));renderSummaryOnly();}
+  }
+  function renderSummaryOnly(){const qty=visibleRows.reduce((sum,r)=>sum+(selected.get(r.key)===false?0:asInt(draftQty.has(r.key)?draftQty.get(r.key):r.sugerido)),0);const n=$('mxRsKpis')?.querySelectorAll('.mx-rs-kpi b');if(n&&n.length>=4)n[3].textContent=fmt(qty)+' pzs';}
+  function csvName(){return 'ORDEN_RESURTIDO_'+stamp();}
+  async function refresh(){
+    if(loading)return;loading=true;
+    if($('mxRsRefresh'))$('mxRsRefresh').disabled=true;
+    filters();notify('Consultando existencias y salidas registradas…');
+    try{
+      if(typeof ensureDBReady==='function')await ensureDBReady();
+      const [inv,sal]=await Promise.all([
+        (typeof window.__mxLoadInventory==='function'?window.__mxLoadInventory({force:true,requireRows:true}):idbAll('inventory')),
+        idbAll('salidas')
+      ]);
+      if(!Array.isArray(inv)||!Array.isArray(sal))throw new Error('No se obtuvieron los registros completos de inventario y salidas');
+      const result=buildRows(inv,sal,state.period,state.minimumTarget);
+      allRows=result.rows;lastLoadedAt=Date.now();errorMessage='';
+      // El cambio de periodo conserva una cantidad modificada manualmente, pero recalcula la propuesta por defecto.
+      render();
+      const note=result.skippedAmbiguous ? ` ${result.skippedAmbiguous} movimientos no pudieron asignarse con certeza a una presentación y se excluyeron del consumo.`:'';
+      notify(`Calculado con ${inv.length} renglones de inventario y ${sal.length} movimientos consultados. Periodo ${result.from.toLocaleDateString('es-MX')} a ${result.to.toLocaleDateString('es-MX')}.${note}`);
+    }catch(e){errorMessage=text(e?.message||e);allRows=[];visibleRows=[];render();notify('No se pudo consultar inventario y salidas: '+errorMessage+'. No se generará una orden con datos incompletos.',true);}
+    finally{loading=false;if($('mxRsRefresh'))$('mxRsRefresh').disabled=false;}
+  }
+  async function exportExcel(){
+    if(loading||errorMessage||!lastLoadedAt){notify('Primero actualiza el módulo para obtener datos válidos.',true);return;}
+    const rows=exportRows();if(!rows.length){notify('Selecciona productos con una cantidad a solicitar mayor a cero.',true);return;}
+    if(!window.XLSX){notify('La librería de Excel no está disponible. Revisa los archivos incluidos con el sistema.',true);return;}
+    try{
+      const est=window.mxGetEstablishmentData?.()||{};
+      const wb=XLSX.utils.book_new(),line=[['ORDEN DE RESURTIDO / SOLICITUD DE ABASTO'],['Unidad',est.nombre||window.mxGetUnitNameFromLicense?.()||''],['Clave unidad',est.claveUnidad||''],['Domicilio',est.domicilio||''],['Folio',state.folio||`RS-${stamp()}`],['Fecha',new Date().toLocaleDateString('es-MX')],['Consumo evaluado',periods[state.period]],['Rango de existencias',`${state.min||'Sin mínimo'} a ${state.max||'Sin máximo'}`],[],['Prioridad','Clave','Descripción','Unidad','Existencia actual','Consumo del periodo','Cobertura (días)','Stock objetivo','Solicitar (pzs)','Proveedor']];
+      rows.forEach(r=>line.push([r.urgencia,r.clave,r.descripcion,r.unidad,r.stock,r.consumo,r.cobertura==null?'Sin consumo':Math.round(r.cobertura*10)/10,r.objetivo,r.pedir,r.proveedor]));
+      line.push([],['TOTAL DE PIEZAS SOLICITADAS','','','','','','','',rows.reduce((sum,x)=>sum+x.pedir,0)]);
+      const sheet=XLSX.utils.aoa_to_sheet(line);sheet['!cols']=[{wch:17},{wch:18},{wch:68},{wch:15},{wch:21},{wch:22},{wch:20},{wch:19},{wch:20},{wch:33}];
+      XLSX.utils.book_append_sheet(wb,sheet,'Orden de resurtido');
+      XLSX.writeFile(wb,`${csvName()}.xlsx`);
+      notify(`Excel generado: ${rows.length} productos y ${fmt(rows.reduce((s,r)=>s+r.pedir,0))} piezas solicitadas.`);
+    }catch(e){notify('No se pudo generar Excel: '+text(e?.message||e),true);}
+  }
+  function pdfSafeLines(doc,val,width){return doc.splitTextToSize(cleanPdf(val)||' ',width);}
+  async function exportPDF(){
+    if(loading||errorMessage||!lastLoadedAt){notify('Primero actualiza el módulo para obtener datos válidos.',true);return;}
+    const rows=exportRows();if(!rows.length){notify('Selecciona productos con una cantidad a solicitar mayor a cero.',true);return;}
+    if(!window.jspdf?.jsPDF){notify('La librería PDF no está disponible.',true);return;}
+    try{
+      const est=window.mxGetEstablishmentData?.()||{}, unidad=text(est.nombre)||text(window.mxGetUnitNameFromLicense?.())||'Unidad no configurada';
+      const logos=typeof mxOrderPdfLogos==='function'?await mxOrderPdfLogos():{};
+      const {jsPDF}=window.jspdf,doc=new jsPDF({orientation:'portrait',unit:'mm',format:'letter'});
+      const W=doc.internal.pageSize.getWidth(),H=doc.internal.pageSize.getHeight(),margin=12,folio=state.folio||`RS-${stamp()}`;
+      const drawHeader=(page=1)=>{
+        doc.setTextColor(20,50,78);
+        if(logos.left)try{doc.addImage(logos.left,'PNG',margin,8,47,15,undefined,'FAST');}catch(_e){}
+        if(logos.right)try{doc.addImage(logos.right,'PNG',W-margin-47,8,47,15,undefined,'FAST');}catch(_e){}
+        if(!logos.left&&!logos.right&&logos.collective)try{doc.addImage(logos.collective,'PNG',margin,7,W-2*margin,17,undefined,'FAST');}catch(_e){}
+        doc.setFont('helvetica','bold');doc.setFontSize(13);doc.text('ORDEN DE RESURTIDO',W/2,29,{align:'center'});
+        doc.setFontSize(9);doc.text('SOLICITUD DE ABASTO',W/2,34,{align:'center'});
+        doc.setDrawColor(90,116,140);doc.line(margin,37,W-margin,37);
+        doc.setFontSize(8);doc.setFont('helvetica','bold');doc.setTextColor(22,44,64);
+        const print=(label,val,x,y,max)=>{doc.setFont('helvetica','bold');doc.text(label,x,y);doc.setFont('helvetica','normal');const lines=pdfSafeLines(doc,val,max);doc.text(lines.slice(0,2),x,y+4);};
+        print('UNIDAD:',unidad,margin,42,115);
+        print('CLAVE DE LA UNIDAD:',est.claveUnidad||'No configurada',W-84,42,70);
+        print('DOMICILIO:',est.domicilio||'No configurado',margin,56,115);
+        print('FOLIO:',folio,W-84,56,70);
+        print('TELÉFONO:',est.telefono||'No configurado',margin,70,90);
+        print('FECHA:',new Date().toLocaleDateString('es-MX'),W-84,70,70);
+        doc.setFont('helvetica','normal');doc.setFontSize(8);doc.setTextColor(30,45,59);
+        doc.text(cleanPdf(`Consumo: ${periods[state.period]||state.period+' días'}  |  Stock: ${state.min||'sin mínimo'} a ${state.max||'sin máximo'} pzs  |  Objetivo mínimo: ${state.minimumTarget} pzs`),margin,83);
+        doc.setTextColor(0,0,0);
+      };
+      drawHeader();
+      const cells=rows.map((r,i)=>[String(i+1),cleanPdf(r.clave),cleanPdf(r.descripcion),cleanPdf(r.unidad),fmt(r.stock),fmt(r.consumo),r.cobertura==null?'S/C':fmt(r.cobertura),String(r.pedir)]);
+      if(typeof doc.autoTable==='function'){
+        doc.autoTable({
+          startY:89,head:[['#','Clave','Descripción / producto','Unidad','Exist.','Consumo','Cob. días','Solicitar']],body:cells,
+          margin:{left:margin,right:margin,top:89,bottom:39},
+          theme:'grid',showHead:'everyPage',
+          headStyles:{fillColor:[18,60,97],textColor:255,fontStyle:'bold',fontSize:7},
+          styles:{font:'helvetica',fontSize:7,cellPadding:1.75,textColor:20,overflow:'linebreak',valign:'middle',lineColor:[172,181,190],lineWidth:.16},
+          columnStyles:{0:{cellWidth:9},1:{cellWidth:21},2:{cellWidth:61},3:{cellWidth:21},4:{cellWidth:17,halign:'right'},5:{cellWidth:19,halign:'right'},6:{cellWidth:17,halign:'right'},7:{cellWidth:19,halign:'right',fontStyle:'bold'}},
+          didDrawPage:()=>{if(doc.internal.getCurrentPageInfo().pageNumber>1)drawHeader();}
+        });
+      }else{
+        let y=92;for(const row of cells){if(y>H-48){doc.addPage();drawHeader();y=92;}
+          doc.setFontSize(7);doc.text(row.slice(0,2).join(' / ')+'  '+row[2].slice(0,72)+'     '+row[7]+' pzs',margin,y);y+=7;}
+      }
+      const total=rows.reduce((s,r)=>s+r.pedir,0);
+      let y=Math.max(90,doc.lastAutoTable?.finalY||90)+7;
+      if(y>H-52){doc.addPage();drawHeader();y=94;}
+      doc.setFont('helvetica','bold');doc.setFontSize(9);doc.setTextColor(25,48,66);
+      doc.text(`TOTAL A SOLICITAR: ${fmt(total)} PIEZAS  ·  ${rows.length} PRODUCTOS`,margin,y);
+      const signY=Math.min(H-26,Math.max(y+19,H-40));
+      doc.setDrawColor(0);doc.line(margin+4,signY,margin+81,signY);doc.line(W-margin-81,signY,W-margin-4,signY);
+      doc.setFontSize(7);doc.text('ELABORÓ / SOLICITÓ',margin+42,signY+5,{align:'center'});doc.text('AUTORIZÓ / RECIBIÓ',W-margin-42,signY+5,{align:'center'});
+      const pages=doc.internal.getNumberOfPages();
+      for(let p=1;p<=pages;p++){
+        doc.setPage(p);doc.setDrawColor(125);doc.line(margin,H-16,W-margin,H-16);
+        doc.setFontSize(6.8);doc.setTextColor(100);
+        if(logos.footer)try{doc.addImage(logos.footer,'PNG',margin,H-14,48,6,undefined,'FAST');}catch(_e){}
+        doc.text(`Resurtido estimado con historial de salidas | Página ${p} de ${pages}`,W-margin,H-10,{align:'right'});
+      }
+      doc.save(`${csvName()}.pdf`);
+      notify(`PDF creado: ${rows.length} productos y ${fmt(total)} piezas solicitadas. No se registró ningún movimiento de inventario.`);
+    }catch(e){console.error('[RESURTIDO PDF]',e);notify('No se pudo generar el PDF: '+text(e?.message||e),true);}
+  }
+  function init(){
+    if(initialized)return;initialized=true;
+    const f=$('mxRsFolio');if(f&&!f.value)f.value=`RS-${stamp()}`;
+    ['mxRsMin','mxRsMax','mxRsSearch','mxRsOnlyWithConsumption'].forEach(id=>{const el=$(id);el?.addEventListener(el?.type==='checkbox'?'change':'input',render);});
+    $('mxRsTarget')?.addEventListener('input',adjustStockTarget);
+    $('mxRsPeriod')?.addEventListener('change',()=>{draftQty.clear();selected.clear();refresh();});
+    $('mxRsRefresh')?.addEventListener('click',refresh);
+    $('mxRsExportExcel')?.addEventListener('click',exportExcel);
+    $('mxRsExportPDF')?.addEventListener('click',exportPDF);
+    $('mxRsSelectAll')?.addEventListener('click',()=>{visibleRows.forEach(r=>selected.set(r.key,true));render();});
+    $('mxRsSelectNone')?.addEventListener('click',()=>{visibleRows.forEach(r=>selected.set(r.key,false));render();});
+    $('mxRsBody')?.addEventListener('change',syncSelection);
+    $('mxRsBody')?.addEventListener('input',e=>{if(e.target.classList.contains('mx-rs-qty'))syncSelection(e);});
+    if(f)f.addEventListener('input',()=>{state.folio=text(f.value);});
+  }
+  window.MX_RESURTIDO={buildRows,parseDate,stockOf,refresh,render,getVisible:()=>visibleRows.slice(),getExportRows:exportRows};
+  window.mxResurtidoRefresh=function(){init();return refresh();};
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init,{once:true});else init();
+})();
+
