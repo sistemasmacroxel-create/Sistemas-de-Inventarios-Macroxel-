@@ -1,0 +1,78 @@
+name: Publicar Macroxel web v272 sincronizado
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/macroxel-web-v272-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macroxel-web-v272-publicacion
+  cancel-in-progress: false
+
+jobs:
+  publish-web:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Restaurar archivos exactos de la web v272 y verificar integridad
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),zlib=require('zlib'),crypto=require('crypto');
+          const files=[
+            ['tools/v272_web_index.br.b64','docs/index.html','45b28403b7664b2c7144cb6e6458bcfe32f26c6f0b5b190cafa62414c27c12a4'],
+            ['tools/v272_web_runtime.br.b64','docs/sistema-inventario.js','4a6e6064500b7cc157fe656a34a4cefb44df529f04e707673ab92548dd86a0fe'],
+            ['tools/v272_web_resurtido_css.br.b64','docs/resurtido-inteligente.css','c60d95c8a80ead9cfbdf1d3ca132025170dae951e1e5b3e07e4a490b889aa928']
+          ];
+          for(const [source,target,expected] of files){
+            const b64=fs.readFileSync(source,'utf8').replace(/\s+/g,'');
+            const data=zlib.brotliDecompressSync(Buffer.from(b64,'base64'));
+            const sha=crypto.createHash('sha256').update(data).digest('hex');
+            if(sha!==expected)throw Error('SHA-256 incorrecto '+target+' '+sha);
+            fs.mkdirSync(require('path').dirname(target),{recursive:true});
+            fs.writeFileSync(target,data);
+            console.log('Restaurado '+target+' '+data.length+' bytes');
+          }
+          let html=fs.readFileSync('docs/index.html','utf8');
+          if(!html.includes('sistema-inventario.js?v=v271-censo-diario'))throw Error('Referencia JS original ausente');
+          if(!html.includes('resurtido-inteligente.css?v=v269'))throw Error('Referencia CSS original ausente');
+          html=html.replace('sistema-inventario.js?v=v271-censo-diario','sistema-inventario.js?v=v272-sincronizado-20261026');
+          html=html.replace('resurtido-inteligente.css?v=v269','resurtido-inteligente.css?v=v272-sincronizado-20261026');
+          html=html.replace('</head>','<meta name="macroxel-web-build" content="v272-sincronizado-20261026"></head>');
+          fs.writeFileSync('docs/index.html',html,'utf8');
+          NODE
+      - name: Comprobar sintaxis y funciones esenciales
+        shell: bash
+        run: |
+          node --check docs/sistema-inventario.js
+          python - <<'PY'
+          from pathlib import Path
+          js=Path('docs/sistema-inventario.js').read_text(encoding='utf-8')
+          html=Path('docs/index.html').read_text(encoding='utf-8')
+          css=Path('docs/resurtido-inteligente.css').read_text(encoding='utf-8')
+          for m in ['mxResurtidoRefresh','Resurtido inteligente','Costo unit.','Precio venta','window.mxAuditDataPersistenceV264']:
+              assert m in js,m
+          for m in ['Resurtido inteligente','resurtido-inteligente.css?v=v272-sincronizado-20261026','sistema-inventario.js?v=v272-sincronizado-20261026']:
+              assert m in html,m
+          assert '#view-resurtido' in css
+          print('Web Macroxel v272 verificada')
+          PY
+      - name: Publicar exclusivamente el sistema web
+        shell: bash
+        run: |
+          git config user.name "Macroxel Web Sync"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/index.html docs/sistema-inventario.js docs/resurtido-inteligente.css
+          if git diff --cached --quiet; then
+            echo "No hay diferencias por publicar"
+            exit 0
+          fi
+          git commit -m "Publica web Macroxel v272: resurtido, costos y censo diario"
+          git push origin HEAD:main
