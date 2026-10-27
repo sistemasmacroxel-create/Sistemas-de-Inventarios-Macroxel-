@@ -24114,9 +24114,9 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   'use strict';
   if(window.__mxAntibioticCapacityPublisherV146)return;window.__mxAntibioticCapacityPublisherV146=true;
   const TXT=v=>String(v==null?'':v).trim().replace(/\s+/g,' '),NUM=v=>{const n=Number(v);return Number.isFinite(n)?n:0},NORM=v=>TXT(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase();
-  let busy=null,lastSignature='',timer=0,pendingForce=false,lastUserAction=Date.now();
+  let busy=null,lastSignature='',lastPublishedAt=0,timer=0,pendingForce=false,lastUserAction=Date.now();
   ['pointerdown','keydown','wheel','touchstart'].forEach(type=>document.addEventListener(type,()=>{lastUserAction=Date.now();},{passive:true,capture:true}));
-  const idleYield=()=>new Promise(resolve=>{const wait=()=>{const left=5000-(Date.now()-lastUserAction);if(left>0){setTimeout(wait,Math.min(1200,left+30));return;}try{if(typeof requestIdleCallback==='function')requestIdleCallback(()=>resolve(),{timeout:1800});else setTimeout(resolve,40);}catch(_e){setTimeout(resolve,40);}};wait();});
+  const idleYield=()=>new Promise(resolve=>{try{if(typeof requestIdleCallback==='function')requestIdleCallback(()=>resolve(),{timeout:220});else setTimeout(resolve,0)}catch(_e){setTimeout(resolve,0)}});
   function branch(){try{return String(window.mxGetSucursalFromLicense?.()||'HGAM').trim().toUpperCase()||'HGAM'}catch(_e){return'HGAM'}}
   function claveOf(r={}){return TXT(r.clave||r.csg||r.CSG||r.codigo||r.codigo_barras||r.codigoBarras)}
   function descOf(r={}){return TXT(r.descripcion||r.nombre||r.medicamento||r.DESCRIPCION||r.DESCRIPCIÓN)}
@@ -24136,13 +24136,13 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
     busy=(async()=>{
       if(typeof window.mxPublishJson!=='function'||typeof window.mxBuildAntibioticCapacityPlanV146!=='function')return false;
       try{if(typeof window.ensureDBReady==='function')await window.ensureDBReady()}catch(_e){}
-      const [inventory,abHist]=await Promise.all([loadInventory(!!force),loadAntibioticHistory()]),histKeys=new Set((abHist||[]).map(claveOf).map(NORM).filter(Boolean)),products=new Map();
-      for(const r of inventory||[]){const clave=claveOf(r),key=NORM(clave);if(!key)continue;const prev=products.get(key)||{clave,descripcion:'',abx:false};if(!prev.descripcion&&descOf(r))prev.descripcion=descOf(r);prev.abx=prev.abx||isAbx(r)||histKeys.has(key);products.set(key,prev)}
+      const [inventory,abHist,masterCatalog]=await Promise.all([loadInventory(!!force),loadAntibioticHistory(),window.idbAll?.('cpm').catch(()=>[])||Promise.resolve([])]),catalogAbxKeys=new Set((masterCatalog||[]).filter(isAbx).map(claveOf).map(NORM).filter(Boolean)),histKeys=new Set((abHist||[]).map(claveOf).map(NORM).filter(Boolean)),products=new Map();
+      for(const r of inventory||[]){const clave=claveOf(r),key=NORM(clave);if(!key)continue;const prev=products.get(key)||{clave,descripcion:'',abx:false};if(!prev.descripcion&&descOf(r))prev.descripcion=descOf(r);prev.abx=prev.abx||isAbx(r)||histKeys.has(key)||catalogAbxKeys.has(key);products.set(key,prev)}
       const targets=[...products.values()].filter(x=>x.abx),items=[];let first=true,i=0;
       for(const prod of targets){
         // v278: publicar resultados vigentes sin esperar inactividad indefinida.
         // Ceder un turno periódico al navegador para conservar captura fluida.
-        if(i%8===0)await new Promise(resolve=>setTimeout(resolve,0));
+        if(i%6===0)await idleYield();
         let plan=null;try{plan=await window.mxBuildAntibioticCapacityPlanV146(prod.clave,!!force&&first)}catch(e){console.warn('[ABX CAP V150] plan',prod.clave,e?.message||e)}first=false;
         if(!plan||plan.notFound||plan.ambiguous||NUM(plan.existencia)<=0)continue;
         const requested=Math.max(0,NUM(plan.activeRequested)),supplied=Math.max(0,NUM(plan.activeSupplied)),pending=Math.max(0,NUM(plan.reserved)),free=Math.max(0,NUM(plan.free)),typical=Math.max(0,NUM(plan.avgTreatment)),est=plan.newTreatments==null?null:Math.max(0,Math.floor(NUM(plan.newTreatments)));
@@ -24150,19 +24150,21 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
         i++;
       }
       items.sort((a,b)=>b.existencia-a.existencia||a.clave.localeCompare(b.clave,'es'));
-      const sig=signatureOf(items);if(!force&&sig===lastSignature)return false;
+      const sig=signatureOf(items);if(!force&&sig===lastSignature&&Date.now()-lastPublishedAt<8*60*1000)return false;
       const now=new Date(),inventorySeq=NUM(localStorage.getItem('mx_cpm_inventory_seq_v1010::'+branch())),
       payload={schemaVersion:278,inventorySeq,inventoryRevision:capacityInventoryRevision(),source:'SISTEMA_PRINCIPAL_ANALISIS',sucursal:branch(),updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX'),regla:'MISMA_LOGICA_ANALISIS_PRINCIPAL',items};
-      await window.mxPublishJson(`/antibiotic_capacity/${encodeURIComponent(branch())}`,payload);await window.mxPublishJson(`/sync_versions/${encodeURIComponent(branch())}/antibiotic_capacity`,{v:Date.now(),updatedAt:payload.updatedAt,source:'SISTEMA_PRINCIPAL_V146'}).catch(()=>{});lastSignature=sig;return true;
+      await window.mxPublishJson(`/antibiotic_capacity/${encodeURIComponent(branch())}`,payload);await window.mxPublishJson(`/sync_versions/${encodeURIComponent(branch())}/antibiotic_capacity`,{v:Date.now(),updatedAt:payload.updatedAt,source:'SISTEMA_PRINCIPAL_V146'}).catch(()=>{});lastSignature=sig;lastPublishedAt=Date.now();return true;
     })().catch(e=>{console.warn('[ABX CAP V150] No se pudo publicar:',e?.message||e);return false}).finally(()=>{busy=null;if(pendingForce){const f=pendingForce;pendingForce=false;schedule(f,6000);}});return busy;
   }
   function schedule(force=false,delay=8000){pendingForce=pendingForce||force;clearTimeout(timer);timer=setTimeout(()=>{const f=pendingForce;pendingForce=false;publish(f);},Math.max(1000,delay));}
   window.mxPublishAntibioticCapacityV146=publish;
+  window.addEventListener('mx-primary-stock-published',ev=>{if(TXT(ev?.detail?.branch).toUpperCase()===branch())schedule(true,1500)});
+  window.addEventListener('online',()=>schedule(true,3500));window.addEventListener('focus',()=>{if(!document.hidden&&Date.now()-lastPublishedAt>3*60*1000)schedule(true,3500)});
   window.addEventListener('mx-salidas-history-updated',()=>schedule(true,30000));
   window.addEventListener('mx-inventory-changed',()=>schedule(true,3500));
   window.addEventListener('mx-operational-sync',e=>{const c=Array.isArray(e?.detail?.changed)?e.detail.changed:[];if(c.includes('orders')||c.includes('inventory')||c.includes('salidas'))schedule(true,30000)});
-  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>schedule(true,90000),{once:true});else schedule(true,90000);
-  setInterval(()=>schedule(false,30000),1800000);
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>schedule(true,12000),{once:true});else schedule(true,12000);
+  setInterval(()=>{if(!document.hidden)schedule(false,15000);},8*60*1000);
 })();
 
 
@@ -25437,7 +25439,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
         await mxPublishJson(`/inventory_visor/${encodeURIComponent(suc)}`,null).catch(()=>{});
         await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'}).catch(()=>{});
         localStorage.removeItem(invSigKey());
-        localStorage.setItem(invSeqKey(),String(seq));
+        localStorage.setItem(invSeqKey(),String(seq));try{window.dispatchEvent(new CustomEvent('mx-primary-stock-published',{detail:{branch:suc,seq}}))}catch(_e){}
         return true;
       }
       // Fuente única: las claves nacen del Inventario Principal. CPM solo complementa
@@ -25494,7 +25496,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
         const now=new Date();
         await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,keyCount:groups.size,stockedKeys:fullStockedKeys,changed:Object.keys(fullItems).length,revision:inventoryRevision(fullSignatures),mode:'FOTOGRAFIA_AUTORITATIVA',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')});
         await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'}).catch(()=>{});
-        localStorage.setItem(invSigKey(),JSON.stringify(fullSignatures));localStorage.setItem(invSeqKey(),String(seq));
+        localStorage.setItem(invSigKey(),JSON.stringify(fullSignatures));localStorage.setItem(invSeqKey(),String(seq));try{window.dispatchEvent(new CustomEvent('mx-primary-stock-published',{detail:{branch:suc,seq}}))}catch(_e){}
         return true;
       }
 
@@ -25562,7 +25564,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
         });
         await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'}).catch(()=>{});
         localStorage.setItem(invSigKey(),JSON.stringify(next));
-        localStorage.setItem(invSeqKey(),String(seq));
+        localStorage.setItem(invSeqKey(),String(seq));try{window.dispatchEvent(new CustomEvent('mx-primary-stock-published',{detail:{branch:suc,seq}}))}catch(_e){}
       }
 
       return entries.length>0;
@@ -25676,7 +25678,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,changed,revision:inventoryRevision(old),mode:'CLAVES_INMEDIATAS_INVENTARIO',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')},'PATCH'),
       mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'})
     ]);
-    localStorage.setItem(invSigKey(),JSON.stringify(old));localStorage.setItem(invSeqKey(),String(seq));
+    localStorage.setItem(invSigKey(),JSON.stringify(old));localStorage.setItem(invSeqKey(),String(seq));try{window.dispatchEvent(new CustomEvent('mx-primary-stock-published',{detail:{branch:suc,seq}}))}catch(_e){}
     return true;
   }
   let canonicalInventoryKeyChain=Promise.resolve();
