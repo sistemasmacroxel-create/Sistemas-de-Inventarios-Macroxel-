@@ -36,15 +36,21 @@
     return tracked;
   }
 
-  function scheduleDurableFlush(delay = 450) {
+  // v274: las escrituras ya estan confirmadas en el WAL de SQLite.
+  // El checkpoint no es parte de una captura y no debe competir con el siguiente campo.
+  function scheduleDurableFlush(delay = 2200) {
     clearTimeout(durableFlushTimer);
     durableFlushTimer = setTimeout(() => {
       durableFlushTimer = 0;
+      if(window.mxUserEditingHotV274?.(1400)){
+        scheduleDurableFlush(1800);
+        return;
+      }
       Promise.allSettled([...ACTIVE_WRITE_PROMISES])
         .then(() => flushStorageWrites())
         .then(() => api.flush())
         .catch(() => {});
-    }, Math.max(50, Number(delay) || 450));
+    }, Math.max(250, Number(delay) || 2200));
   }
 
   function clearSecondaryIndexes(name) {
@@ -1410,14 +1416,15 @@ function mxInitClasifCatalogUI(){
       mxRefreshInvCatalogLookup();
     }
 
-    const items = Array.from((mxInvCatalogLookup||new Map()).values())
-      .filter(it=>{
-        const c = mxNormKey(it.clave||'').toLowerCase();
-        const n = mxNormKey(it.nombre||'').toLowerCase();
-        if(/[a-záéíóúñ]/i.test(q)) return n.includes(q) || c.includes(q);
-        return c.includes(q) || n.includes(q);
-      })
-      .slice(0, 12);
+    const items=[];
+    for(const it of (mxInvCatalogLookup||new Map()).values()){
+      const c=mxNormKey(it.clave||'').toLowerCase();
+      const n=mxNormKey(it.nombre||'').toLowerCase();
+      if(c.includes(q)||n.includes(q)){
+        items.push(it);
+        if(items.length>=12)break;
+      }
+    }
 
     if(!items.length){ mxHideCatInvDrop(); return; }
 
@@ -1462,9 +1469,11 @@ function mxInitClasifCatalogUI(){
     if(!inDrop && !inInput) mxHideCatInvDrop();
   });
 
+  let mxCatFilterTimerV276=0;
   filtro.addEventListener('input', ()=>{
-    mxRenderClasifCatalogTable();     // sigue filtrando el catálogo
-    mxRenderCatInvSuggestions(filtro.value); // y sugiere desde inventario
+    mxRenderCatInvSuggestions(filtro.value);
+    clearTimeout(mxCatFilterTimerV276);
+    mxCatFilterTimerV276=setTimeout(mxRenderClasifCatalogTable,110);
   });
   filtro.addEventListener('blur', ()=> setTimeout(mxHideCatInvDrop, 200));
 
@@ -1752,9 +1761,13 @@ function mxInitAmpulaCatalogUI(){
   function renderSuggestions(qRaw){
     const q = mxNormKey(qRaw||'').toLowerCase();
     if(!q || q.length<2){ hideDrop(); return; }
-    const items = Array.from((mxInvCatalogLookup||new Map()).values())
-      .filter(it=>mxNormKey(it.clave||'').toLowerCase().includes(q) || mxNormKey(it.nombre||'').toLowerCase().includes(q))
-      .slice(0,12);
+    const items=[];
+    for(const it of (mxInvCatalogLookup||new Map()).values()){
+      if(mxNormKey(it.clave||'').toLowerCase().includes(q)||mxNormKey(it.nombre||'').toLowerCase().includes(q)){
+        items.push(it);
+        if(items.length>=12)break;
+      }
+    }
     if(!items.length){ hideDrop(); return; }
     drop.innerHTML = items.map(it=>`<div class="mx-sug-item" data-k="${encodeURIComponent(mxNormKey(it.clave||''))}">
       <div class="mx-sug-clave">${mxCSVEscape(mxNormKey(it.clave||''))}</div>
@@ -1777,7 +1790,8 @@ function mxInitAmpulaCatalogUI(){
     const inInput = ev.target?.closest?.('#mxAmpFiltro');
     if(!inDrop && !inInput) hideDrop();
   });
-  filtro.addEventListener('input', ()=>{ mxRenderAmpulaCatalogTable(); renderSuggestions(filtro.value); });
+  let mxAmpFilterTimerV276=0;
+  filtro.addEventListener('input', ()=>{ renderSuggestions(filtro.value); clearTimeout(mxAmpFilterTimerV276); mxAmpFilterTimerV276=setTimeout(mxRenderAmpulaCatalogTable,110); });
   filtro.addEventListener('blur', ()=>setTimeout(hideDrop, 200));
 
   addBtn.addEventListener('click', ()=>{
@@ -3973,7 +3987,11 @@ window.addEventListener('pagehide', ()=>{ __mxScheduleFlushAll(0); });
 window.addEventListener('freeze', ()=>{ __mxScheduleFlushAll(0); }); // Chrome
 window.addEventListener('beforeunload', ()=>{ try{ __mxScheduleFlushAll(0); }catch(e){} });
 
-setInterval(()=>{ __mxScheduleFlushAll(0); }, 30000);
+setInterval(()=>{
+  // No serializar colas vacias mientras el usuario esta llenando campos.
+  if(window.mxUserEditingHotV274?.() && !(__pendingEntradas.length||__pendingAntib.length||__pendingSalidas.length))return;
+  __mxScheduleFlushAll(0);
+}, 30000);
 
 let __pendingEntradas = [];
 window.__pendingEntradas = __pendingEntradas;
@@ -11537,10 +11555,25 @@ window.mxCatalogEnsureFromEntradas = async function(entryRows){
     if(!list.length||typeof idbAll!=='function'||typeof idbPut!=='function')return {added:0};
     if(typeof ensureDBReady==='function')await ensureDBReady();
     const normKey=v=>String(v??'').trim().normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/[^A-Z0-9.\-]/g,'');
-    const current=await idbAll('cpm').catch(()=>[]),known=new Set((current||[]).map(r=>normKey(r?.csg??r?.clave)).filter(Boolean));
+    // v274: una Entrada repetida no debe descargar todo el Catalogo (CPM).
+    // SQLite ya tiene indice para clave; solo leer la tabla completa si la clave no existe.
+    // La via de respaldo mantiene la comparacion normalizada de claves historicas.
+    let known=null;
+    const indexed=!!(window.electronSql?.isElectron&&typeof window.electronSql.indexGet==='function');
     let added=0,seed=Date.now();
     for(const r of list){
-      const clave=String(r?.clave??r?.csg??'').trim(),key=normKey(clave);if(!key||known.has(key))continue;
+      const clave=String(r?.clave??r?.csg??'').trim(),key=normKey(clave);if(!key||(known&&known.has(key)))continue;
+      if(known===null&&indexed){
+        try{
+          const hit=await window.electronSql.indexGet('cpm','clave',clave,true);
+          if(Array.isArray(hit)&&hit.some(p=>normKey(p?.csg??p?.clave)===key))continue;
+        }catch(_e){}
+      }
+      if(known===null){
+        const current=await idbAll('cpm').catch(()=>[]);
+        known=new Set((current||[]).map(p=>normKey(p?.csg??p?.clave)).filter(Boolean));
+      }
+      if(known.has(key))continue;
       const row={
         _id:seed+(added++),csg:clave,clave,grupo:String(r?.grupo??r?.grupo_terapeutico??'').trim(),descripcion:String(r?.descripcion??r?.nombre??'').trim(),unidad:String(r?.unidad??r?.presentacion??'').trim(),
         clasificacion:String(r?.clasificacion??'').trim(),restriccion:String(r?.restriccion??'').trim(),ubicacion:String(r?.ubicacion??r?.ubicacion_entrada??'').trim(),pzsAsignadas:0,
@@ -11813,7 +11846,56 @@ async function syncEntradasSalidasInventario(opts = {}) {
   }
 }
 
+// Filtro de ubicación de Inventario (v277). No escribe ni modifica existencias.
+const MX_INV_SIN_UBICACION_V277 = '__SIN_UBICACION__';
+function mxInvUbicacionTextoV277(r){
+  if(!r) return '';
+  for(const value of [r.ubicacion,r['ubicación'],r.UBICACION,r['UBICACIÓN']]){
+    if(value != null && String(value).trim()) return String(value).trim().replace(/\s+/g,' ');
+  }
+  return '';
+}
+function mxInvUbicacionClaveV277(value){
+  return String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().replace(/\s+/g,' ').toLocaleUpperCase('es-MX');
+}
+function mxInvUbicacionCoincideV277(r){
+  const selected = String(document.getElementById('invFiltroUbic')?.value || '');
+  if(!selected) return true;
+  const normalized = mxInvUbicacionClaveV277(mxInvUbicacionTextoV277(r));
+  return selected === MX_INV_SIN_UBICACION_V277 ? !normalized : normalized === selected;
+}
+function mxInvUbicacionActualizarOpcionesV277(data){
+  const sel=document.getElementById('invFiltroUbic');
+  if(!sel) return;
+  const prev=sel.value;
+  const uniq=new Map();
+  let hasEmpty=false;
+  for(const row of Array.isArray(data)?data:[]){
+    const label=mxInvUbicacionTextoV277(row);
+    const key=mxInvUbicacionClaveV277(label);
+    if(!key){hasEmpty=true;continue;}
+    if(!uniq.has(key))uniq.set(key,label);
+  }
+  const entries=Array.from(uniq.entries()).sort((a,b)=>a[1].localeCompare(b[1],'es',{sensitivity:'base',numeric:true}));
+  // No reconstruir el select en cada pulsación si las ubicaciones no cambiaron.
+  const signature=JSON.stringify([hasEmpty,entries]);
+  if(sel.dataset.mxUbicSignatureV277!==signature){
+    const frag=document.createDocumentFragment();
+    const all=document.createElement('option');all.value='';all.textContent='📍 Ubicación: Todas';frag.appendChild(all);
+    for(const [key,label] of entries){const opt=document.createElement('option');opt.value=key;opt.textContent=label;frag.appendChild(opt);}
+    if(hasEmpty){const empty=document.createElement('option');empty.value=MX_INV_SIN_UBICACION_V277;empty.textContent='Sin ubicación';frag.appendChild(empty);}
+    sel.replaceChildren(frag);
+    sel.dataset.mxUbicSignatureV277=signature;
+  }
+  sel.value=prev;
+  if(sel.value!==prev)sel.value='';
+}
+
 async function drawInventario(opts={}){
+  // Las escrituras de inventario se guardan por separado. Dibujar una tabla oculta
+  // no aporta a esa transacción y competía con el TAB/escáner de Entradas y Salidas.
+  const mxInvViewV276=document.getElementById('view-inventario');
+  if(!opts?.forceDb && mxInvViewV276?.classList.contains('hidden'))return false;
   await ensureDBReady();
   const forceDb = !!(opts && opts.forceDb);
   let data = [];
@@ -11848,6 +11930,7 @@ async function drawInventario(opts={}){
     }
   }
 
+  mxInvUbicacionActualizarOpcionesV277(data);
   const q = ($('#invBusca')?.value || '').toLowerCase().trim();
   const sem = ($('#invFiltroSem')?.value || '').toLowerCase().trim();
   const stock = ($('#invFiltroStock')?.value || '').toLowerCase().trim();
@@ -11880,7 +11963,7 @@ async function drawInventario(opts={}){
     const existencia = Number(x.almacen||0) + Number(x.estantes||0);
     const matchStock = !stock || (stock === 'con' ? existencia > 0 : (stock === 'cero' ? existencia <= 0 : true));
 
-    return matchQ && matchSem && matchStock;
+    return matchQ && matchSem && matchStock && mxInvUbicacionCoincideV277(x);
   });
 
   const tb = document.querySelector('#tblInv tbody');
@@ -11905,7 +11988,7 @@ async function drawInventario(opts={}){
         if(clave || lote || cad) lotesFiltrados.add(`${clave.toUpperCase()}|${lote.toUpperCase()}|${cad}`);
       }
       const totalPiezas = totalAlmacen + totalEstantes;
-      const hayFiltro = Boolean(q || sem || stock);
+      const hayFiltro = Boolean(q || sem || stock || document.getElementById('invFiltroUbic')?.value);
       const titulo = hayFiltro ? 'SUMATORIA DEL FILTRO' : 'SUMATORIA DEL INVENTARIO';
       sumNote.textContent = `${titulo}: ${totalPiezas.toLocaleString('es-MX')} piezas · Almacén: ${totalAlmacen.toLocaleString('es-MX')} · Estantes: ${totalEstantes.toLocaleString('es-MX')} · Lotes: ${lotesFiltrados.size.toLocaleString('es-MX')} · Claves: ${clavesFiltradas.size.toLocaleString('es-MX')}`;
       sumNote.title = 'Suma todos los lotes coincidentes, no solo los 100 renglones visibles de la página.';
@@ -11950,7 +12033,7 @@ async function drawInventario(opts={}){
       ${typeof window.mxFinancialCellsHTML==='function'?window.mxFinancialCellsHTML(r):''}
       <td>${clas}</td>
       <td>${restr}</td>
-      <td>${ubic}</td>
+      <td class="mx-inv-ubic">${ubic}</td>
       <td class="mx-sema-cell">${semaforoCell}</td>
     </tr>`;
   }).join('');
@@ -12007,6 +12090,7 @@ async function drawInventario(opts={}){
   bindResetAndDraw('invBusca', 'input');
   bindResetAndDraw('invFiltroSem', 'change');
   bindResetAndDraw('invFiltroStock', 'change');
+  bindResetAndDraw('invFiltroUbic', 'change');
 })();
 
 async function mxPurgarInventarioCeros(){
@@ -13293,6 +13377,7 @@ document.getElementById('btnExportInv').onclick = async function exportarTodoExc
       const total = getExistenciaTotal(r);
       if(filtroStock === 'con' && total <= 0) return false;
       if(filtroStock === 'cero' && total !== 0) return false;
+      if(!mxInvUbicacionCoincideV277(r)) return false;
       return true;
     });
 
@@ -17055,7 +17140,10 @@ if(invSaveFast) invSaveFast.onclick = async function(){
       }catch(_){ existencia = 0; }
       const matchStock = !stock || (stock === 'con' ? existencia > 0 : (stock === 'cero' ? existencia <= 0 : true));
 
-      tr.style.display = (matchQ && matchSem && matchStock) ? '' : 'none';
+      const chosenUbic=document.getElementById('invFiltroUbic')?.value || '';
+      const currentUbic=tr.querySelector('.mx-inv-ubic')?.textContent || tds[tds.length-2]?.textContent || '';
+      const matchUbic=!chosenUbic || (chosenUbic===MX_INV_SIN_UBICACION_V277 ? !mxInvUbicacionClaveV277(currentUbic) : mxInvUbicacionClaveV277(currentUbic)===chosenUbic);
+      tr.style.display = (matchQ && matchSem && matchStock && matchUbic) ? '' : 'none';
     });
   }
 
@@ -17282,6 +17370,8 @@ doc.autoTable({
     if(sem) sem.addEventListener('change', applyInvFilters);
     const stock = qs('#invFiltroStock');
     if(stock) stock.addEventListener('change', applyInvFilters);
+    const location = qs('#invFiltroUbic');
+    if(location) location.addEventListener('change', applyInvFilters);
     const search = qs('#invBusca');
     if(search) search.addEventListener('input', applyInvFilters);
   });
@@ -17452,6 +17542,8 @@ async function mxExportInventarioConteoPDF(){
   let inv = [];
   try{ inv = await idbAll('inventory'); }catch(e){}
   inv = Array.isArray(inv) ? inv : [];
+  try{const overlay=mxApplyUbicMapToInventory(inv);if(overlay?.arr)inv=overlay.arr;}catch(_e){}
+  inv=inv.filter(mxInvUbicacionCoincideV277);
   if(inv.length===0){
     mxAlert('⚠️ No hay inventario para exportar.');
     return;
@@ -19372,6 +19464,8 @@ document.getElementById('btnLimpiarEntradas')?.addEventListener('click', () => {
     if(f) f.addEventListener('change', ()=>{ try{ clearSelection(); refreshSelectionVisibility(); }catch(_){} });
     const fs = _qs('#invFiltroStock');
     if(fs) fs.addEventListener('change', ()=>{ try{ clearSelection(); refreshSelectionVisibility(); }catch(_){} });
+    const fu = _qs('#invFiltroUbic');
+    if(fu) fu.addEventListener('change', ()=>{ try{ clearSelection(); refreshSelectionVisibility(); }catch(_){} });
   });
 })();
 
@@ -19491,9 +19585,22 @@ function mxInventoryExistenceValue(it){
   return 0;
 }
 function mxNormalizePublicText(v){return String(v==null?'':v).trim().replace(/\s+/g,' ');}
+// v278: los visores son una FOTO de lotes existentes y utilizables, nunca un historial.
+// Caducidad al finalizar el día local, sin confundir DD/MM/AAAA con MM/DD/AAAA.
+function mxViewerLotIsCurrent(row,reference=new Date()){
+  const raw=String(row?.caducidad??row?.cad??row?.vence??row?.expiry??'').trim();
+  if(!raw)return true;
+  let y=0,m=0,d=0,match;
+  if((match=raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/))){y=+match[1];m=+match[2];d=+match[3];}
+  else if((match=raw.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})/))){d=+match[1];m=+match[2];y=+match[3];}
+  else return true; // no ocultar registros con fechas no verificables
+  const expiry=new Date(y,m-1,d),today=new Date(reference.getFullYear(),reference.getMonth(),reference.getDate());
+  return expiry.getFullYear()!==y||expiry.getMonth()!==m-1||expiry.getDate()!==d?true:expiry>=today;
+}
+function mxViewerUsableInventoryRows(rows){return(Array.isArray(rows)?rows:[]).filter(r=>mxInventoryExistenceValue(r)>0&&mxViewerLotIsCurrent(r));}
 function mxBuildInventoryTotals(rows){
   const grouped=new Map();
-  for(const it of (Array.isArray(rows)?rows:[])){
+  for(const it of mxViewerUsableInventoryRows(rows)){
     const clave=mxNormalizePublicText(it?.clave ?? it?.codigo ?? it?.csg ?? it?.id ?? it?.key).toUpperCase();
     const descripcion=mxNormalizePublicText(it?.descripcion ?? it?.nombre ?? it?.desc ?? it?.producto ?? it?.name);
     if(!clave && !descripcion) continue;
@@ -19534,7 +19641,7 @@ function mxBuildInventoryTotals(rows){
 
 
 function mxBuildInventoryLots(rows){
-  return (Array.isArray(rows)?rows:[]).map(it=>{
+  return mxViewerUsableInventoryRows(rows).map(it=>{
     const hasLocations=!!(it&&['almacen','ALMACEN','existenciaAlmacen','existencia almacen','existencia_almacen','alm','pzs_almacen','pzsalmacen','estantes','ESTANTES','estante','ESTANTE','existenciaEstante','existencia estante','existencia_estante','est','pzs_estantes','pzsestantes'].some(k=>Object.prototype.hasOwnProperty.call(it,k)));
     const legacyTotal=Number(it?.existencia ?? it?.existencias ?? it?.stock ?? it?.total ?? 0);
     const almacen=hasLocations?Number(it?.almacen ?? it?.ALMACEN ?? it?.existenciaAlmacen ?? it?.['existencia almacen'] ?? it?.existencia_almacen ?? it?.alm ?? it?.pzs_almacen ?? it?.pzsalmacen ?? 0):(Number.isFinite(legacyTotal)?legacyTotal:0);
@@ -19757,6 +19864,7 @@ async function mxPublicarInventarioFirebase(force=false){
     };
     await mxPublishJson(`${MX_INV_PUBLIC_PATH}/${encodeURIComponent(suc)}/products`,payload);
     await mxPublishJson(`${MX_INV_PUBLIC_PATH}/${encodeURIComponent(suc)}/lots`,lotPayload);
+    await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory_full`,{updatedAt:nowIso,stockedKeys:items.length,source:'PRINCIPAL_V278'}).catch(()=>{});
     try{await mxPublishJson(`/inventory_analytics/${encodeURIComponent(suc)}`,analyticsPayload);await mxPublishJson(`/inventory_analytics/${encodeURIComponent(suc)}/summary`,mxBuildInventoryAnalyticsSummaryPayload(analyticsPayload));}catch(e){console.warn('[ANALITICA] No se pudo publicar analytics/summary; aplica las reglas Firebase incluidas.',e?.message||e);}
     __mxLastPublishAt=now;
     try{localStorage.setItem(MX_INV_FULL_SIG_KEY,fullSig);}catch(_e){}
@@ -20042,10 +20150,11 @@ document.addEventListener('DOMContentLoaded', ()=>{
     const wanted=identityParts(line);
     if(wanted.id){
       const exact=inventory.find((row)=>txt(row?._id)===wanted.id);
-      if(exact){
-        if(!rowMatchesLine(exact,line)) throw new Error('El lote seleccionado cambió. Vuelve a seleccionarlo desde Inventario.');
-        return exact;
-      }
+      // No usar otro lote por similitud cuando desaparece el ID confirmado.
+      // Una coincidencia aproximada podría mover piezas de un lote distinto.
+      if(!exact) throw new Error('El ID del lote ya no existe en el Inventario principal. Actualiza el visor y selecciona nuevamente el lote.');
+      if(!rowMatchesLine(exact,line)) throw new Error('El lote seleccionado cambió. Vuelve a seleccionarlo desde Inventario.');
+      return exact;
     }
     const candidates=inventory.filter((row)=>{
       const current=identityParts(row);
@@ -20147,16 +20256,16 @@ document.addEventListener('DOMContentLoaded', ()=>{
     }
 
     const [inventory,logs]=await Promise.all([freshAll('inventory'),freshAll('transferencias')]);
-    let existing=null,repairing=false;
+    let existing=null;
     if(requestId){
       existing=(logs||[]).find((row)=>txt(row?.request_id||row?.firebase_request_id)===requestId && ['APPLIED','APLICADA'].includes(norm(row?.estado||row?.status)) && !norm(row?.tipo_doc).includes('TRANSFERENCIA RECIBIDA'));
       if(existing){
-        const check=await inspectExistingLog(existing);
-        if(check.valid){
-          return {ok:true,existing:true,folio:txt(existing.folio),log:existing,items:existing.items||existing.resultado||[],totalPzs:num(existing.pzs)};
-        }
-        if(check.repairable) repairing=true;
-        else throw new Error('La solicitud ya tiene un registro previo, pero el inventario cambió después. Revisa el lote antes de reintentar.');
+        // IDEMPOTENCIA ESTRICTA: el folio ya se comprometió junto con Inventario y Movimientos.
+        // No comparar cantidades anteriores/posteriores para 'reparar' el movimiento: una
+        // transferencia inversa, una entrada, una salida o un ajuste físico posterior
+        // podrían devolver legítimamente el lote a sus cifras originales. Repetir aquí
+        // la transferencia duplicaría el descuento y simularía una restauración.
+        return {ok:true,existing:true,folio:txt(existing.folio),log:existing,items:existing.items||existing.resultado||[],totalPzs:num(existing.pzs),totalProductos:(existing.items||existing.resultado||[]).length};
       }
     }
 
@@ -20198,15 +20307,15 @@ document.addEventListener('DOMContentLoaded', ()=>{
     const now=new Date();
     const requestedFolio=txt(options.requestFolio||options.requestedFolio);
     const sameFolioCorrection=options.reuseRequestFolio===true&&!!requestedFolio;
-    const folio=repairing&&existing?.folio?txt(existing.folio):(sameFolioCorrection?requestedFolio:nextFolio(logs));
+    const folio=sameFolioCorrection?requestedFolio:nextFolio(logs);
     const total=results.reduce((sum,row)=>sum+num(row.pzs),0);
     const user=txt(options.user)||'SISTEMA';
     const opId=requestId?`REMOTE_TRANSFER:${requestId}`:`LOCAL_TRANSFER:${Date.now()}:${Math.random().toString(36).slice(2,8)}`;
-    const log=Object.assign({},repairing&&existing?existing:{},{
+    const log=Object.assign({}, {
       _mxOpId:opId,op_id:opId,request_id:requestId||'',firebase_request_id:requestId||'',request_folio:requestedFolio,sameFolioCorrection:sameFolioCorrection||undefined,revision:Math.max(0,num(options.revision)),
       folio,tipo_doc:source==='FIREBASE'?'TRANSFERENCIA FIREBASE':'TRANSFERENCIA INTERNA',usuario:user,
       fecha:now.toLocaleDateString('es-MX'),fechaIso:now.toISOString(),origen:from.toUpperCase(),destino:to.toUpperCase(),
-      pzs:total,estado:'APLICADA',status:'applied',items:results,resultado:results,source,repairingPreviousLog:repairing||undefined
+      pzs:total,estado:'APLICADA',status:'applied',items:results,resultado:results,source
     });
     const movements=results.map((row,index)=>({
       _mxOpId:`${opId}:MOV:${index+1}`,op_id:`${opId}:MOV:${index+1}`,folio,tipo_doc:log.tipo_doc,usuario:user,fecha:log.fecha,fechaIso:log.fechaIso,
@@ -20220,14 +20329,24 @@ document.addEventListener('DOMContentLoaded', ()=>{
     operations.push({type:'put',store:'transferencias',value:log});
     movements.forEach((row)=>operations.push({type:'put',store:'movimientos',value:row}));
     await durableTransaction(operations);
-    const freshRows=await verifyInventory(results);
+    // Después del COMMIT la verificación no debe convertir un movimiento confirmado
+    // en rechazado si otra operación válida actualizó el mismo lote entretanto.
+    let freshRows;
+    try{ freshRows=await verifyInventory(results); }
+    catch(verifyError){
+      const durableLogs=await freshAll('transferencias');
+      const saved=durableLogs.some(r=>requestId&&txt(r?.request_id||r?.firebase_request_id)===requestId&&norm(r?.estado||r?.status)==='APLICADA');
+      if(!saved)throw verifyError;
+      console.warn('[MX TRANSFERENCIAS] Movimiento durable confirmado; diferencia posterior de existencias. No se repetirá ni rechazará la transferencia:',verifyError?.message||verifyError);
+      freshRows=await freshAll('inventory');
+    }
 
     try{ window.__mxInvalidateInventoryCache?.(); }catch(_e){}
     try{ window.__mxSetInventoryMemory?.(freshRows,true); }catch(_e){}
     try{ if(typeof drawInventario==='function') await drawInventario({forceDb:true}); }catch(_e){}
     try{ if(typeof applyInvFilters==='function') applyInvFilters(); }catch(_e){}
 
-    return {ok:true,existing:false,repaired:repairing,folio,log,items:results,totalPzs:total,totalProductos:results.length,changed};
+    return {ok:true,existing:false,folio,log,items:results,totalPzs:total,totalProductos:results.length,changed};
   }
 
   function nextAdjustmentFolio(logs){
@@ -20779,6 +20898,7 @@ function mxSetSelected(r){
     await ensureDBReady();
     let data = await idbAll('inventory');
     data = Array.isArray(data) ? data.slice() : [];
+    try{const overlay=mxApplyUbicMapToInventory(data);if(overlay?.arr)data=overlay.arr;}catch(_e){}
     try{
       if(typeof mxSortInventarioInPlace==='function') mxSortInventarioInPlace(data);
       else if(typeof mxSortInvByDescripcion==='function') mxSortInvByDescripcion(data);
@@ -20796,7 +20916,7 @@ function mxSetSelected(r){
       const okSem = !sem || rowSem === sem;
       const total = mxInvTotal(r);
       const okStock = !stock || (stock === 'con' ? total > 0 : (stock === 'cero' ? total <= 0 : true));
-      return okQ && okSem && okStock;
+      return okQ && okSem && okStock && mxInvUbicacionCoincideV277(r);
     });
   }
   function mxMapInventoryExportRows(rows){
@@ -20831,6 +20951,7 @@ function mxSetSelected(r){
       }else{
         let data = await idbAll('inventory');
         data = Array.isArray(data) ? data.slice() : [];
+        try{const overlay=mxApplyUbicMapToInventory(data);if(overlay?.arr)data=overlay.arr;}catch(_e){}
         try{
           if(typeof mxSortInventarioInPlace==='function') mxSortInventarioInPlace(data);
           else if(typeof mxSortInvByDescripcion==='function') mxSortInvByDescripcion(data);
@@ -20843,7 +20964,7 @@ function mxSetSelected(r){
           const okQ = !q || hay.includes(q);
           const total = mxInvTotal(r);
           const okStock = !stock || stock === 'todo' || (stock === 'con' ? total > 0 : (stock === 'cero' ? total <= 0 : true));
-          return okQ && okStock;
+          return okQ && okStock && mxInvUbicacionCoincideV277(r);
         });
       }
 
@@ -20859,6 +20980,8 @@ function mxSetSelected(r){
       else if(sem === 'green') parts.push('GENERAL');
       else if(sem) parts.push('SEM_'+sem.toUpperCase());
       else parts.push('GENERAL');
+      const locationFilter=document.getElementById('invFiltroUbic')?.value || '';
+      if(locationFilter) parts.push('UBICACION_FILTRADA');
       if(q) parts.push('FILTRADO');
       const now = new Date();
       const yyyy = now.getFullYear();
@@ -20900,7 +21023,7 @@ function mxSetSelected(r){
       purge.dataset.mxReviewed = '1';
       purge.addEventListener('click', function(){ setTimeout(mxRefreshInventoryReviewed, 120); });
     }
-    ['invBusca','invFiltroSem','invFiltroStock'].forEach(function(id){
+    ['invBusca','invFiltroSem','invFiltroStock','invFiltroUbic'].forEach(function(id){
       const el = document.getElementById(id);
       if(el && !el.dataset.mxReviewedBind){
         el.dataset.mxReviewedBind = '1';
@@ -23646,7 +23769,7 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   function makeChart(name,id,config){destroyChart(name);const el=document.getElementById(id);if(!el||typeof Chart!=='function')return;try{charts[name]=new Chart(el,config);}catch(e){console.warn('Gráfica análisis',name,e);}}
 
   function mxAnaDaysInclusive(from,to){const a=Date.parse(String(from||'')+'T12:00:00'),b=Date.parse(String(to||'')+'T12:00:00');return Number.isFinite(a)&&Number.isFinite(b)?Math.max(1,Math.round((b-a)/86400000)+1):1;}
-  function mxAnaInventoryQty(it={}){try{if(typeof mxSalExistenciaReal==='function')return Math.max(0,num(mxSalExistenciaReal(it)));}catch(_e){}try{if(typeof pickExistencia==='function')return Math.max(0,num(pickExistencia(it)));}catch(_e){}const hasLoc=[it.almacen,it.ALMACEN,it.estantes,it.ESTANTES].some(v=>v!==undefined&&v!==null&&v!=='');return Math.max(0,hasLoc?(num(it.almacen??it.ALMACEN)+num(it.estantes??it.ESTANTES)):num(it.existencia??it.existencias??it.EXISTENCIA??it.pzs));}
+  function mxAnaInventoryQty(it={}){if(typeof mxViewerLotIsCurrent==='function'&&!mxViewerLotIsCurrent(it))return 0;try{if(typeof mxSalExistenciaReal==='function')return Math.max(0,num(mxSalExistenciaReal(it)));}catch(_e){}try{if(typeof pickExistencia==='function')return Math.max(0,num(pickExistencia(it)));}catch(_e){}const hasLoc=[it.almacen,it.ALMACEN,it.estantes,it.ESTANTES].some(v=>v!==undefined&&v!==null&&v!=='');return Math.max(0,hasLoc?(num(it.almacen??it.ALMACEN)+num(it.estantes??it.ESTANTES)):num(it.existencia??it.existencias??it.EXISTENCIA??it.pzs));}
   function mxAnaTreatmentClosed(r={}){const state=norm([r.estado_colectivo,r.estadoColectivo,r.estado_tratamiento,r.estadoTratamiento,r.cierre_servicio_estado,r.cierreServicioEstado,r.estado_cierre_servicio,r.estadoCierreServicio,r.status,r.estado,r.observaciones,r.observacion].filter(Boolean).join(' '));return r.tratamiento_activo===false||r.tratamientoActivo===false||r.activo===false||r.cierre_servicio===true||r.cierreServicio===true||r.canceladoPorServicio===true||r.tratamiento_completo===true||r.tratamientoCompleto===true||/(CERRAD|CANCEL|ANUL|RECHAZ|FINALIZADO TRATAMIENTO|TRATAMIENTO COMPLETO)/.test(state);}
   function mxAnaIsJustified(r={}){return norm(r.tipo_doc||r.tipoDocumento||r.tipo||r.tipoSalida).includes('COLECTIVO JUSTIFICADO');}
   function mxAnaTreatmentTotal(r={}){const vals=[r.cantidad_tratamiento_total,r.cantidadTratamientoTotal,r.total_unidades_tratamiento,r.totalUnidadesTratamiento,r.cantidadSolicitadaCalculada,r.autorizadoTratamiento,r.cantidadAutorizadaTratamiento].map(num).filter(v=>v>0),perDay=Math.max(0,num(r.cantidad_24_horas??r.cantidad24Horas)),days=Math.max(0,num(r.tiempo_tratamiento_dias??r.tiempoTratamientoDias));if(perDay>0&&days>0)vals.push(perDay*days);return vals.length?Math.min(...vals):0;}
@@ -24001,6 +24124,12 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   async function loadInventory(force=false){try{if(typeof window.__mxLoadInventory==='function'){const r=await window.__mxLoadInventory({force:!!force,requireRows:false});if(Array.isArray(r))return r}}catch(_e){}try{return await window.idbAll?.('inventory')||[]}catch(_e){return[]}}
   async function loadAntibioticHistory(){try{return await window.idbAll?.('antibioticos')||[]}catch(_e){return[]}}
   function signatureOf(items){return JSON.stringify((items||[]).map(r=>[r.clave,r.existencia,r.solicitadoTotal,r.yaSurtido,r.pendienteComprometido,r.disponibleNuevo,r.promedioColectivo,r.mediana30,r.folios30,r.tratamientosActivos,r.tratamientosEstimados,r.base,r.staleExcluded]));}
+  function capacityInventoryRevision(){
+    let sig={};try{sig=JSON.parse(localStorage.getItem('mx_cpm_inventory_signatures_v278::'+branch())||'{}')||{}}catch(_e){}
+    const stable=Object.keys(sig).sort().map(k=>k+':'+sig[k]).join('|');
+    let h=2166136261;for(let i=0;i<stable.length;i++){h^=stable.charCodeAt(i);h=Math.imul(h,16777619);}
+    return (h>>>0).toString(36);
+  }
   async function publish(force=false){
     if(busy){pendingForce=pendingForce||force;return busy;}
     if(document.hidden)return false;
@@ -24011,8 +24140,9 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
       for(const r of inventory||[]){const clave=claveOf(r),key=NORM(clave);if(!key)continue;const prev=products.get(key)||{clave,descripcion:'',abx:false};if(!prev.descripcion&&descOf(r))prev.descripcion=descOf(r);prev.abx=prev.abx||isAbx(r)||histKeys.has(key);products.set(key,prev)}
       const targets=[...products.values()].filter(x=>x.abx),items=[];let first=true,i=0;
       for(const prod of targets){
-        if(Date.now()-lastUserAction<5000)await idleYield();
-        await idleYield();
+        // v278: publicar resultados vigentes sin esperar inactividad indefinida.
+        // Ceder un turno periódico al navegador para conservar captura fluida.
+        if(i%8===0)await new Promise(resolve=>setTimeout(resolve,0));
         let plan=null;try{plan=await window.mxBuildAntibioticCapacityPlanV146(prod.clave,!!force&&first)}catch(e){console.warn('[ABX CAP V150] plan',prod.clave,e?.message||e)}first=false;
         if(!plan||plan.notFound||plan.ambiguous||NUM(plan.existencia)<=0)continue;
         const requested=Math.max(0,NUM(plan.activeRequested)),supplied=Math.max(0,NUM(plan.activeSupplied)),pending=Math.max(0,NUM(plan.reserved)),free=Math.max(0,NUM(plan.free)),typical=Math.max(0,NUM(plan.avgTreatment)),est=plan.newTreatments==null?null:Math.max(0,Math.floor(NUM(plan.newTreatments)));
@@ -24021,14 +24151,15 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
       }
       items.sort((a,b)=>b.existencia-a.existencia||a.clave.localeCompare(b.clave,'es'));
       const sig=signatureOf(items);if(!force&&sig===lastSignature)return false;
-      const now=new Date(),payload={schemaVersion:146,source:'SISTEMA_PRINCIPAL_ANALISIS',sucursal:branch(),updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX'),regla:'MISMA_LOGICA_ANALISIS_PRINCIPAL',items};
+      const now=new Date(),inventorySeq=NUM(localStorage.getItem('mx_cpm_inventory_seq_v1010::'+branch())),
+      payload={schemaVersion:278,inventorySeq,inventoryRevision:capacityInventoryRevision(),source:'SISTEMA_PRINCIPAL_ANALISIS',sucursal:branch(),updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX'),regla:'MISMA_LOGICA_ANALISIS_PRINCIPAL',items};
       await window.mxPublishJson(`/antibiotic_capacity/${encodeURIComponent(branch())}`,payload);await window.mxPublishJson(`/sync_versions/${encodeURIComponent(branch())}/antibiotic_capacity`,{v:Date.now(),updatedAt:payload.updatedAt,source:'SISTEMA_PRINCIPAL_V146'}).catch(()=>{});lastSignature=sig;return true;
     })().catch(e=>{console.warn('[ABX CAP V150] No se pudo publicar:',e?.message||e);return false}).finally(()=>{busy=null;if(pendingForce){const f=pendingForce;pendingForce=false;schedule(f,6000);}});return busy;
   }
   function schedule(force=false,delay=8000){pendingForce=pendingForce||force;clearTimeout(timer);timer=setTimeout(()=>{const f=pendingForce;pendingForce=false;publish(f);},Math.max(1000,delay));}
   window.mxPublishAntibioticCapacityV146=publish;
   window.addEventListener('mx-salidas-history-updated',()=>schedule(true,30000));
-  window.addEventListener('mx-inventory-changed',()=>schedule(true,30000));
+  window.addEventListener('mx-inventory-changed',()=>schedule(true,3500));
   window.addEventListener('mx-operational-sync',e=>{const c=Array.isArray(e?.detail?.changed)?e.detail.changed:[];if(c.includes('orders')||c.includes('inventory')||c.includes('salidas'))schedule(true,30000)});
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>schedule(true,90000),{once:true});else schedule(true,90000);
   setInterval(()=>schedule(false,30000),1800000);
@@ -24607,7 +24738,11 @@ function principalSessionActive(){try{if(document.body?.classList?.contains('log
   };
 
   // Guardado de seguridad periódico. Es ligero cuando no existen cambios.
-  setInterval(()=>{ if(!document.hidden){ try{ window.__mxPersistAllNow(); }catch(_e){} } }, 60000);
+  setInterval(()=>{
+    if(!document.hidden&&!window.mxUserEditingHotV274?.()){
+      try{window.__mxPersistAllNow()}catch(_e){}
+    }
+  },60000);
 })();
 
 
@@ -24712,7 +24847,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       .mx-it-body{padding:16px 20px}.mx-it-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin-bottom:12px}.mx-it-summary>div{border:1px solid #dbe6f2;background:#f7faff;border-radius:12px;padding:9px}.mx-it-summary small{display:block;color:#64748b;font-weight:800;font-size:10px}.mx-it-summary b{display:block;color:#123e6b;margin-top:3px;font-size:14px;overflow-wrap:anywhere}
       .mx-it-tablewrap{max-height:48vh;overflow:auto;border:1px solid #dbe5ef;border-radius:13px}.mx-it-table{width:100%;border-collapse:collapse;font-size:12px}.mx-it-table th{position:sticky;top:0;background:#eaf2ff;color:#123d69;padding:9px;text-align:left;z-index:1}.mx-it-table td{padding:9px;border-top:1px solid #e7edf4;vertical-align:top}.mx-it-table .qty{font-size:16px;font-weight:950;color:#0d61bd;text-align:center}.mx-it-product{font-weight:850;color:#122f50}.mx-it-meta{margin-top:4px;color:#5d7188;font-size:11px}.mx-it-total{display:flex;justify-content:flex-end;gap:20px;padding:11px 2px 0;font-weight:900;color:#123e6b}
       .mx-it-actions{display:flex;justify-content:flex-end;gap:9px;padding:14px 20px;border-top:1px solid #e5ebf2;background:#f8fafc}.mx-it-actions button{border:0;border-radius:11px;padding:10px 17px;font-weight:900;cursor:pointer}.mx-it-later{background:#e7edf5;color:#31475e}.mx-it-accept{background:linear-gradient(135deg,#16a34a,#22c55e);color:#fff}.mx-it-close{background:#3058e8;color:#fff}
-      .mx-it-progress{display:none;padding:26px 4px 18px;text-align:center}.mx-it-progress.show{display:block}.mx-it-progress h4{font-size:18px;color:#123e6b;margin:0 0 8px}.mx-it-progress p{color:#64748b;margin:0 0 17px}.mx-it-track{height:18px;border-radius:999px;background:#e6edf6;overflow:hidden;border:1px solid #d4dfeb}.mx-it-bar{height:100%;width:0;background:linear-gradient(90deg,#1769e0,#19b765);transition:width .28s ease}.mx-it-percent{font-weight:950;color:#0e5dab;margin-top:8px;font-size:17px}.mx-it-final{display:none;margin-top:14px;padding:13px;border-radius:12px;font-weight:850}.mx-it-final.ok{display:block;background:#ecfdf3;border:1px solid #a7efc0;color:#166534}.mx-it-final.bad{display:block;background:#fff1f2;border:1px solid #fecdd3;color:#9f1239}
+      .mx-it-progress{display:none;padding:26px 4px 18px;text-align:center}.mx-it-progress.show{display:block}.mx-it-progress h4{font-size:18px;color:#123e6b;margin:0 0 8px}.mx-it-progress p{color:#64748b;margin:0 0 17px}.mx-it-track{height:18px;border-radius:999px;background:#e6edf6;overflow:hidden;border:1px solid #d4dfeb}.mx-it-bar{height:100%;width:0;background:linear-gradient(90deg,#1769e0,#19b765);transition:width .28s ease}.mx-it-percent{font-weight:950;color:#0e5dab;margin-top:8px;font-size:17px}.mx-it-final{display:none;margin-top:14px;padding:13px;border-radius:12px;font-weight:850}.mx-it-final.ok{display:block;background:#ecfdf3;border:1px solid #a7efc0;color:#166534}.mx-it-final.bad{display:block;background:#fff1f2;border:1px solid #fecdd3;color:#9f1239}.mx-it-final.pending{display:block;background:#fffbeb;border:1px solid #fcd34d;color:#92400e}
       @media(max-width:700px){.mx-it-summary{grid-template-columns:1fr 1fr}.mx-it-tablewrap{max-height:42vh}}
       `;document.head.appendChild(s);
     }
@@ -24723,7 +24858,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   function uiParts(){const g=ensureUi();return{g,details:g.querySelector('#mxItDetails'),summary:g.querySelector('#mxItSummary'),rows:g.querySelector('#mxItRows'),total:g.querySelector('#mxItTotal'),progress:g.querySelector('#mxItProgress'),bar:g.querySelector('#mxItBar'),pct:g.querySelector('#mxItPercent'),pTitle:g.querySelector('#mxItProgressTitle'),pText:g.querySelector('#mxItProgressText'),final:g.querySelector('#mxItFinal'),actions:g.querySelector('#mxItActions'),accept:g.querySelector('#mxItAccept'),later:g.querySelector('#mxItLater'),title:g.querySelector('#mxItTitle'),subtitle:g.querySelector('#mxItSubtitle')}}
   function askApproval(id,q){const u=uiParts(),items=itemsOf(q),pieces=items.reduce((s,r)=>s+num(r?.pzs??r?.cantidad??r?.qty),0),direction=transferDirectionOf(q),movement=`${direction.fromLabel} → ${direction.toLabel}`;u.title.textContent='Transferencia pendiente de aceptación';u.subtitle.textContent=`Movimiento: ${movement}. El inventario principal todavía no ha sido modificado.`;u.details.style.display='block';u.progress.classList.remove('show');u.actions.style.display='flex';u.final.className='mx-it-final';u.summary.innerHTML=`<div><small>FOLIO DE SOLICITUD</small><b>${esc(q.requestFolio||q.folio||id)}</b></div><div><small>MOVIMIENTO</small><b>${esc(movement)}</b></div><div><small>PRODUCTOS</small><b>${items.length}</b></div><div><small>PIEZAS</small><b>${pieces}</b></div>`;u.rows.innerHTML=items.map((r,i)=>`<tr><td>${i+1}</td><td><div class="mx-it-product">${esc(r.clave||r.codigo_barras||'Sin clave')} — ${esc(r.descripcion||r.nombre||'Sin descripción')}</div><div class="mx-it-meta">${esc(movement)}</div></td><td><b>Lote:</b> ${esc(r.lote||'—')}<br><b>Caducidad:</b> ${esc(r.caducidad||r.cad||'—')}</td><td class="qty">${num(r.pzs??r.cantidad??r.qty)}</td></tr>`).join('');u.total.innerHTML=`<span>Solicitante: ${esc(q.usuario||q.createdBy||'MACROXEL TRANSFERENCIAS')}</span><span>Total: ${items.length} productos · ${pieces} piezas</span>`;u.g.classList.add('open');speakPendingTransfer(id);return new Promise(resolve=>{u.accept.onclick=()=>resolve('accept');u.later.onclick=()=>resolve('later');setTimeout(()=>u.accept.focus(),80);});}
   function setProgress(percent,title,text){const u=uiParts();u.details.style.display='none';u.actions.style.display='none';u.progress.classList.add('show');u.final.className='mx-it-final';u.pTitle.textContent=title||'Aplicando transferencia';u.pText.textContent=text||'';const p=Math.max(0,Math.min(100,Number(percent)||0));u.bar.style.width=p+'%';u.pct.textContent=Math.round(p)+'%';}
-  function finishUi(ok,title,text){const u=uiParts();u.pTitle.textContent=title;u.pText.textContent=text;u.bar.style.width='100%';u.pct.textContent='100%';u.final.className='mx-it-final '+(ok?'ok':'bad');u.final.textContent=ok?'Inventario principal actualizado y confirmado en Firebase.':'La operación no se completó. Revisa el detalle indicado.';u.actions.style.display='flex';u.later.style.display='none';u.accept.className='mx-it-close';u.accept.textContent='Cerrar';return new Promise(resolve=>{u.accept.onclick=()=>{u.g.classList.remove('open');u.accept.textContent='Aceptar y actualizar';u.accept.className='mx-it-accept';u.later.style.display='';resolve();};});}
+  function finishUi(ok,title,text){const u=uiParts();u.pTitle.textContent=title;u.pText.textContent=text;u.bar.style.width='100%';u.pct.textContent='100%';u.final.className='mx-it-final '+(ok===true?'ok':ok==='pending'?'pending':'bad');u.final.textContent=ok===true?'Inventario principal actualizado y confirmado en Firebase.':ok==='pending'?'El inventario principal ya se actualizó. Falta confirmar la publicación en Firebase; no repitas el movimiento.':'La operación no se completó. Revisa el detalle indicado.';u.actions.style.display='flex';u.later.style.display='none';u.accept.className='mx-it-close';u.accept.textContent='Cerrar';return new Promise(resolve=>{u.accept.onclick=()=>{u.g.classList.remove('open');u.accept.textContent='Aceptar y actualizar';u.accept.className='mx-it-accept';u.later.style.display='';resolve();};});}
 
   async function refreshPrincipalInventory(){
     try{if(typeof window.__mxClearSqlCache==='function')window.__mxClearSqlCache('inventory');}catch(_e){}
@@ -24751,6 +24886,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       const decision=await askApproval(id,q);
       if(decision!=='accept'){await releaseClaim(id,q);ensureUi().classList.remove('open');try{if(typeof window.mxToast==='function')window.mxToast('Transferencia pospuesta. Se mostrará nuevamente en 10 minutos.');}catch(_e){}return false;}
     }
+    let committedResult=null;
     const execute=async()=>{
       if(!automatic){setProgress(8,'Validando transferencia','Comprobando claves, lotes y cantidades contra el inventario principal...');await sleep(80);}
       const direction=transferDirectionOf(q);
@@ -24758,10 +24894,12 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       const from=norm(q.origen||q.from||'ALMACEN').includes('ESTANTE')?'estantes':'almacen';
       const to=norm(q.destino||q.to||'ESTANTES').includes('ALMAC')?'almacen':'estantes';
       const result=await window.mxAplicarTransferenciaCentral({source:'FIREBASE',requestId:id,requestFolio:q.requestFolio||q.folio,reuseRequestFolio:q.sameFolioCorrection===true||num(q.revision)>0||num(q.retryCount)>0,revision:num(q.revision||q.retryCount),user:txt(q.usuario||q.createdBy||'MACROXEL TRANSFERENCIAS'),from,to,items:itemsOf(q)});
+      committedResult=result; // SQLite e historial se comprometieron de forma atómica.
       doneIds.add(id);window.mxOperationalKeepHot?.(90000);
       const changedKeys=[...new Set((result.items||[]).map(x=>norm(x?.clave)).filter(Boolean))];
       if(!automatic)setProgress(65,'Sincronizando con Firebase','Confirmando la transferencia y publicando las existencias modificadas...');
-      const publishChanged=changedKeys.length&&typeof window.mxPublicarClavesInventarioFirebase==='function'?window.mxPublicarClavesInventarioFirebase(changedKeys):Promise.resolve(true);
+      if(changedKeys.length&&typeof window.mxPublicarClavesInventarioFirebase!=='function')throw new Error('Inventario guardado, pero no está disponible la publicación Firebase. Se reintentará la confirmación.');
+      const publishChanged=changedKeys.length?window.mxPublicarClavesInventarioFirebase(changedKeys):Promise.resolve(true);
       // Primero publica las existencias nuevas; solo después responde APPLIED al visor.
       // Así el visor nunca recibe "aplicada" mientras Firebase todavía conserva cantidades anteriores.
       await publishChanged;
@@ -24782,6 +24920,15 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       setProgress(100,'Transferencia aplicada',`Folio ${result.folio} · ${result.items.length} productos · ${result.totalPzs} piezas.`);
       await finishUi(true,'Transferencia aplicada',`Folio ${result.folio}. Las cantidades ya están visibles en el inventario principal.`);return true;
     }catch(e){
+      if(committedResult){
+        // Nunca marcar RECHAZADA una transferencia guardada. Un error de red no
+        // revierte SQLite y el reintento debe reutilizar el mismo requestId.
+        const retryAfter=Date.now()+30000;
+        await putJson(`/transfer_requests/${encodeURIComponent(suc())}/${encodeURIComponent(id)}`,{...q,status:'pending',processingAt:'',processingBy:'',postponedUntilMs:retryAfter,postponedUntil:new Date(retryAfter).toISOString(),pendingSync:true,lastSyncError:txt(e?.message||e),updatedAt:new Date().toISOString()}).catch(err=>console.warn('[MX TRANSFERENCIAS] No se pudo programar el reintento',err));
+        notifyAutomaticTransfer(`Movimiento ${committedResult.folio} guardado. La confirmación en Firebase está pendiente; se reintentará sin volver a mover cantidades.`,false);
+        if(!automatic){setProgress(100,'Transferencia guardada','Las cantidades ya se guardaron en inventario. Firebase está pendiente de confirmación.');await finishUi('pending','Confirmación pendiente',`Folio ${committedResult.folio}. No vuelvas a registrar la transferencia.`);}
+        return false;
+      }
       await rejectRequest(id,q,e?.message||String(e),Array.isArray(e?.details)?e.details:[]);
       if(automatic){notifyAutomaticTransfer(`No se pudo aplicar la transferencia: ${e?.message||String(e)}`,false);return false;}
       setProgress(100,'No se pudo aplicar la transferencia',e?.message||String(e));await finishUi(false,'Transferencia rechazada',e?.message||String(e));return false;
@@ -25168,7 +25315,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 
   const DEFAULT_CPM_VERSION='1895E660C985D879';
   const CATALOG_SIG_KEY='mx_cpm_catalog_signature_v1010';
-  const INVENTORY_SIG_KEY='mx_cpm_inventory_signatures_v1010';
+  const INVENTORY_SIG_KEY='mx_cpm_inventory_signatures_v278';
   const INVENTORY_SEQ_KEY='mx_cpm_inventory_seq_v1010';
   let publishRunning=false;
   let catalogTimer=0;
@@ -25187,6 +25334,13 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   const validCpmKey=v=>/^\d{3}\.\d{3}\.\d{4}\.\d{2}$/.test(norm(v));
   const validInventoryKey=v=>{const k=norm(v);return !!k&&k!=='0'&&!/^(?:NULL|UNDEFINED|N\/?A|SIN CLAVE)$/.test(k);};
   const branch=()=>typeof mxGetSucursalFromLicense==='function'?mxGetSucursalFromLicense():'HGAM';
+  const invSigKey=()=>INVENTORY_SIG_KEY+'::'+branch();
+  const invSeqKey=()=>INVENTORY_SEQ_KEY+'::'+branch();
+  function inventoryRevision(signatures){
+    const stable=Object.keys(signatures||{}).sort().map(k=>k+':'+signatures[k]).join('|');
+    let h=2166136261;for(let i=0;i<stable.length;i++){h^=stable.charCodeAt(i);h=Math.imul(h,16777619);}
+    return (h>>>0).toString(36);
+  }
 
   function safeFirebaseKey(v){
     try{return btoa(unescape(encodeURIComponent(norm(v)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
@@ -25194,10 +25348,10 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   }
 
   function inventoryParts(row){
-    const hasLocations=row&&['almacen','alm','pzs_almacen','pzsalmacen','estantes','est','pzs_estantes','pzsestantes'].some(k=>Object.prototype.hasOwnProperty.call(row,k));
-    const legacy=number(row?.existencia??row?.existencias??row?.stock??row?.total);
-    const almacen=hasLocations?number(row?.almacen??row?.alm??row?.pzs_almacen??row?.pzsalmacen):legacy;
-    const estantes=hasLocations?number(row?.estantes??row?.est??row?.pzs_estantes??row?.pzsestantes):0;
+    const hasLocations=row&&['almacen','ALMACEN','existenciaAlmacen','existencia almacen','existencia_almacen','alm','pzs_almacen','pzsalmacen','estantes','ESTANTES','estante','ESTANTE','existenciaEstante','existencia estante','existencia_estante','est','pzs_estantes','pzsestantes'].some(k=>Object.prototype.hasOwnProperty.call(row,k));
+    const legacy=number(row?.existencia??row?.existencias??row?.EXISTENCIA??row?.stock??row?.total);
+    const almacen=hasLocations?number(row?.almacen??row?.ALMACEN??row?.existenciaAlmacen??row?.['existencia almacen']??row?.existencia_almacen??row?.alm??row?.pzs_almacen??row?.pzsalmacen):legacy;
+    const estantes=hasLocations?number(row?.estantes??row?.ESTANTES??row?.estante??row?.ESTANTE??row?.existenciaEstante??row?.['existencia estante']??row?.existencia_estante??row?.est??row?.pzs_estantes??row?.pzsestantes):0;
     return{almacen:Math.max(0,almacen),estantes:Math.max(0,estantes)};
   }
 
@@ -25266,32 +25420,30 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       const cpm=await catalogRows();
       const cpmByKey=new Map(cpm.map(x=>[norm(x.clave),x]));
       const suc=branch();
-      const seq=Math.max(Date.now(),number(localStorage.getItem(INVENTORY_SEQ_KEY))+1);
+      const seq=Math.max(Date.now(),number(localStorage.getItem(invSeqKey()))+1);
       const inventory=typeof window.__mxLoadInventory==='function'?await window.__mxLoadInventory({force:true,requireRows:false}).catch(()=>idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[])):await idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[]);
-      const hasPublishedStock=Array.isArray(inventory)&&inventory.some(row=>{
-        const p=inventoryParts(row);return (number(p.almacen)+number(p.estantes))>0;
-      });
+      const usableInventory=typeof mxViewerUsableInventoryRows==='function'?mxViewerUsableInventoryRows(inventory):(Array.isArray(inventory)?inventory:[]);
+      const hasPublishedStock=usableInventory.length>0;
       if(!Array.isArray(inventory) || inventory.length===0 || !hasPublishedStock){
         const now=new Date();
         await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/items`,null);
         await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{
-          seq,keyCount:0,stockedKeys:0,changed:0,mode:'INVENTARIO_PRINCIPAL_VACIO',sourceAuthority:'INVENTARIO_PRINCIPAL',
+          seq,keyCount:0,stockedKeys:0,changed:0,revision:inventoryRevision({}),mode:'INVENTARIO_PRINCIPAL_VACIO',sourceAuthority:'INVENTARIO_PRINCIPAL',
           updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')
         });
         // Una fotografía vacía debe vaciar también el detalle de lotes: no pueden quedar
         // medicamentos fantasma en ningún visor.
         await mxPublishJson(`/inventory_lots_by_key/${encodeURIComponent(suc)}`,null).catch(()=>{});
         await mxPublishJson(`/inventory_visor/${encodeURIComponent(suc)}`,null).catch(()=>{});
-        await mxPublishJson(`/pharmacy_orders/${encodeURIComponent(suc)}`,null).catch(()=>{});
         await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'}).catch(()=>{});
-        localStorage.removeItem(INVENTORY_SIG_KEY);
-        localStorage.setItem(INVENTORY_SEQ_KEY,String(seq));
+        localStorage.removeItem(invSigKey());
+        localStorage.setItem(invSeqKey(),String(seq));
         return true;
       }
       // Fuente única: las claves nacen del Inventario Principal. CPM solo complementa
       // metadatos; nunca decide si un producto existe o deja de existir.
       const groups=new Map();
-      for(const row of inventory||[]){
+      for(const row of usableInventory){
         const clave=norm(row?.clave??row?.codigo??row?.csg);
         if(!validInventoryKey(clave))continue;
         const cat=cpmByKey.get(clave)||{};
@@ -25340,14 +25492,14 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
           mxPublishJson(`/inventory_lots_by_key/${encodeURIComponent(suc)}`,Object.keys(fullLots).length?fullLots:null)
         ]);
         const now=new Date();
-        await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,keyCount:groups.size,stockedKeys:fullStockedKeys,changed:Object.keys(fullItems).length,mode:'FOTOGRAFIA_AUTORITATIVA',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')});
+        await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,keyCount:groups.size,stockedKeys:fullStockedKeys,changed:Object.keys(fullItems).length,revision:inventoryRevision(fullSignatures),mode:'FOTOGRAFIA_AUTORITATIVA',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')});
         await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'}).catch(()=>{});
-        localStorage.setItem(INVENTORY_SIG_KEY,JSON.stringify(fullSignatures));localStorage.setItem(INVENTORY_SEQ_KEY,String(seq));
+        localStorage.setItem(invSigKey(),JSON.stringify(fullSignatures));localStorage.setItem(invSeqKey(),String(seq));
         return true;
       }
 
       let old={};
-      try{old=JSON.parse(localStorage.getItem(INVENTORY_SIG_KEY)||'{}')||{};}catch(_e){}
+      try{old=JSON.parse(localStorage.getItem(invSigKey())||'{}')||{};}catch(_e){}
       const next={};
       const changed={};
       let stockedKeys=0;
@@ -25373,9 +25525,11 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
         const active=record.e>0||record.a>0||record.s>0||record.l>0;
         const existed=Object.prototype.hasOwnProperty.call(old,firebaseKey);
         if(active)stockedKeys++;
-        if(active||existed){
+        if(active){
           next[firebaseKey]=signature;
-          if((force&&active)||old[firebaseKey]!==signature)changed[firebaseKey]=record;
+          if(old[firebaseKey]!==signature)changed[firebaseKey]=record;
+        }else if(existed){
+          changed[firebaseKey]=null; // baja total: eliminar clave y lotes del servidor, no publicar 0
         }
       }
       for(const firebaseKey of Object.keys(old))if(!(firebaseKey in next))changed[firebaseKey]=null;
@@ -25400,14 +25554,15 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
           keyCount:groups.size,
           stockedKeys,
           changed:entries.length,
+          revision:inventoryRevision(next),
           mode:'DELTA_INVENTARIO_PRINCIPAL',
           sourceAuthority:'INVENTARIO_PRINCIPAL',
           updatedAt:now.toISOString(),
           updatedAtText:now.toLocaleString('es-MX')
         });
         await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'}).catch(()=>{});
-        localStorage.setItem(INVENTORY_SIG_KEY,JSON.stringify(next));
-        localStorage.setItem(INVENTORY_SEQ_KEY,String(seq));
+        localStorage.setItem(invSigKey(),JSON.stringify(next));
+        localStorage.setItem(invSeqKey(),String(seq));
       }
 
       return entries.length>0;
@@ -25481,11 +25636,14 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 
   const dirtyInventoryKeys=new Set();
   async function publishInventoryKeys(keys){
+    // No permitir que una publicación parcial pise una fotografía completa en curso.
+    if(publishRunning){scheduleInventoryKey('',1800);return false;}
     const wanted=[...new Set((keys||[]).map(norm).filter(validInventoryKey))];
     if(!wanted.length||typeof mxPublishJson!=='function')return false;
-    const inventory=typeof window.__mxLoadInventory==='function'?await window.__mxLoadInventory({force:true,requireRows:false}).catch(()=>idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[])):await idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[]);
-    const suc=branch(),seq=Math.max(Date.now(),number(localStorage.getItem(INVENTORY_SEQ_KEY))+1);
-    let old={};try{old=JSON.parse(localStorage.getItem(INVENTORY_SIG_KEY)||'{}')||{};}catch(_e){}
+    const rawInventory=typeof window.__mxLoadInventory==='function'?await window.__mxLoadInventory({force:true,requireRows:false}).catch(()=>idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[])):await idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[]);
+    const inventory=typeof mxViewerUsableInventoryRows==='function'?mxViewerUsableInventoryRows(rawInventory):rawInventory;
+    const suc=branch(),seq=Math.max(Date.now(),number(localStorage.getItem(invSeqKey()))+1);
+    let old={};try{old=JSON.parse(localStorage.getItem(invSigKey())||'{}')||{};}catch(_e){}
     const patch={},lotPatch={};let changed=0;
     for(const clave of wanted){
       const group={almacen:0,estantes:0,lots:[],descripcion:'',unidad:'',clasificacion:'',restriccion:''};
@@ -25515,18 +25673,25 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     ]);
     const now=new Date();
     await Promise.allSettled([
-      mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,changed,mode:'CLAVES_INMEDIATAS_INVENTARIO',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')},'PATCH'),
+      mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,changed,revision:inventoryRevision(old),mode:'CLAVES_INMEDIATAS_INVENTARIO',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')},'PATCH'),
       mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'})
     ]);
-    localStorage.setItem(INVENTORY_SIG_KEY,JSON.stringify(old));localStorage.setItem(INVENTORY_SEQ_KEY,String(seq));
+    localStorage.setItem(invSigKey(),JSON.stringify(old));localStorage.setItem(invSeqKey(),String(seq));
     return true;
   }
+  let canonicalInventoryKeyChain=Promise.resolve();
+  window.mxPublicarInventarioClavesCanonicas=function(keys){
+    const run=()=>publishInventoryKeys(keys);
+    const pending=canonicalInventoryKeyChain.then(run,run);
+    canonicalInventoryKeyChain=pending.catch(()=>{});
+    return pending;
+  };
   function scheduleInventoryKey(clave,delay=120){
     const c=norm(clave);if(validInventoryKey(c))dirtyInventoryKeys.add(c);
     clearTimeout(inventoryTimer);
     inventoryTimer=setTimeout(()=>{
       const keys=[...dirtyInventoryKeys];dirtyInventoryKeys.clear();
-      const run=()=>Promise.resolve(keys.length?publishInventoryKeys(keys):publishCompactInventory(false)).catch(()=>{});
+      const run=()=>Promise.resolve(keys.length?window.mxPublicarInventarioClavesCanonicas(keys):publishCompactInventory(false)).catch(()=>{});
       try{if(window.requestIdleCallback)requestIdleCallback(run,{timeout:1800});else setTimeout(run,0);}catch(_e){setTimeout(run,0);}
     },Math.max(80,Number(delay)||120));
   }
@@ -25567,9 +25732,17 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     };
     // V150: evitar la avalancha de arranque. Las escrituras reales publican por evento;
     // la fotografía general se refresca después, cuando la sesión ya está estable y el navegador está ocioso.
-    setTimeout(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=async()=>{await publishCompactInventory(false);await new Promise(r=>setTimeout(r,60));await publishCatalog(false);};try{window.requestIdleCallback?requestIdleCallback(run,{timeout:12000}):setTimeout(run,1200)}catch(_e){setTimeout(run,1200)}}},30000);
+    let startupReconciled=false,startupReconciling=false;
+    const reconcileAfterLogin=()=>{
+      if(startupReconciled||startupReconciling||document.hidden||!document.body?.classList?.contains('logged'))return;
+      startupReconciling=true;
+      publishCompactInventory(true).then(ok=>{if(ok)startupReconciled=true}).catch(()=>{}).finally(()=>{startupReconciling=false});
+    };
+    setInterval(reconcileAfterLogin,15000);
+    window.addEventListener('online',()=>{startupReconciled=false;reconcileAfterLogin();});
+    setTimeout(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=async()=>{await publishCompactInventory(true);await new Promise(r=>setTimeout(r,60));await publishCatalog(false);};try{window.requestIdleCallback?requestIdleCallback(run,{timeout:12000}):setTimeout(run,1200)}catch(_e){setTimeout(run,1200)}}},30000);
     setTimeout(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')&&publishFullInventory){const run=()=>publishFullInventory(false);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:20000}):setTimeout(run,2000)}catch(_e){setTimeout(run,2000)}}},90000);
-    setInterval(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=()=>publishCompactInventory(false);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:5000}):setTimeout(run,0)}catch(_e){setTimeout(run,0)}}},300000);
+    setInterval(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=()=>publishCompactInventory(true);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:5000}):setTimeout(run,0)}catch(_e){setTimeout(run,0)}}},900000);
     setInterval(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')&&publishFullInventory){const run=()=>publishFullInventory(false);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:10000}):setTimeout(run,0)}catch(_e){setTimeout(run,0)}}},900000);
     setInterval(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=()=>publishCatalog(false);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:7000}):setTimeout(run,0)}catch(_e){setTimeout(run,0)}}},600000);
     // Compatibilidad con visores antiguos: consulta muy espaciada; los actuales leen inventory_lots_by_key directamente.
@@ -26038,10 +26211,11 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     const wanted=new Set(raw.map(norm));return(all||[]).filter(r=>wanted.has(norm(r?.clave??r?.codigo??r?.csg)));
   }
   window.__mxInventoryRowsForKeysFastV10162=inventoryRowsForKeys;
-  window.mxPublicarClavesInventarioFirebase=async function(keys){
+  let mxInventoryPublishChain=Promise.resolve();
+  async function publishKeysSequentially(keys){
     const wanted=[...new Set((keys||[]).map(norm).filter(Boolean))];
     if(!wanted.length||typeof mxPublishJson!=='function')return false;
-    const wantedSet=new Set(wanted),inventory=await inventoryRowsForKeys(keys),groups=new Map(wanted.map(k=>[k,{almacen:0,estantes:0,lots:[]} ]));
+    const wantedSet=new Set(wanted),rawInventory=await inventoryRowsForKeys(keys),inventory=typeof mxViewerUsableInventoryRows==='function'?mxViewerUsableInventoryRows(rawInventory):rawInventory,groups=new Map(wanted.map(k=>[k,{almacen:0,estantes:0,lots:[]} ]));
     for(const row of inventory||[]){
       const clave=norm(row?.clave??row?.codigo??row?.csg);if(!wantedSet.has(clave))continue;
       const p=parts(row),g=groups.get(clave);g.almacen+=p.almacen;g.estantes+=p.estantes;
@@ -26062,6 +26236,16 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     ]);
     await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,changed:wanted.length,mode:'CLAVES_INMEDIATAS_TRANSFERENCIA',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')},'PATCH');
     localStorage.setItem(SIG_KEY,JSON.stringify(sig));localStorage.setItem(SEQ_KEY,String(seq));return true;
+  }
+  window.mxPublicarClavesInventarioFirebase=function(keys){
+    // v278: todos los cambios (incluidas transferencias) usan el publicador canónico.
+    // El motor v1018 queda como respaldo solo si el puente principal no se inicializó.
+    if(typeof window.mxPublicarInventarioClavesCanonicas==='function')
+      return window.mxPublicarInventarioClavesCanonicas(keys);
+    const run=()=>publishKeysSequentially(keys);
+    const pending=mxInventoryPublishChain.then(run,run);
+    mxInventoryPublishChain=pending.catch(()=>{});
+    return pending;
   };
 })();
 
@@ -26787,18 +26971,19 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     const epoch = ++searchEpoch;
     const all = await ensureInventory();
     if(epoch !== searchEpoch || txt(input.value).toLowerCase() !== q) return;
-    const rows = (all || []).filter(r => {
-      const hay = [r?.clave, r?.codigo_barras, r?.codigoBarras, r?.barcode, r?.descripcion, r?.nombre, r?.lote]
-        .map(v => txt(v).toLowerCase()).join(' ');
-      return hay.includes(q);
-    }).sort((a,b) => {
-      const aa = txt(a?.codigo_barras ?? a?.codigoBarras ?? a?.barcode).toLowerCase() === q ? 1 : 0;
-      const bb = txt(b?.codigo_barras ?? b?.codigoBarras ?? b?.barcode).toLowerCase() === q ? 1 : 0;
-      if(aa !== bb) return bb - aa;
-      const ak = txt(a?.clave).toLowerCase() === q ? 1 : 0;
-      const bk = txt(b?.clave).toLowerCase() === q ? 1 : 0;
-      return bk - ak;
-    }).slice(0, 40);
+    // v274: no ordenar ni materializar todos los lotes coincidentes a cada tecla.
+    // Prioridad: codigo exacto > clave exacta > coincidencia parcial, maximo 40.
+    const exactCode=[],exactKey=[],partials=[];
+    for(const r of (all||[])){
+      const code=txt(r?.codigo_barras??r?.codigoBarras??r?.barcode).toLowerCase();
+      const clave=txt(r?.clave).toLowerCase();
+      const isCode=code===q,isKey=clave===q;
+      if(isCode){if(exactCode.length<40)exactCode.push(r);continue;}
+      if(isKey){if(exactKey.length<40)exactKey.push(r);continue;}
+      if(partials.length>=40)continue;
+      if([clave,code,r?.descripcion,r?.nombre,r?.lote].some(v=>txt(v).toLowerCase().includes(q)))partials.push(r);
+    }
+    const rows=exactCode.concat(exactKey,partials).slice(0,40);
     if(epoch !== searchEpoch || txt(input.value).toLowerCase() !== q) return;
     renderSearch(input, rows);
   }
@@ -32480,8 +32665,18 @@ if(document.readyState === 'loading'){
   window.__mxPerformanceCoreV100=true;
 
   const idle=(fn,timeout=1200)=>{
-    if(typeof requestIdleCallback==='function') return requestIdleCallback(()=>{try{fn();}catch(e){console.warn('[Rendimiento]',e)}},{timeout});
-    return setTimeout(()=>{try{fn();}catch(e){console.warn('[Rendimiento]',e)}},Math.min(timeout,600));
+    const started=Date.now();
+    const run=()=>{
+      if((document.hidden||window.mxUserEditingHotV274?.(750))&&Date.now()-started<60000){
+        setTimeout(queue,900);return;
+      }
+      try{fn();}catch(e){console.warn('[Rendimiento]',e)}
+    };
+    const queue=()=>{
+      if(typeof requestIdleCallback==='function')return requestIdleCallback(run,{timeout:Math.min(Math.max(300,timeout),3500)});
+      return setTimeout(run,Math.min(timeout,600));
+    };
+    return queue();
   };
   window.mxRunWhenIdle=idle;
 
@@ -32529,7 +32724,13 @@ if(document.readyState === 'loading'){
           try{localStorage.removeItem('mx_inventory_locations_migrated_v200');}catch(_e){}
         }
       }
-      return original.apply(this,arguments);
+      const result=original.apply(this,arguments);
+      // Invalidar resumen del proveedor solo después de una entrada confirmada.
+      if(store==='entradas'){
+        if(result&&typeof result.then==='function')return result.then(value=>{window.mxInvalidateProviderUsageV276?.();return value;});
+        window.mxInvalidateProviderUsageV276?.();
+      }
+      return result;
     };
     wrapped.__mxPerfWrite=true;
     wrapped.__mxOriginal=original;
@@ -35540,11 +35741,30 @@ const $=id=>document.getElementById(id);
 const txt=v=>String(v==null?'':v).trim();
 const norm=v=>txt(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/\s+/g,' ');
 const esc=v=>txt(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let editDbId=null,cache=[];
+let editDbId=null,cache=[],cacheLoaded=false;
+let useCache=null,useCacheAt=0,useRead=null,searchTimer=null,drawSequence=0;
+window.mxInvalidateProviderUsageV276=()=>{useCache=null;useCacheAt=0;};
+async function getProviderUsage(){
+  if(useCache&&Date.now()-useCacheAt<60000)return useCache;
+  if(useRead)return useRead;
+  useRead=(async()=>{
+    const entradas=typeof idbAll==='function'?await idbAll('entradas'):[];
+    const byId=new Map(),byName=new Map();let withProvider=0;
+    for(const e of entradas||[]){
+      const id=txt(e.proveedor_id),n=norm(e.proveedor);
+      if(n)withProvider++;
+      if(id)byId.set(id,(byId.get(id)||0)+1);
+      else if(n)byName.set(n,(byName.get(n)||0)+1);
+    }
+    const result={byId,byName,withProvider};
+    useCache=result;useCacheAt=Date.now();return result;
+  })();
+  try{return await useRead}finally{useRead=null}
+}
 function stableId(){try{return 'PRV-'+crypto.randomUUID();}catch(_e){return 'PRV-'+Date.now().toString(36).toUpperCase()+'-'+Math.random().toString(36).slice(2,8).toUpperCase();}}
 async function rows(force=false){
-  if(!force&&cache.length)return cache.slice();
-  try{if(typeof ensureDBReady==='function')await ensureDBReady();const all=typeof idbAll==='function'?await idbAll('settings'):[];cache=(all||[]).filter(r=>txt(r?.tipo_doc)===DOC).sort((a,b)=>txt(a.nombre).localeCompare(txt(b.nombre),'es',{sensitivity:'base'}));}catch(e){console.warn('[Proveedores load]',e);cache=[];}
+  if(!force&&cacheLoaded)return cache.slice();
+  try{if(typeof ensureDBReady==='function')await ensureDBReady();const all=typeof idbAll==='function'?await idbAll('settings'):[];cache=(all||[]).filter(r=>txt(r?.tipo_doc)===DOC).sort((a,b)=>txt(a.nombre).localeCompare(txt(b.nombre),'es',{sensitivity:'base'}));cacheLoaded=true;}catch(e){console.warn('[Proveedores load]',e);cache=[];cacheLoaded=false;}
   return cache.slice();
 }
 function clearForm(){editDbId=null;['provNombre','provRfc','provContacto','provTelefono','provCorreo','provDomicilio','provNotas'].forEach(id=>{const el=$(id);if(el)el.value='';});if($('provFormTitle'))$('provFormTitle').textContent='Nuevo proveedor';if($('btnProvGuardar'))$('btnProvGuardar').textContent='💾 Guardar proveedor';}
@@ -35559,24 +35779,32 @@ async function refreshSelect(){
   if(current&&list.some(r=>txt(r.proveedor_id)===current))sel.value=current;updateEntradaInfo();
 }
 window.mxEntradaProveedorSnapshot=function(){const sel=$('entProveedor'),opt=sel?.selectedOptions?.[0];if(!sel||!txt(sel.value)||!opt)return{};return{proveedor:txt(opt.dataset.nombre||opt.textContent?.split(' · ')[0]),proveedor_id:txt(sel.value),proveedor_rfc:txt(opt.dataset.rfc),proveedor_contacto:txt(opt.dataset.contacto)};};
-window.mxRefreshEntradaProveedorSelect=async()=>{cache=[];await refreshSelect();};
+window.mxRefreshEntradaProveedorSelect=async()=>{cache=[];cacheLoaded=false;await refreshSelect();};
 async function save(){
   const nombre=txt($('provNombre')?.value),rfc=txt($('provRfc')?.value).toUpperCase(),contacto=txt($('provContacto')?.value),telefono=txt($('provTelefono')?.value),correo=txt($('provCorreo')?.value),domicilio=txt($('provDomicilio')?.value),notas=txt($('provNotas')?.value);if(!nombre)return mxAlert('Captura el nombre o razón social del proveedor.');
   const list=await rows(true),existing=list.find(r=>String(r._id)===String(editDbId??'')),dupe=list.find(r=>norm(r.nombre)===norm(nombre)&&String(r._id)!==String(editDbId??''));if(dupe)return mxAlert('Ya existe un proveedor con ese nombre. Puedes editar el registro existente.');
   const row={tipo_doc:DOC,folio:'PROVEEDOR',descripcion:'Proveedor para trazabilidad de Entradas',proveedor_id:txt(existing?.proveedor_id)||stableId(),nombre,rfc,contacto,telefono,correo,domicilio,notas,updatedAt:new Date().toISOString()};if(existing?._id!=null)row._id=existing._id;else row.createdAt=new Date().toISOString();
-  try{const id=await idbPut('settings',row);try{await window.__mxFlushSqlWrites?.();}catch(_e){}cache=[];clearForm();await draw();await refreshSelect();mxAlert(existing?'✅ Proveedor actualizado. Los registros históricos de Entradas conservan la información con la que fueron guardados.':'✅ Proveedor agregado.');return id;}catch(e){console.error('[Proveedores save]',e);mxAlert('No se pudo guardar el proveedor: '+(e?.message||e));}
+  try{const id=await idbPut('settings',row);try{await window.__mxFlushSqlWrites?.();}catch(_e){}cache=[];cacheLoaded=false;clearForm();await draw();await refreshSelect();mxAlert(existing?'✅ Proveedor actualizado. Los registros históricos de Entradas conservan la información con la que fueron guardados.':'✅ Proveedor agregado.');return id;}catch(e){console.error('[Proveedores save]',e);mxAlert('No se pudo guardar el proveedor: '+(e?.message||e));}
 }
 async function edit(id){const list=await rows(true),r=list.find(x=>String(x._id)===String(id));if(!r)return;editDbId=r._id;const map={provNombre:r.nombre,provRfc:r.rfc,provContacto:r.contacto,provTelefono:r.telefono,provCorreo:r.correo,provDomicilio:r.domicilio,provNotas:r.notas};for(const[k,v]of Object.entries(map)){const el=$(k);if(el)el.value=txt(v);}if($('provFormTitle'))$('provFormTitle').textContent='Editar proveedor';if($('btnProvGuardar'))$('btnProvGuardar').textContent='💾 Guardar cambios';try{$('provNombre')?.focus({preventScroll:true});}catch(_e){}}
-async function remove(id){const list=await rows(true),r=list.find(x=>String(x._id)===String(id));if(!r)return;if(!await mxConfirm(`¿Eliminar del catálogo al proveedor "${r.nombre}"?\n\nLas Entradas históricas NO se modificarán y conservarán el proveedor registrado.`))return;try{await idbDelete('settings',Number(r._id));try{await window.__mxFlushSqlWrites?.();}catch(_e){}cache=[];if(String(editDbId)===String(id))clearForm();await draw();await refreshSelect();mxAlert('✅ Proveedor eliminado del catálogo. El historial de Entradas se conserva.');}catch(e){mxAlert('No se pudo eliminar el proveedor: '+(e?.message||e));}}
+async function remove(id){const list=await rows(true),r=list.find(x=>String(x._id)===String(id));if(!r)return;if(!await mxConfirm(`¿Eliminar del catálogo al proveedor "${r.nombre}"?\n\nLas Entradas históricas NO se modificarán y conservarán el proveedor registrado.`))return;try{await idbDelete('settings',Number(r._id));try{await window.__mxFlushSqlWrites?.();}catch(_e){}cache=[];cacheLoaded=false;if(String(editDbId)===String(id))clearForm();await draw();await refreshSelect();mxAlert('✅ Proveedor eliminado del catálogo. El historial de Entradas se conserva.');}catch(e){mxAlert('No se pudo eliminar el proveedor: '+(e?.message||e));}}
 function csvCell(v){return `"${txt(v).replace(/"/g,'""')}"`;}
 async function exportCsv(){const list=await rows(true),head=['ID','PROVEEDOR','RFC','CONTACTO','TELEFONO','CORREO','DOMICILIO','NOTAS'],lines=[head.join(',')];for(const r of list)lines.push([r.proveedor_id,r.nombre,r.rfc,r.contacto,r.telefono,r.correo,r.domicilio,r.notas].map(csvCell).join(','));const blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}),a=document.createElement('a'),u=URL.createObjectURL(blob);a.href=u;a.download=`PROVEEDORES_MACROXEL_${new Date().toISOString().slice(0,10)}.csv`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(u),1000);}
-async function draw(){
-  const list=await rows(true),q=norm($('provBusca')?.value),shown=q?list.filter(r=>norm([r.nombre,r.rfc,r.contacto,r.telefono,r.correo,r.domicilio].join(' ')).includes(q)):list;let entradas=[];try{entradas=typeof idbAll==='function'?await idbAll('entradas'):[];}catch(_e){}const byId=new Map(),byName=new Map();for(const e of entradas||[]){const id=txt(e.proveedor_id),n=norm(e.proveedor);if(id)byId.set(id,(byId.get(id)||0)+1);else if(n)byName.set(n,(byName.get(n)||0)+1);}
-  const tb=document.querySelector('#tblProv tbody');if(tb)tb.innerHTML=shown.length?shown.map(r=>{const used=byId.get(txt(r.proveedor_id))||byName.get(norm(r.nombre))||0;return`<tr><td><b>${esc(r.nombre)}</b>${r.notas?`<br><small style="color:#64748b">${esc(r.notas)}</small>`:''}</td><td>${esc(r.rfc)}</td><td>${esc(r.contacto)}</td><td>${esc(r.telefono)}</td><td>${esc(r.correo)}</td><td>${esc(r.domicilio)}</td><td><span class="badge">${used}</span></td><td><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn" type="button" data-prov-edit="${r._id}">✏️ Editar</button><button class="btn danger" type="button" data-prov-del="${r._id}">🗑️ Eliminar</button></div></td></tr>`;}).join(''):'<tr><td colspan="8" style="text-align:center;color:#64748b;">No hay proveedores configurados.</td></tr>';
-  if($('provResumen'))$('provResumen').textContent=`${list.length} proveedor${list.length===1?'':'es'} · ${(entradas||[]).filter(e=>txt(e.proveedor)).length} entrada(s) con proveedor`;tb?.querySelectorAll('[data-prov-edit]').forEach(b=>b.onclick=()=>edit(b.dataset.provEdit));tb?.querySelectorAll('[data-prov-del]').forEach(b=>b.onclick=()=>remove(b.dataset.provDel));await refreshSelect();
+async function draw(options={}){
+  const seq=++drawSequence;
+  const list=await rows(false),q=norm($('provBusca')?.value),shown=q?list.filter(r=>norm([r.nombre,r.rfc,r.contacto,r.telefono,r.correo,r.domicilio].join(' ')).includes(q)):list;
+  const {byId,byName,withProvider}=await getProviderUsage();
+  if(seq!==drawSequence)return;
+  const tb=document.querySelector('#tblProv tbody');
+  if(tb)tb.innerHTML=shown.length?shown.map(r=>{const used=byId.get(txt(r.proveedor_id))||byName.get(norm(r.nombre))||0;return`<tr><td><b>${esc(r.nombre)}</b>${r.notas?`<br><small style="color:#64748b">${esc(r.notas)}</small>`:''}</td><td>${esc(r.rfc)}</td><td>${esc(r.contacto)}</td><td>${esc(r.telefono)}</td><td>${esc(r.correo)}</td><td>${esc(r.domicilio)}</td><td><span class="badge">${used}</span></td><td><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn" type="button" data-prov-edit="${r._id}">✏️ Editar</button><button class="btn danger" type="button" data-prov-del="${r._id}">🗑️ Eliminar</button></div></td></tr>`;}).join(''):'<tr><td colspan="8" style="text-align:center;color:#64748b;">No hay proveedores configurados.</td></tr>';
+  if($('provResumen'))$('provResumen').textContent=`${list.length} proveedor${list.length===1?'':'es'} · ${withProvider} entrada(s) con proveedor`;
+  tb?.querySelectorAll('[data-prov-edit]').forEach(b=>b.onclick=()=>edit(b.dataset.provEdit));
+  tb?.querySelectorAll('[data-prov-del]').forEach(b=>b.onclick=()=>remove(b.dataset.provDel));
+  // Evitar reconstruir el selector de Entradas en cada tecla del filtro.
+  if(!options.searchOnly)await refreshSelect();
 }
 window.drawProveedores=draw;
-function bind(){$('btnProvGuardar')?.addEventListener('click',save);$('btnProvNuevo')?.addEventListener('click',clearForm);$('btnProvExport')?.addEventListener('click',exportCsv);$('provBusca')?.addEventListener('input',()=>draw().catch(console.error));$('entProveedor')?.addEventListener('change',updateEntradaInfo);refreshSelect().catch(console.error);}
+function bind(){$('btnProvGuardar')?.addEventListener('click',save);$('btnProvNuevo')?.addEventListener('click',clearForm);$('btnProvExport')?.addEventListener('click',exportCsv);$('provBusca')?.addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>draw({searchOnly:true}).catch(console.error),130);});$('entProveedor')?.addEventListener('change',updateEntradaInfo);refreshSelect().catch(console.error);}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',bind,{once:true});else bind();
 })();
 
@@ -35788,48 +36016,189 @@ async function openModal(){ensureUi();modalOpen=true;$('mxQxArchiveModal')?.clas
 function closeModal(){modalOpen=false;$('mxQxArchiveModal')?.classList.add('hidden')}
 function schedule(ms=400){clearTimeout(timer);timer=setTimeout(()=>refresh(false).catch(()=>{}),ms)}
 window.mxRefreshQxViewerArchive=()=>refresh(true);window.mxOpenQxViewerArchive=openModal;window.mxDeleteQxViewerHistory=deleteHistory;
-async function boot(){ensureUi();await loadLocal();renderModal();setTimeout(()=>refresh(false).catch(()=>{}),1400);setInterval(()=>{if(document.hidden)return;if(modalOpen||$('view-salidasrapidas')&&!$('view-salidasrapidas').classList.contains('hidden'))refresh(false).catch(()=>{})},20000);window.addEventListener('focus',()=>schedule(250));window.addEventListener('online',()=>schedule(120));window.addEventListener('mx-viewer-refresh-now',()=>schedule(120));const mo=new MutationObserver(()=>ensureUi());mo.observe(document.body,{childList:true,subtree:true})}
+async function boot(){ensureUi();await loadLocal();renderModal();setTimeout(()=>refresh(false).catch(()=>{}),1400);setInterval(()=>{if(document.hidden)return;if(modalOpen||$('view-salidasrapidas')&&!$('view-salidasrapidas').classList.contains('hidden'))refresh(false).catch(()=>{})},20000);window.addEventListener('focus',()=>schedule(250));window.addEventListener('online',()=>schedule(120));window.addEventListener('mx-viewer-refresh-now',()=>schedule(120));let mxUiEnsureTimerV276=0;
+  const mo=new MutationObserver(()=>{
+    // En un render con cientos de renglones no volver a montar el visor cientos de veces.
+    if($('btnQxViewerArchive')&&$('mxQxArchiveModal'))return;
+    if(mxUiEnsureTimerV276)return;
+    mxUiEnsureTimerV276=setTimeout(()=>{mxUiEnsureTimerV276=0;ensureUi()},250);
+  });
+  mo.observe(document.body,{childList:true,subtree:true})}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
 
 
-/* ===== MACROXEL HPS · Espejo hospitalario v2 (snapshot completo sanitizado) ===== */
+/* ===== MACROXEL HPS v274 · PRIORIDAD A CAPTURA Y LIMPIEZA DE TRABAJO ===== */
+(function(){
+  'use strict';
+  if(window.__mxUserInputPriorityV274)return;
+  window.__mxUserInputPriorityV274=true;
+  let lastInputAt=0;
+  const mark=()=>{lastInputAt=Date.now();};
+  document.addEventListener('input',mark,{capture:true,passive:true});
+  document.addEventListener('keydown',mark,{capture:true,passive:true});
+  document.addEventListener('focusin',mark,{capture:true,passive:true});
+  // No impide guardados/operaciones criticas. Solo posterga lecturas masivas del espejo.
+  window.mxUserEditingHotV274=(quietMs=1300)=>{
+    const el=document.activeElement;
+    if(!el||!el.matches?.('input,textarea,select,[contenteditable="true"]'))return false;
+    return Date.now()-lastInputAt<quietMs;
+  };
+})();
+
+/* ===== MACROXEL HPS v276 · Espejo hospitalario incremental y cooperativo ===== */
 (()=>{
   'use strict';
   if(window.__mxHospitalMirrorPublisherV2)return;window.__mxHospitalMirrorPublisherV2=true;
   const STORES=['inventory','entradas','salidas','antibioticos','movimientos','pedidos','conteo','medicos','cpm','transferencias','users','settings'];
   const SIG_PREFIX='mx_hospital_mirror_sig_v2_';
-  const timers=new Map();let publishingAll=false;
+  const timers=new Map(),running=new Map(),revisions=new Map(),knownCounts=new Map(),dirty=new Set();
+  let publishingAll=false,lastSweepAt=0;
   const txt=v=>String(v==null?'':v).trim();
   const branch=()=>{try{return txt(window.mxGetSucursalFromLicense?.()||window.mxGetEcosystemStoreId?.()||'HGAM').toUpperCase().replace(/[.#$\[\]\/]/g,'_')||'HGAM'}catch(_e){return'HGAM'}};
   const dbReady=()=>typeof window.idbAll==='function'&&typeof window.mxPublishJson==='function'&&(!window.mxRemoteDbEnabled||window.mxRemoteDbEnabled());
-  function safeKey(v){let s=txt(v);if(!s)return'';return s.replace(/[.#$\[\]\/]/g,'_')}
+  const safeKey=v=>txt(v).replace(/[.#$\[\]\/]/g,'_');
   function recordKey(row,i){return safeKey(row?._id??row?.id??row?.firebase_id??row?.folio??row?.folio_doc??row?.codigo_barras??row?.clave??('R'+i))||('R'+i)}
   const SECRET_RE=/(password|pass(?:word)?|contras(?:eña|ena)?|pwd|secret|token|firebase|remote.?db|github.*(?:url|route|base)|license|licencia|api.?key|private.?key|access.?key|auth)/i;
   function sanitize(store,value,depth=0){
     if(depth>7)return null;
     if(Array.isArray(value))return value.map(v=>sanitize(store,v,depth+1));
     if(!value||typeof value!=='object')return value;
-    const out={};for(const [k,v] of Object.entries(value)){if(SECRET_RE.test(k))continue;if(store==='users'&&/^(pin|clave|hash|salt)$/i.test(k))continue;const x=sanitize(store,v,depth+1);if(x!==undefined)out[k]=x}return out
+    const out={};for(const [k,v] of Object.entries(value)){if(SECRET_RE.test(k))continue;if(store==='users'&&/^(pin|clave|hash|salt)$/i.test(k))continue;const x=sanitize(store,v,depth+1);if(x!==undefined)out[k]=x}return out;
   }
-  function hashRows(rows){let h=2166136261;for(const r of rows){const s=JSON.stringify(r);for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}}return(h>>>0).toString(36)+'_'+rows.length}
-  function toNode(store,rows){const node={};(rows||[]).forEach((r,i)=>{if(!r||typeof r!=='object')return;let k=recordKey(r,i);if(Object.prototype.hasOwnProperty.call(node,k))k=k+'_'+i;node[k]=sanitize(store,r)});return node}
+  // El trabajo de serialización se reparte en lotes: evita congelar el teclado con miles de movimientos.
+  const yieldControl=()=>new Promise(resolve=>setTimeout(resolve,0));
+  async function snapshot(store,rows){
+    const node={};let h=2166136261;const list=Array.isArray(rows)?rows:[];
+    // Mantener la firma histórica: se calcula sobre las filas saneadas, incluso si una no tiene llave.
+    for(let i=0;i<list.length;i++){
+      const row=sanitize(store,list[i]);
+      const json=JSON.stringify(row);
+      for(let k=0;k<json.length;k++){h^=json.charCodeAt(k);h=Math.imul(h,16777619)}
+      if(row&&typeof row==='object'){
+        let key=recordKey(row,i);if(Object.prototype.hasOwnProperty.call(node,key))key=key+'_'+i;
+        node[key]=row;
+      }
+      if(i>0&&i%100===0)await yieldControl();
+    }
+    return {node,signature:(h>>>0).toString(36)+'_'+list.length,count:list.length};
+  }
   async function publishMeta(extra={}){
-    if(!dbReady())return false;const b=branch(),counts={};
-    for(const store of STORES){try{counts[store]=(await window.idbAll(store).catch(()=>[])).length||0}catch(_e){counts[store]=0}}
+    if(!dbReady())return false;
+    const counts={};
+    for(const store of STORES){
+      if(!knownCounts.has(store)){
+        try{knownCounts.set(store,(await window.idbAll(store).catch(()=>[])).length||0)}catch(_e){knownCounts.set(store,0)}
+      }
+      counts[store]=knownCounts.get(store)||0;
+    }
+    const b=branch();
     const meta={version:2,source:'SISTEMA_PRINCIPAL_MACROXEL_HOSPITALES',readOnlyMirror:true,systemId:b,unitName:txt(window.mxGetUnitNameFromLicense?.()||''),updatedAt:new Date().toISOString(),updatedAtText:new Date().toLocaleString('es-MX'),deviceId:txt(localStorage.getItem('macroxel_device_id')||localStorage.getItem('mx_license_device_id')||''),menuVersion:'principal-v204',counts,...extra};
-    await window.mxPublishJson(`/hospital_mirror/${encodeURIComponent(b)}/meta`,meta).catch(()=>false);return true
+    return (await window.mxPublishJson(`/hospital_mirror/${encodeURIComponent(b)}/meta`,meta).catch(()=>false))===true;
   }
   async function publishStore(store,force=false){
     store=txt(store);if(!STORES.includes(store)||!dbReady())return false;
-    try{const raw=await window.idbAll(store).catch(()=>[]),rows=(raw||[]).map(r=>sanitize(store,r)),sig=hashRows(rows),sigKey=SIG_PREFIX+branch()+'_'+store;if(!force&&localStorage.getItem(sigKey)===sig)return false;await window.mxPublishJson(`/hospital_mirror/${encodeURIComponent(branch())}/stores/${encodeURIComponent(store)}`,toNode(store,rows));try{localStorage.setItem(sigKey,sig)}catch(_e){}await window.mxPublishJson(`/hospital_mirror/${encodeURIComponent(branch())}/store_meta/${encodeURIComponent(store)}`,{count:rows.length,updatedAt:new Date().toISOString(),signature:sig}).catch(()=>{});return true}catch(e){console.warn('[ESPEJO HOSPITALARIO] No se pudo publicar',store,e?.message||e);return false}
+    if(running.has(store))return running.get(store);
+    const rev=revisions.get(store)||0;
+    const promise=(async()=>{
+      try{
+        const raw=await window.idbAll(store);
+        const packed=await snapshot(store,raw);
+        knownCounts.set(store,packed.count);
+        const sigKey=SIG_PREFIX+branch()+'_'+store;
+        if(!force&&localStorage.getItem(sigKey)===packed.signature){
+          if((revisions.get(store)||0)===rev)dirty.delete(store);
+          return false;
+        }
+        const root=`/hospital_mirror/${encodeURIComponent(branch())}`;
+        // Una publicación fallida NO debe marcar la firma como transmitida.
+        const ok=await window.mxPublishJson(`${root}/stores/${encodeURIComponent(store)}`,packed.node);
+        if(ok!==true)return false;
+        try{localStorage.setItem(sigKey,packed.signature)}catch(_e){}
+        await window.mxPublishJson(`${root}/store_meta/${encodeURIComponent(store)}`,{count:packed.count,updatedAt:new Date().toISOString(),signature:packed.signature}).catch(()=>false);
+        if((revisions.get(store)||0)===rev)dirty.delete(store);
+        return true;
+      }catch(e){console.warn('[ESPEJO HOSPITALARIO] No se pudo publicar',store,e?.message||e);return false}
+    })();
+    running.set(store,promise);
+    try{return await promise;}finally{
+      running.delete(store);
+      if((revisions.get(store)||0)!==rev)schedule(store,1200);
+    }
   }
-  function schedule(store,delay=550){if(!STORES.includes(String(store||'')))return;clearTimeout(timers.get(store));timers.set(store,setTimeout(()=>{timers.delete(store);publishStore(store,false).then(changed=>{if(changed)publishMeta({lastStore:store}).catch(()=>{})})},Math.max(120,Number(delay)||550)))}
-  async function publishAll(force=false){if(publishingAll||!dbReady())return false;publishingAll=true;try{let changed=false;for(const store of STORES){changed=(await publishStore(store,force))||changed;await new Promise(r=>setTimeout(r,70))}await publishMeta({fullSync:true});return changed}finally{publishingAll=false}}
-  function wrapOne(name,storeArgIndex=0){const original=window[name];if(typeof original!=='function'||original.__mxHospitalMirrorWrapped)return;const fn=async function(){const store=String(arguments[storeArgIndex]||'');const result=await original.apply(this,arguments);if(STORES.includes(store))schedule(store,350);return result};fn.__mxHospitalMirrorWrapped=true;fn.__mxHospitalMirrorOriginal=original;window[name]=fn}
+  // Se marca la tabla después de completar el guardado, nunca antes.
+  function schedule(store,delay=550){
+    store=txt(store);if(!STORES.includes(store))return;
+    dirty.add(store);
+    clearTimeout(timers.get(store));
+    timers.set(store,setTimeout(()=>{
+      timers.delete(store);
+      if(document.hidden||window.mxUserEditingHotV274?.()){schedule(store,1450);return;}
+      publishStore(store,false).then(changed=>{if(changed)publishMeta({lastStore:store}).catch(()=>{})}).catch(()=>{});
+    },Math.max(150,Number(delay)||550)));
+  }
+  async function publishAll(force=false){
+    if(publishingAll||!dbReady()||document.hidden||window.mxUserEditingHotV274?.())return false;
+    publishingAll=true;
+    let changed=false,completed=true;
+    try{
+      // El barrido de verificación sigue existiendo para detectar escrituras externas,
+      // pero no recorre doce almacenes a cada minuto si no se ha cambiado nada.
+      for(const store of STORES){
+        if(document.hidden||window.mxUserEditingHotV274?.()){completed=false;break}
+        changed=(await publishStore(store,force))||changed;
+        await new Promise(resolve=>setTimeout(resolve,75));
+      }
+      if(completed){lastSweepAt=Date.now();await publishMeta({fullSync:true});}
+      return changed;
+    }finally{publishingAll=false;}
+  }
+  function wrapOne(name,storeArgIndex=0){
+    const original=window[name];if(typeof original!=='function'||original.__mxHospitalMirrorWrapped)return;
+    const fn=async function(){
+      const store=txt(arguments[storeArgIndex]);
+      const result=await original.apply(this,arguments);
+      if(STORES.includes(store)){
+        revisions.set(store,(revisions.get(store)||0)+1);
+        schedule(store,850);
+      }
+      return result;
+    };
+    fn.__mxHospitalMirrorWrapped=true;fn.__mxHospitalMirrorOriginal=original;window[name]=fn;
+  }
   function wrapWrites(){wrapOne('idbPut');wrapOne('idbBulkPut');wrapOne('idbDelete');wrapOne('idbClear');wrapOne('mxReplaceStoreSafely')}
-  window.mxHospitalMirrorPublishAll=publishAll;window.mxHospitalMirrorPublishStore=publishStore;window.mxHospitalMirrorSchedule=schedule;
-  function start(){wrapWrites();setTimeout(()=>publishAll(true).catch(()=>{}),3500);setInterval(()=>{wrapWrites();if(!document.hidden)publishAll(false).catch(()=>{})},45000);window.addEventListener('focus',()=>{wrapWrites();setTimeout(()=>publishAll(false).catch(()=>{}),700)});window.addEventListener('mx-operational-sync',()=>setTimeout(()=>publishAll(false).catch(()=>{}),900))}
+  window.mxHospitalMirrorPublishAll=publishAll;
+  window.mxHospitalMirrorPublishStore=publishStore;
+  window.mxHospitalMirrorSchedule=schedule;
+  window.mxHospitalMirrorStatusV276=()=>({pending:[...dirty],publishing:[...running.keys()],lastSweepAt,counts:Object.fromEntries(knownCounts)});
+  function start(){
+    wrapWrites();
+    // Escaneo de reconciliación al iniciar, diferido si la persona ya está capturando.
+    let initialTimer=0;
+    const beginInitial=()=>{
+      clearTimeout(initialTimer);
+      if(document.hidden||window.mxUserEditingHotV274?.()){
+        initialTimer=setTimeout(beginInitial,1800);return;
+      }
+      publishAll(true).catch(()=>{}); // Reafirma la copia remota al abrir, incluso tras una restauración de Firebase.
+    };
+    initialTimer=setTimeout(beginInitial,4200);
+    setInterval(()=>{
+      wrapWrites();
+      if(document.hidden||window.mxUserEditingHotV274?.())return;
+      if(dirty.size){for(const store of [...dirty])if(!timers.has(store)&&!running.has(store))schedule(store,500);}
+      if(Date.now()-lastSweepAt>=8*60*1000)publishAll(false).catch(()=>{});
+    },30000);
+    let resumeTimer=0;
+    const afterResume=()=>{wrapWrites();clearTimeout(resumeTimer);resumeTimer=setTimeout(()=>{
+      if(dirty.size){for(const store of [...dirty])schedule(store,400)}
+      else if(Date.now()-lastSweepAt>=8*60*1000)publishAll(false).catch(()=>{});
+    },1800)};
+    window.addEventListener('focus',afterResume);
+    document.addEventListener('visibilitychange',()=>{if(!document.hidden)afterResume()});
+    window.addEventListener('online',afterResume);
+    window.addEventListener('mx-operational-sync',afterResume);
+  }
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start,{once:true});else start();
 })();
 
