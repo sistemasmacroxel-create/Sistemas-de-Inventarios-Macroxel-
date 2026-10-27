@@ -4,6 +4,7 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/macroxel-abx-v285.yml'
+      - 'tools/v285_abx_publisher.py'
   workflow_dispatch:
 permissions:
   contents: write
@@ -14,64 +15,20 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Conciliar calculo ABX con inventario publicado
-        shell: bash
+      - name: Conciliar capacidad antibioticos con inventario
+        run: python3 tools/v285_abx_publisher.py
+      - name: Verificar JavaScript
         run: |
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-          p=Path('docs/sistema-inventario.js')
-          s=p.read_text(encoding='utf-8')
-          if 'mxAbxCapacityHandShakeV285' not in s:
-            before="      const sig=signatureOf(items);if(!force&&sig===lastSignature&&Date.now()-lastPublishedAt<8*60*1000)return false;"
-            after="""      // mxAbxCapacityHandShakeV285: confirmar la misma revision de Inventario Principal.
-      const actualRev=capacityInventoryRevision(),suc=branch();
-      let confirmedMeta=null;
-      try{if(typeof window.mxGetJson==='function')confirmedMeta=await window.mxGetJson('/inventory_cpm_totals/'+encodeURIComponent(suc)+'/meta')}catch(e){console.warn('[ABX V285] Lectura de inventario:',e?.message||e)}
-      const same=confirmedMeta?.sourceAuthority==='INVENTARIO_PRINCIPAL'&&NUM(confirmedMeta?.seq)>0&&TXT(confirmedMeta?.revision)===actualRev;
-      if(!same){
-        console.warn('[ABX V285] Esperando revision de inventario antes de confirmar capacidad.');
-        if(Date.now()-lastInventoryRepairAt>240000&&typeof window.mxPublicarInventarioFirebase==='function'){
-          lastInventoryRepairAt=Date.now();
-          Promise.resolve().then(()=>window.mxPublicarInventarioFirebase(true)).then(()=>schedule(true,3500)).catch(e=>console.warn('[ABX V285]',e?.message||e));
-        }
-        return false;
-      }
-      const sig=actualRev+'|'+confirmedMeta.seq+'|'+signatureOf(items);
-      if(!force&&sig===lastSignature&&Date.now()-lastPublishedAt<6*60*1000)return false;"""
-            assert s.count(before)==1,'No se encontro la funcion publicadora esperada'
-            s=s.replace(before,after,1)
-            key="let busy=null,lastSignature='',lastPublishedAt=0,timer=0,pendingForce=false,lastUserAction=Date.now();"
-            assert s.count(key)==1
-            s=s.replace(key,"let busy=null,lastSignature='',lastPublishedAt=0,timer=0,pendingForce=false,lastUserAction=Date.now(),lastInventoryRepairAt=0;",1)
-            key="inventorySeq=NUM(localStorage.getItem('mx_cpm_inventory_seq_v1010::'+branch()))"
-            assert s.count(key)==1
-            s=s.replace(key,"inventorySeq=NUM(confirmedMeta.seq)",1)
-            key="payload={schemaVersion:278,inventorySeq,inventoryRevision:capacityInventoryRevision()"
-            assert s.count(key)==1
-            s=s.replace(key,"payload={schemaVersion:285,inventorySeq,inventoryRevision:actualRev",1)
-            start="await window.mxPublishJson("
-            # Change only the first publication after the payload is assembled.
-            marker="      const now=new Date(),inventorySeq=NUM(confirmedMeta.seq),"
-            idx=s.index(marker)
-            front,tail=s[:idx],s[idx:]
-            assert tail.count("payload);await window.mxPublishJson(")>=1
-            tail=tail.replace("      await window.mxPublishJson(","      const published=await window.mxPublishJson(",1)
-            tail=tail.replace("payload);await window.mxPublishJson(","payload);if(published!==true)throw new Error('Firebase no confirmo publicacion de capacidad');await window.mxPublishJson(",1)
-            s=front+tail
-            p.write_text(s,encoding='utf-8')
-          p=Path('docs/index.html')
-          html=p.read_text(encoding='utf-8')
-          html=re.sub(r'sistema-inventario\.js\?v=[^"\s<>]+','sistema-inventario.js?v=v285-abx-confirmado',html)
-          p.write_text(html,encoding='utf-8')
-          PY
           node --check docs/sistema-inventario.js
-      - name: Actualizar web sin modificar licencias ni inventario
+          grep -q 'mxAbxCapacityHandShakeV285' docs/sistema-inventario.js
+      - name: Publicar web v285
         shell: bash
         run: |
-          if git diff --quiet -- docs/index.html docs/sistema-inventario.js; then echo 'Publicada previamente'; exit 0; fi
-          git config user.name 'Macroxel Web ABX'
+          if git diff --quiet -- docs/index.html docs/sistema-inventario.js; then
+            echo 'Ya estaba actualizado'; exit 0
+          fi
+          git config user.name 'Sistemas Macroxel'
           git config user.email 'sistemasmacroxel@gmail.com'
           git add docs/index.html docs/sistema-inventario.js
-          git commit -m 'Corrige capacidad confirmada antibióticos v285'
+          git commit -m 'Confirma capacidad de antibioticos y revision inventario v285'
           git push origin HEAD:main
