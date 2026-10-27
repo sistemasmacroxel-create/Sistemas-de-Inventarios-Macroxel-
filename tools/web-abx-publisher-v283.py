@@ -26,7 +26,7 @@ s=s.replace(old, old+"try{window.dispatchEvent(new CustomEvent('mx-primary-stock
 p.write_text(s,encoding='utf-8')
 q=Path('docs/index.html')
 h=q.read_text(encoding='utf-8')
-h,n=re.subn(r'sistema-inventario\\.js\\?v=[^"\\s]+', 'sistema-inventario.js?v=v283-abx-control-central-20261026',h,count=1)
+h,n=re.subn(r'sistema-inventario\.js\?v=[^"\s]+', 'sistema-inventario.js?v=v283-abx-control-central-20261026',h,count=1)
 assert n==1,n
 q.write_text(h,encoding='utf-8')
 print('Publicador actualizado, versión web invalidada')
