@@ -21,8 +21,8 @@ jobs:
         shell: bash
         run: |
           set -eu
-          SHA=$(sha256sum docs/sistema-inventario.js | awk '{print $1}')
-          if [ "$SHA" != '5ddb3cc13fe132544a98998bb310689e336bdca43197c0abda4910436df7f254' ]; then
+          SHA=$(git hash-object docs/sistema-inventario.js)
+          if [ "$SHA" != '1e55316887cbee7fc75cd6ecaf20a38ce613ae92' ]; then
             echo "::error::El emisor web cambió. Evitar reemplazo accidental."
             exit 1
           fi
