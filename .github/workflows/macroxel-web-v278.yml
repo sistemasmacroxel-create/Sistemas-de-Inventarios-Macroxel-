@@ -1,0 +1,67 @@
+name: Publicar sistema web Macroxel v278
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/macroxel-web-v278.yml'
+      - 'tools/v278/web-index.br.b64'
+      - 'tools/v278/web-runtime.br.b64'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publicar-web-v278:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Restaurar web completo y comprobar SHA-256
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const zlib = require('zlib');
+          const crypto = require('crypto');
+          const files = [
+            {
+              source: 'tools/v278/web-index.br.b64',
+              target: 'docs/index.html',
+              sha256: '66da2765996d2bd003a83527bb17f39619a270dd0f03163564c848c8d0de4a7a'
+            },
+            {
+              source: 'tools/v278/web-runtime.br.b64',
+              target: 'docs/sistema-inventario.js',
+              sha256: '5ddb3cc13fe132544a98998bb310689e336bdca43197c0abda4910436df7f254'
+            }
+          ];
+          for (const file of files) {
+            const encoded = fs.readFileSync(file.source, 'utf8').replace(/\s/g, '');
+            const bytes = zlib.brotliDecompressSync(Buffer.from(encoded, 'base64'));
+            const got = crypto.createHash('sha256').update(bytes).digest('hex');
+            if (got !== file.sha256) throw new Error('SHA-256 no coincide: ' + file.target);
+            fs.writeFileSync(file.target, bytes);
+            console.log('Archivo web verificado: ' + file.target + ' ' + bytes.length + ' bytes');
+          }
+          NODE
+      - name: Comprobar sintaxis y modulos v278
+        shell: bash
+        run: |
+          node --check docs/sistema-inventario.js
+          grep -q 'Resurtido inteligente' docs/index.html
+          grep -q 'sistema-inventario.js' docs/index.html
+      - name: Publicar solo archivos web
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/index.html docs/sistema-inventario.js; then
+            echo 'La web ya se encuentra en v278.'
+            exit 0
+          fi
+          git config user.name 'Sistemas Macroxel - Web Sync'
+          git config user.email 'sistemasmacroxel@gmail.com'
+          git add -- docs/index.html docs/sistema-inventario.js
+          git commit -m 'Actualiza web a v278: existencias vigentes y sincronizacion de visores'
+          git push origin HEAD:main
