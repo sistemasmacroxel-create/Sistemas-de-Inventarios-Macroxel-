@@ -1,0 +1,46 @@
+name: Integrar filtro por ubicacion v277 en web vigente
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/macroxel-web-v279-ubicacion.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macroxel-publicacion-web-v279
+  cancel-in-progress: false
+
+jobs:
+  integrar-ubicacion:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener la ultima version publicada sin reemplazarla
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Aplicar solo el filtro por ubicacion a la web actual
+        run: python tools/patch_web_ubicacion_v279.py
+      - name: Comprobar que se conserva resurtido, ubicacion y sintaxis
+        shell: bash
+        run: |
+          node --check docs/sistema-inventario.js
+          grep -q 'Resurtido inteligente' docs/index.html
+          grep -q 'id="invFiltroUbic"' docs/index.html
+          grep -q 'mxInvUbicacionCoincideV277' docs/sistema-inventario.js
+          grep -q 'invFiltroUbic' docs/sistema-inventario.js
+          git diff --stat -- docs/index.html docs/sistema-inventario.js
+      - name: Publicar solo los archivos web modificados
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/index.html docs/sistema-inventario.js; then
+            echo 'El filtro ya estaba publicado: no se altera la web.'
+            exit 0
+          fi
+          git config user.name 'Sistemas Macroxel Web'
+          git config user.email 'sistemasmacroxel@gmail.com'
+          git add -- docs/index.html docs/sistema-inventario.js
+          git commit -m 'Integra filtro por ubicacion v277 sobre web vigente sin retroceder v278'
+          git push origin HEAD:main
