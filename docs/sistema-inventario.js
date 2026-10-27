@@ -19585,22 +19585,9 @@ function mxInventoryExistenceValue(it){
   return 0;
 }
 function mxNormalizePublicText(v){return String(v==null?'':v).trim().replace(/\s+/g,' ');}
-// v278: los visores son una FOTO de lotes existentes y utilizables, nunca un historial.
-// Caducidad al finalizar el día local, sin confundir DD/MM/AAAA con MM/DD/AAAA.
-function mxViewerLotIsCurrent(row,reference=new Date()){
-  const raw=String(row?.caducidad??row?.cad??row?.vence??row?.expiry??'').trim();
-  if(!raw)return true;
-  let y=0,m=0,d=0,match;
-  if((match=raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/))){y=+match[1];m=+match[2];d=+match[3];}
-  else if((match=raw.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})/))){d=+match[1];m=+match[2];y=+match[3];}
-  else return true; // no ocultar registros con fechas no verificables
-  const expiry=new Date(y,m-1,d),today=new Date(reference.getFullYear(),reference.getMonth(),reference.getDate());
-  return expiry.getFullYear()!==y||expiry.getMonth()!==m-1||expiry.getDate()!==d?true:expiry>=today;
-}
-function mxViewerUsableInventoryRows(rows){return(Array.isArray(rows)?rows:[]).filter(r=>mxInventoryExistenceValue(r)>0&&mxViewerLotIsCurrent(r));}
 function mxBuildInventoryTotals(rows){
   const grouped=new Map();
-  for(const it of mxViewerUsableInventoryRows(rows)){
+  for(const it of (Array.isArray(rows)?rows:[])){
     const clave=mxNormalizePublicText(it?.clave ?? it?.codigo ?? it?.csg ?? it?.id ?? it?.key).toUpperCase();
     const descripcion=mxNormalizePublicText(it?.descripcion ?? it?.nombre ?? it?.desc ?? it?.producto ?? it?.name);
     if(!clave && !descripcion) continue;
@@ -19641,7 +19628,7 @@ function mxBuildInventoryTotals(rows){
 
 
 function mxBuildInventoryLots(rows){
-  return mxViewerUsableInventoryRows(rows).map(it=>{
+  return (Array.isArray(rows)?rows:[]).map(it=>{
     const hasLocations=!!(it&&['almacen','ALMACEN','existenciaAlmacen','existencia almacen','existencia_almacen','alm','pzs_almacen','pzsalmacen','estantes','ESTANTES','estante','ESTANTE','existenciaEstante','existencia estante','existencia_estante','est','pzs_estantes','pzsestantes'].some(k=>Object.prototype.hasOwnProperty.call(it,k)));
     const legacyTotal=Number(it?.existencia ?? it?.existencias ?? it?.stock ?? it?.total ?? 0);
     const almacen=hasLocations?Number(it?.almacen ?? it?.ALMACEN ?? it?.existenciaAlmacen ?? it?.['existencia almacen'] ?? it?.existencia_almacen ?? it?.alm ?? it?.pzs_almacen ?? it?.pzsalmacen ?? 0):(Number.isFinite(legacyTotal)?legacyTotal:0);
@@ -19864,7 +19851,6 @@ async function mxPublicarInventarioFirebase(force=false){
     };
     await mxPublishJson(`${MX_INV_PUBLIC_PATH}/${encodeURIComponent(suc)}/products`,payload);
     await mxPublishJson(`${MX_INV_PUBLIC_PATH}/${encodeURIComponent(suc)}/lots`,lotPayload);
-    await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory_full`,{updatedAt:nowIso,stockedKeys:items.length,source:'PRINCIPAL_V278'}).catch(()=>{});
     try{await mxPublishJson(`/inventory_analytics/${encodeURIComponent(suc)}`,analyticsPayload);await mxPublishJson(`/inventory_analytics/${encodeURIComponent(suc)}/summary`,mxBuildInventoryAnalyticsSummaryPayload(analyticsPayload));}catch(e){console.warn('[ANALITICA] No se pudo publicar analytics/summary; aplica las reglas Firebase incluidas.',e?.message||e);}
     __mxLastPublishAt=now;
     try{localStorage.setItem(MX_INV_FULL_SIG_KEY,fullSig);}catch(_e){}
@@ -23769,7 +23755,7 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   function makeChart(name,id,config){destroyChart(name);const el=document.getElementById(id);if(!el||typeof Chart!=='function')return;try{charts[name]=new Chart(el,config);}catch(e){console.warn('Gráfica análisis',name,e);}}
 
   function mxAnaDaysInclusive(from,to){const a=Date.parse(String(from||'')+'T12:00:00'),b=Date.parse(String(to||'')+'T12:00:00');return Number.isFinite(a)&&Number.isFinite(b)?Math.max(1,Math.round((b-a)/86400000)+1):1;}
-  function mxAnaInventoryQty(it={}){if(typeof mxViewerLotIsCurrent==='function'&&!mxViewerLotIsCurrent(it))return 0;try{if(typeof mxSalExistenciaReal==='function')return Math.max(0,num(mxSalExistenciaReal(it)));}catch(_e){}try{if(typeof pickExistencia==='function')return Math.max(0,num(pickExistencia(it)));}catch(_e){}const hasLoc=[it.almacen,it.ALMACEN,it.estantes,it.ESTANTES].some(v=>v!==undefined&&v!==null&&v!=='');return Math.max(0,hasLoc?(num(it.almacen??it.ALMACEN)+num(it.estantes??it.ESTANTES)):num(it.existencia??it.existencias??it.EXISTENCIA??it.pzs));}
+  function mxAnaInventoryQty(it={}){try{if(typeof mxSalExistenciaReal==='function')return Math.max(0,num(mxSalExistenciaReal(it)));}catch(_e){}try{if(typeof pickExistencia==='function')return Math.max(0,num(pickExistencia(it)));}catch(_e){}const hasLoc=[it.almacen,it.ALMACEN,it.estantes,it.ESTANTES].some(v=>v!==undefined&&v!==null&&v!=='');return Math.max(0,hasLoc?(num(it.almacen??it.ALMACEN)+num(it.estantes??it.ESTANTES)):num(it.existencia??it.existencias??it.EXISTENCIA??it.pzs));}
   function mxAnaTreatmentClosed(r={}){const state=norm([r.estado_colectivo,r.estadoColectivo,r.estado_tratamiento,r.estadoTratamiento,r.cierre_servicio_estado,r.cierreServicioEstado,r.estado_cierre_servicio,r.estadoCierreServicio,r.status,r.estado,r.observaciones,r.observacion].filter(Boolean).join(' '));return r.tratamiento_activo===false||r.tratamientoActivo===false||r.activo===false||r.cierre_servicio===true||r.cierreServicio===true||r.canceladoPorServicio===true||r.tratamiento_completo===true||r.tratamientoCompleto===true||/(CERRAD|CANCEL|ANUL|RECHAZ|FINALIZADO TRATAMIENTO|TRATAMIENTO COMPLETO)/.test(state);}
   function mxAnaIsJustified(r={}){return norm(r.tipo_doc||r.tipoDocumento||r.tipo||r.tipoSalida).includes('COLECTIVO JUSTIFICADO');}
   function mxAnaTreatmentTotal(r={}){const vals=[r.cantidad_tratamiento_total,r.cantidadTratamientoTotal,r.total_unidades_tratamiento,r.totalUnidadesTratamiento,r.cantidadSolicitadaCalculada,r.autorizadoTratamiento,r.cantidadAutorizadaTratamiento].map(num).filter(v=>v>0),perDay=Math.max(0,num(r.cantidad_24_horas??r.cantidad24Horas)),days=Math.max(0,num(r.tiempo_tratamiento_dias??r.tiempoTratamientoDias));if(perDay>0&&days>0)vals.push(perDay*days);return vals.length?Math.min(...vals):0;}
@@ -24114,9 +24100,9 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   'use strict';
   if(window.__mxAntibioticCapacityPublisherV146)return;window.__mxAntibioticCapacityPublisherV146=true;
   const TXT=v=>String(v==null?'':v).trim().replace(/\s+/g,' '),NUM=v=>{const n=Number(v);return Number.isFinite(n)?n:0},NORM=v=>TXT(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase();
-  let busy=null,lastSignature='',lastPublishedAt=0,timer=0,pendingForce=false,lastUserAction=Date.now(),lastInventoryRepairAt=0;
+  let busy=null,lastSignature='',timer=0,pendingForce=false,lastUserAction=Date.now();
   ['pointerdown','keydown','wheel','touchstart'].forEach(type=>document.addEventListener(type,()=>{lastUserAction=Date.now();},{passive:true,capture:true}));
-  const idleYield=()=>new Promise(resolve=>{try{if(typeof requestIdleCallback==='function')requestIdleCallback(()=>resolve(),{timeout:220});else setTimeout(resolve,0)}catch(_e){setTimeout(resolve,0)}});
+  const idleYield=()=>new Promise(resolve=>{const wait=()=>{const left=5000-(Date.now()-lastUserAction);if(left>0){setTimeout(wait,Math.min(1200,left+30));return;}try{if(typeof requestIdleCallback==='function')requestIdleCallback(()=>resolve(),{timeout:1800});else setTimeout(resolve,40);}catch(_e){setTimeout(resolve,40);}};wait();});
   function branch(){try{return String(window.mxGetSucursalFromLicense?.()||'HGAM').trim().toUpperCase()||'HGAM'}catch(_e){return'HGAM'}}
   function claveOf(r={}){return TXT(r.clave||r.csg||r.CSG||r.codigo||r.codigo_barras||r.codigoBarras)}
   function descOf(r={}){return TXT(r.descripcion||r.nombre||r.medicamento||r.DESCRIPCION||r.DESCRIPCIÓN)}
@@ -24124,26 +24110,18 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   async function loadInventory(force=false){try{if(typeof window.__mxLoadInventory==='function'){const r=await window.__mxLoadInventory({force:!!force,requireRows:false});if(Array.isArray(r))return r}}catch(_e){}try{return await window.idbAll?.('inventory')||[]}catch(_e){return[]}}
   async function loadAntibioticHistory(){try{return await window.idbAll?.('antibioticos')||[]}catch(_e){return[]}}
   function signatureOf(items){return JSON.stringify((items||[]).map(r=>[r.clave,r.existencia,r.solicitadoTotal,r.yaSurtido,r.pendienteComprometido,r.disponibleNuevo,r.promedioColectivo,r.mediana30,r.folios30,r.tratamientosActivos,r.tratamientosEstimados,r.base,r.staleExcluded]));}
-  function capacityInventoryRevision(){
-    let sig={};try{sig=JSON.parse(localStorage.getItem('mx_cpm_inventory_signatures_v278::'+branch())||'{}')||{}}catch(_e){}
-    const stable=Object.keys(sig).sort().map(k=>k+':'+sig[k]).join('|');
-    let h=2166136261;for(let i=0;i<stable.length;i++){h^=stable.charCodeAt(i);h=Math.imul(h,16777619);}
-    return (h>>>0).toString(36);
-  }
   async function publish(force=false){
     if(busy){pendingForce=pendingForce||force;return busy;}
-    // mxAbxBackgroundPublisherV284
-    if(document.hidden&&!force&&Date.now()-lastPublishedAt<10*60*1000)return false;
+    if(document.hidden)return false;
     busy=(async()=>{
       if(typeof window.mxPublishJson!=='function'||typeof window.mxBuildAntibioticCapacityPlanV146!=='function')return false;
       try{if(typeof window.ensureDBReady==='function')await window.ensureDBReady()}catch(_e){}
-      const [inventory,abHist,masterCatalog]=await Promise.all([loadInventory(!!force),loadAntibioticHistory(),window.idbAll?.('cpm').catch(()=>[])||Promise.resolve([])]),catalogAbxKeys=new Set((masterCatalog||[]).filter(isAbx).map(claveOf).map(NORM).filter(Boolean)),histKeys=new Set((abHist||[]).map(claveOf).map(NORM).filter(Boolean)),products=new Map();
-      for(const r of inventory||[]){const clave=claveOf(r),key=NORM(clave);if(!key)continue;const prev=products.get(key)||{clave,descripcion:'',abx:false};if(!prev.descripcion&&descOf(r))prev.descripcion=descOf(r);prev.abx=prev.abx||isAbx(r)||histKeys.has(key)||catalogAbxKeys.has(key);products.set(key,prev)}
+      const [inventory,abHist]=await Promise.all([loadInventory(!!force),loadAntibioticHistory()]),histKeys=new Set((abHist||[]).map(claveOf).map(NORM).filter(Boolean)),products=new Map();
+      for(const r of inventory||[]){const clave=claveOf(r),key=NORM(clave);if(!key)continue;const prev=products.get(key)||{clave,descripcion:'',abx:false};if(!prev.descripcion&&descOf(r))prev.descripcion=descOf(r);prev.abx=prev.abx||isAbx(r)||histKeys.has(key);products.set(key,prev)}
       const targets=[...products.values()].filter(x=>x.abx),items=[];let first=true,i=0;
       for(const prod of targets){
-        // v278: publicar resultados vigentes sin esperar inactividad indefinida.
-        // Ceder un turno periódico al navegador para conservar captura fluida.
-        if(i%6===0)await idleYield();
+        if(Date.now()-lastUserAction<5000)await idleYield();
+        await idleYield();
         let plan=null;try{plan=await window.mxBuildAntibioticCapacityPlanV146(prod.clave,!!force&&first)}catch(e){console.warn('[ABX CAP V150] plan',prod.clave,e?.message||e)}first=false;
         if(!plan||plan.notFound||plan.ambiguous||NUM(plan.existencia)<=0)continue;
         const requested=Math.max(0,NUM(plan.activeRequested)),supplied=Math.max(0,NUM(plan.activeSupplied)),pending=Math.max(0,NUM(plan.reserved)),free=Math.max(0,NUM(plan.free)),typical=Math.max(0,NUM(plan.avgTreatment)),est=plan.newTreatments==null?null:Math.max(0,Math.floor(NUM(plan.newTreatments)));
@@ -24151,35 +24129,18 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
         i++;
       }
       items.sort((a,b)=>b.existencia-a.existencia||a.clave.localeCompare(b.clave,'es'));
-      // mxAbxCapacityHandShakeV285: confirmar la misma revision de Inventario Principal.
-      const actualRev=capacityInventoryRevision(),suc=branch();
-      let confirmedMeta=null;
-      try{if(typeof window.mxGetJson==='function')confirmedMeta=await window.mxGetJson('/inventory_cpm_totals/'+encodeURIComponent(suc)+'/meta')}catch(e){console.warn('[ABX V285] Lectura:',e?.message||e)}
-      const same=confirmedMeta?.sourceAuthority==='INVENTARIO_PRINCIPAL'&&NUM(confirmedMeta?.seq)>0&&TXT(confirmedMeta?.revision)===actualRev;
-      if(!same){
-        console.warn('[ABX V285] Esperando revision de inventario antes de confirmar capacidad.');
-        if(Date.now()-lastInventoryRepairAt>240000&&typeof window.mxPublicarInventarioFirebase==='function'){
-          lastInventoryRepairAt=Date.now();
-          Promise.resolve().then(()=>window.mxPublicarInventarioFirebase(true)).then(()=>schedule(true,3500)).catch(e=>console.warn('[ABX V285]',e?.message||e));
-        }
-        return false;
-      }
-      const sig=actualRev+'|'+confirmedMeta.seq+'|'+signatureOf(items);
-      if(!force&&sig===lastSignature&&Date.now()-lastPublishedAt<6*60*1000)return false;
-      const now=new Date(),inventorySeq=NUM(confirmedMeta.seq),
-      payload={schemaVersion:285,inventorySeq,inventoryRevision:actualRev,source:'SISTEMA_PRINCIPAL_ANALISIS',sucursal:branch(),updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX'),regla:'MISMA_LOGICA_ANALISIS_PRINCIPAL',items};
-      const published=await window.mxPublishJson(`/antibiotic_capacity/${encodeURIComponent(branch())}`,payload);if(published!==true)throw new Error('Firebase no confirmo capacidad');await window.mxPublishJson(`/sync_versions/${encodeURIComponent(branch())}/antibiotic_capacity`,{v:Date.now(),updatedAt:payload.updatedAt,source:'SISTEMA_PRINCIPAL_V146'}).catch(()=>{});lastSignature=sig;lastPublishedAt=Date.now();return true;
+      const sig=signatureOf(items);if(!force&&sig===lastSignature)return false;
+      const now=new Date(),payload={schemaVersion:146,source:'SISTEMA_PRINCIPAL_ANALISIS',sucursal:branch(),updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX'),regla:'MISMA_LOGICA_ANALISIS_PRINCIPAL',items};
+      await window.mxPublishJson(`/antibiotic_capacity/${encodeURIComponent(branch())}`,payload);await window.mxPublishJson(`/sync_versions/${encodeURIComponent(branch())}/antibiotic_capacity`,{v:Date.now(),updatedAt:payload.updatedAt,source:'SISTEMA_PRINCIPAL_V146'}).catch(()=>{});lastSignature=sig;return true;
     })().catch(e=>{console.warn('[ABX CAP V150] No se pudo publicar:',e?.message||e);return false}).finally(()=>{busy=null;if(pendingForce){const f=pendingForce;pendingForce=false;schedule(f,6000);}});return busy;
   }
   function schedule(force=false,delay=8000){pendingForce=pendingForce||force;clearTimeout(timer);timer=setTimeout(()=>{const f=pendingForce;pendingForce=false;publish(f);},Math.max(1000,delay));}
   window.mxPublishAntibioticCapacityV146=publish;
-  window.addEventListener('mx-primary-stock-published',ev=>{if(TXT(ev?.detail?.branch).toUpperCase()===branch())schedule(true,1500)});
-  window.addEventListener('online',()=>schedule(true,3500));window.addEventListener('focus',()=>{if(!document.hidden&&Date.now()-lastPublishedAt>3*60*1000)schedule(true,3500)});
   window.addEventListener('mx-salidas-history-updated',()=>schedule(true,30000));
-  window.addEventListener('mx-inventory-changed',()=>schedule(true,3500));
+  window.addEventListener('mx-inventory-changed',()=>schedule(true,30000));
   window.addEventListener('mx-operational-sync',e=>{const c=Array.isArray(e?.detail?.changed)?e.detail.changed:[];if(c.includes('orders')||c.includes('inventory')||c.includes('salidas'))schedule(true,30000)});
-  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>schedule(true,12000),{once:true});else schedule(true,12000);
-  setInterval(()=>{schedule(false,15000);},8*60*1000);
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>schedule(true,90000),{once:true});else schedule(true,90000);
+  setInterval(()=>schedule(false,30000),1800000);
 })();
 
 
@@ -25332,7 +25293,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 
   const DEFAULT_CPM_VERSION='1895E660C985D879';
   const CATALOG_SIG_KEY='mx_cpm_catalog_signature_v1010';
-  const INVENTORY_SIG_KEY='mx_cpm_inventory_signatures_v278';
+  const INVENTORY_SIG_KEY='mx_cpm_inventory_signatures_v1010';
   const INVENTORY_SEQ_KEY='mx_cpm_inventory_seq_v1010';
   let publishRunning=false;
   let catalogTimer=0;
@@ -25351,13 +25312,6 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   const validCpmKey=v=>/^\d{3}\.\d{3}\.\d{4}\.\d{2}$/.test(norm(v));
   const validInventoryKey=v=>{const k=norm(v);return !!k&&k!=='0'&&!/^(?:NULL|UNDEFINED|N\/?A|SIN CLAVE)$/.test(k);};
   const branch=()=>typeof mxGetSucursalFromLicense==='function'?mxGetSucursalFromLicense():'HGAM';
-  const invSigKey=()=>INVENTORY_SIG_KEY+'::'+branch();
-  const invSeqKey=()=>INVENTORY_SEQ_KEY+'::'+branch();
-  function inventoryRevision(signatures){
-    const stable=Object.keys(signatures||{}).sort().map(k=>k+':'+signatures[k]).join('|');
-    let h=2166136261;for(let i=0;i<stable.length;i++){h^=stable.charCodeAt(i);h=Math.imul(h,16777619);}
-    return (h>>>0).toString(36);
-  }
 
   function safeFirebaseKey(v){
     try{return btoa(unescape(encodeURIComponent(norm(v)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
@@ -25365,10 +25319,10 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   }
 
   function inventoryParts(row){
-    const hasLocations=row&&['almacen','ALMACEN','existenciaAlmacen','existencia almacen','existencia_almacen','alm','pzs_almacen','pzsalmacen','estantes','ESTANTES','estante','ESTANTE','existenciaEstante','existencia estante','existencia_estante','est','pzs_estantes','pzsestantes'].some(k=>Object.prototype.hasOwnProperty.call(row,k));
-    const legacy=number(row?.existencia??row?.existencias??row?.EXISTENCIA??row?.stock??row?.total);
-    const almacen=hasLocations?number(row?.almacen??row?.ALMACEN??row?.existenciaAlmacen??row?.['existencia almacen']??row?.existencia_almacen??row?.alm??row?.pzs_almacen??row?.pzsalmacen):legacy;
-    const estantes=hasLocations?number(row?.estantes??row?.ESTANTES??row?.estante??row?.ESTANTE??row?.existenciaEstante??row?.['existencia estante']??row?.existencia_estante??row?.est??row?.pzs_estantes??row?.pzsestantes):0;
+    const hasLocations=row&&['almacen','alm','pzs_almacen','pzsalmacen','estantes','est','pzs_estantes','pzsestantes'].some(k=>Object.prototype.hasOwnProperty.call(row,k));
+    const legacy=number(row?.existencia??row?.existencias??row?.stock??row?.total);
+    const almacen=hasLocations?number(row?.almacen??row?.alm??row?.pzs_almacen??row?.pzsalmacen):legacy;
+    const estantes=hasLocations?number(row?.estantes??row?.est??row?.pzs_estantes??row?.pzsestantes):0;
     return{almacen:Math.max(0,almacen),estantes:Math.max(0,estantes)};
   }
 
@@ -25437,30 +25391,32 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
       const cpm=await catalogRows();
       const cpmByKey=new Map(cpm.map(x=>[norm(x.clave),x]));
       const suc=branch();
-      const seq=Math.max(Date.now(),number(localStorage.getItem(invSeqKey()))+1);
+      const seq=Math.max(Date.now(),number(localStorage.getItem(INVENTORY_SEQ_KEY))+1);
       const inventory=typeof window.__mxLoadInventory==='function'?await window.__mxLoadInventory({force:true,requireRows:false}).catch(()=>idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[])):await idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[]);
-      const usableInventory=typeof mxViewerUsableInventoryRows==='function'?mxViewerUsableInventoryRows(inventory):(Array.isArray(inventory)?inventory:[]);
-      const hasPublishedStock=usableInventory.length>0;
+      const hasPublishedStock=Array.isArray(inventory)&&inventory.some(row=>{
+        const p=inventoryParts(row);return (number(p.almacen)+number(p.estantes))>0;
+      });
       if(!Array.isArray(inventory) || inventory.length===0 || !hasPublishedStock){
         const now=new Date();
         await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/items`,null);
         await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{
-          seq,keyCount:0,stockedKeys:0,changed:0,revision:inventoryRevision({}),mode:'INVENTARIO_PRINCIPAL_VACIO',sourceAuthority:'INVENTARIO_PRINCIPAL',
+          seq,keyCount:0,stockedKeys:0,changed:0,mode:'INVENTARIO_PRINCIPAL_VACIO',sourceAuthority:'INVENTARIO_PRINCIPAL',
           updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')
         });
         // Una fotografía vacía debe vaciar también el detalle de lotes: no pueden quedar
         // medicamentos fantasma en ningún visor.
         await mxPublishJson(`/inventory_lots_by_key/${encodeURIComponent(suc)}`,null).catch(()=>{});
         await mxPublishJson(`/inventory_visor/${encodeURIComponent(suc)}`,null).catch(()=>{});
+        await mxPublishJson(`/pharmacy_orders/${encodeURIComponent(suc)}`,null).catch(()=>{});
         await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'}).catch(()=>{});
-        localStorage.removeItem(invSigKey());
-        localStorage.setItem(invSeqKey(),String(seq));try{window.dispatchEvent(new CustomEvent('mx-primary-stock-published',{detail:{branch:suc,seq}}))}catch(_e){}
+        localStorage.removeItem(INVENTORY_SIG_KEY);
+        localStorage.setItem(INVENTORY_SEQ_KEY,String(seq));
         return true;
       }
       // Fuente única: las claves nacen del Inventario Principal. CPM solo complementa
       // metadatos; nunca decide si un producto existe o deja de existir.
       const groups=new Map();
-      for(const row of usableInventory){
+      for(const row of inventory||[]){
         const clave=norm(row?.clave??row?.codigo??row?.csg);
         if(!validInventoryKey(clave))continue;
         const cat=cpmByKey.get(clave)||{};
@@ -25509,14 +25465,14 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
           mxPublishJson(`/inventory_lots_by_key/${encodeURIComponent(suc)}`,Object.keys(fullLots).length?fullLots:null)
         ]);
         const now=new Date();
-        await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,keyCount:groups.size,stockedKeys:fullStockedKeys,changed:Object.keys(fullItems).length,revision:inventoryRevision(fullSignatures),mode:'FOTOGRAFIA_AUTORITATIVA',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')});
+        await mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,keyCount:groups.size,stockedKeys:fullStockedKeys,changed:Object.keys(fullItems).length,mode:'FOTOGRAFIA_AUTORITATIVA',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')});
         await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'}).catch(()=>{});
-        localStorage.setItem(invSigKey(),JSON.stringify(fullSignatures));localStorage.setItem(invSeqKey(),String(seq));try{window.dispatchEvent(new CustomEvent('mx-primary-stock-published',{detail:{branch:suc,seq}}))}catch(_e){}
+        localStorage.setItem(INVENTORY_SIG_KEY,JSON.stringify(fullSignatures));localStorage.setItem(INVENTORY_SEQ_KEY,String(seq));
         return true;
       }
 
       let old={};
-      try{old=JSON.parse(localStorage.getItem(invSigKey())||'{}')||{};}catch(_e){}
+      try{old=JSON.parse(localStorage.getItem(INVENTORY_SIG_KEY)||'{}')||{};}catch(_e){}
       const next={};
       const changed={};
       let stockedKeys=0;
@@ -25542,11 +25498,9 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
         const active=record.e>0||record.a>0||record.s>0||record.l>0;
         const existed=Object.prototype.hasOwnProperty.call(old,firebaseKey);
         if(active)stockedKeys++;
-        if(active){
+        if(active||existed){
           next[firebaseKey]=signature;
-          if(old[firebaseKey]!==signature)changed[firebaseKey]=record;
-        }else if(existed){
-          changed[firebaseKey]=null; // baja total: eliminar clave y lotes del servidor, no publicar 0
+          if((force&&active)||old[firebaseKey]!==signature)changed[firebaseKey]=record;
         }
       }
       for(const firebaseKey of Object.keys(old))if(!(firebaseKey in next))changed[firebaseKey]=null;
@@ -25571,15 +25525,14 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
           keyCount:groups.size,
           stockedKeys,
           changed:entries.length,
-          revision:inventoryRevision(next),
           mode:'DELTA_INVENTARIO_PRINCIPAL',
           sourceAuthority:'INVENTARIO_PRINCIPAL',
           updatedAt:now.toISOString(),
           updatedAtText:now.toLocaleString('es-MX')
         });
         await mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'}).catch(()=>{});
-        localStorage.setItem(invSigKey(),JSON.stringify(next));
-        localStorage.setItem(invSeqKey(),String(seq));try{window.dispatchEvent(new CustomEvent('mx-primary-stock-published',{detail:{branch:suc,seq}}))}catch(_e){}
+        localStorage.setItem(INVENTORY_SIG_KEY,JSON.stringify(next));
+        localStorage.setItem(INVENTORY_SEQ_KEY,String(seq));
       }
 
       return entries.length>0;
@@ -25653,14 +25606,11 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
 
   const dirtyInventoryKeys=new Set();
   async function publishInventoryKeys(keys){
-    // No permitir que una publicación parcial pise una fotografía completa en curso.
-    if(publishRunning){scheduleInventoryKey('',1800);return false;}
     const wanted=[...new Set((keys||[]).map(norm).filter(validInventoryKey))];
     if(!wanted.length||typeof mxPublishJson!=='function')return false;
-    const rawInventory=typeof window.__mxLoadInventory==='function'?await window.__mxLoadInventory({force:true,requireRows:false}).catch(()=>idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[])):await idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[]);
-    const inventory=typeof mxViewerUsableInventoryRows==='function'?mxViewerUsableInventoryRows(rawInventory):rawInventory;
-    const suc=branch(),seq=Math.max(Date.now(),number(localStorage.getItem(invSeqKey()))+1);
-    let old={};try{old=JSON.parse(localStorage.getItem(invSigKey())||'{}')||{};}catch(_e){}
+    const inventory=typeof window.__mxLoadInventory==='function'?await window.__mxLoadInventory({force:true,requireRows:false}).catch(()=>idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[])):await idbAll('inventory').catch(()=>Array.isArray(cacheInv)?cacheInv:[]);
+    const suc=branch(),seq=Math.max(Date.now(),number(localStorage.getItem(INVENTORY_SEQ_KEY))+1);
+    let old={};try{old=JSON.parse(localStorage.getItem(INVENTORY_SIG_KEY)||'{}')||{};}catch(_e){}
     const patch={},lotPatch={};let changed=0;
     for(const clave of wanted){
       const group={almacen:0,estantes:0,lots:[],descripcion:'',unidad:'',clasificacion:'',restriccion:''};
@@ -25690,25 +25640,18 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     ]);
     const now=new Date();
     await Promise.allSettled([
-      mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,changed,revision:inventoryRevision(old),mode:'CLAVES_INMEDIATAS_INVENTARIO',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')},'PATCH'),
+      mxPublishJson(`/inventory_cpm_totals/${encodeURIComponent(suc)}/meta`,{seq,changed,mode:'CLAVES_INMEDIATAS_INVENTARIO',sourceAuthority:'INVENTARIO_PRINCIPAL',updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX')},'PATCH'),
       mxPublishJson(`/sync_versions/${encodeURIComponent(suc)}/inventory`,{v:seq,updatedAt:now.toISOString(),source:'INVENTARIO_PRINCIPAL_V163'})
     ]);
-    localStorage.setItem(invSigKey(),JSON.stringify(old));localStorage.setItem(invSeqKey(),String(seq));try{window.dispatchEvent(new CustomEvent('mx-primary-stock-published',{detail:{branch:suc,seq}}))}catch(_e){}
+    localStorage.setItem(INVENTORY_SIG_KEY,JSON.stringify(old));localStorage.setItem(INVENTORY_SEQ_KEY,String(seq));
     return true;
   }
-  let canonicalInventoryKeyChain=Promise.resolve();
-  window.mxPublicarInventarioClavesCanonicas=function(keys){
-    const run=()=>publishInventoryKeys(keys);
-    const pending=canonicalInventoryKeyChain.then(run,run);
-    canonicalInventoryKeyChain=pending.catch(()=>{});
-    return pending;
-  };
   function scheduleInventoryKey(clave,delay=120){
     const c=norm(clave);if(validInventoryKey(c))dirtyInventoryKeys.add(c);
     clearTimeout(inventoryTimer);
     inventoryTimer=setTimeout(()=>{
       const keys=[...dirtyInventoryKeys];dirtyInventoryKeys.clear();
-      const run=()=>Promise.resolve(keys.length?window.mxPublicarInventarioClavesCanonicas(keys):publishCompactInventory(false)).catch(()=>{});
+      const run=()=>Promise.resolve(keys.length?publishInventoryKeys(keys):publishCompactInventory(false)).catch(()=>{});
       try{if(window.requestIdleCallback)requestIdleCallback(run,{timeout:1800});else setTimeout(run,0);}catch(_e){setTimeout(run,0);}
     },Math.max(80,Number(delay)||120));
   }
@@ -25749,17 +25692,9 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     };
     // V150: evitar la avalancha de arranque. Las escrituras reales publican por evento;
     // la fotografía general se refresca después, cuando la sesión ya está estable y el navegador está ocioso.
-    let startupReconciled=false,startupReconciling=false;
-    const reconcileAfterLogin=()=>{
-      if(startupReconciled||startupReconciling||document.hidden||!document.body?.classList?.contains('logged'))return;
-      startupReconciling=true;
-      publishCompactInventory(true).then(ok=>{if(ok)startupReconciled=true}).catch(()=>{}).finally(()=>{startupReconciling=false});
-    };
-    setInterval(reconcileAfterLogin,15000);
-    window.addEventListener('online',()=>{startupReconciled=false;reconcileAfterLogin();});
-    setTimeout(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=async()=>{await publishCompactInventory(true);await new Promise(r=>setTimeout(r,60));await publishCatalog(false);};try{window.requestIdleCallback?requestIdleCallback(run,{timeout:12000}):setTimeout(run,1200)}catch(_e){setTimeout(run,1200)}}},30000);
+    setTimeout(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=async()=>{await publishCompactInventory(false);await new Promise(r=>setTimeout(r,60));await publishCatalog(false);};try{window.requestIdleCallback?requestIdleCallback(run,{timeout:12000}):setTimeout(run,1200)}catch(_e){setTimeout(run,1200)}}},30000);
     setTimeout(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')&&publishFullInventory){const run=()=>publishFullInventory(false);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:20000}):setTimeout(run,2000)}catch(_e){setTimeout(run,2000)}}},90000);
-    setInterval(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=()=>publishCompactInventory(true);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:5000}):setTimeout(run,0)}catch(_e){setTimeout(run,0)}}},900000);
+    setInterval(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=()=>publishCompactInventory(false);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:5000}):setTimeout(run,0)}catch(_e){setTimeout(run,0)}}},300000);
     setInterval(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')&&publishFullInventory){const run=()=>publishFullInventory(false);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:10000}):setTimeout(run,0)}catch(_e){setTimeout(run,0)}}},900000);
     setInterval(()=>{if(!document.hidden&&document.body?.classList?.contains('logged')){const run=()=>publishCatalog(false);try{window.requestIdleCallback?requestIdleCallback(run,{timeout:7000}):setTimeout(run,0)}catch(_e){setTimeout(run,0)}}},600000);
     // Compatibilidad con visores antiguos: consulta muy espaciada; los actuales leen inventory_lots_by_key directamente.
@@ -26232,7 +26167,7 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
   async function publishKeysSequentially(keys){
     const wanted=[...new Set((keys||[]).map(norm).filter(Boolean))];
     if(!wanted.length||typeof mxPublishJson!=='function')return false;
-    const wantedSet=new Set(wanted),rawInventory=await inventoryRowsForKeys(keys),inventory=typeof mxViewerUsableInventoryRows==='function'?mxViewerUsableInventoryRows(rawInventory):rawInventory,groups=new Map(wanted.map(k=>[k,{almacen:0,estantes:0,lots:[]} ]));
+    const wantedSet=new Set(wanted),inventory=await inventoryRowsForKeys(keys),groups=new Map(wanted.map(k=>[k,{almacen:0,estantes:0,lots:[]} ]));
     for(const row of inventory||[]){
       const clave=norm(row?.clave??row?.codigo??row?.csg);if(!wantedSet.has(clave))continue;
       const p=parts(row),g=groups.get(clave);g.almacen+=p.almacen;g.estantes+=p.estantes;
@@ -26255,10 +26190,9 @@ if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',
     localStorage.setItem(SIG_KEY,JSON.stringify(sig));localStorage.setItem(SEQ_KEY,String(seq));return true;
   }
   window.mxPublicarClavesInventarioFirebase=function(keys){
-    // v278: todos los cambios (incluidas transferencias) usan el publicador canónico.
-    // El motor v1018 queda como respaldo solo si el puente principal no se inicializó.
-    if(typeof window.mxPublicarInventarioClavesCanonicas==='function')
-      return window.mxPublicarInventarioClavesCanonicas(keys);
+    // La lectura de SQLite y las dos publicaciones se realizan dentro de una
+    // cola serial. Una solicitud anterior no puede publicar después de otra
+    // más reciente y hacer reaparecer en Firebase cantidades antiguas.
     const run=()=>publishKeysSequentially(keys);
     const pending=mxInventoryPublishChain.then(run,run);
     mxInventoryPublishChain=pending.catch(()=>{});
