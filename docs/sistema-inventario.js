@@ -24114,7 +24114,7 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   'use strict';
   if(window.__mxAntibioticCapacityPublisherV146)return;window.__mxAntibioticCapacityPublisherV146=true;
   const TXT=v=>String(v==null?'':v).trim().replace(/\s+/g,' '),NUM=v=>{const n=Number(v);return Number.isFinite(n)?n:0},NORM=v=>TXT(v).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase();
-  let busy=null,lastSignature='',lastPublishedAt=0,timer=0,pendingForce=false,lastUserAction=Date.now();
+  let busy=null,lastSignature='',lastPublishedAt=0,timer=0,pendingForce=false,lastUserAction=Date.now(),lastInventoryRepairAt=0;
   ['pointerdown','keydown','wheel','touchstart'].forEach(type=>document.addEventListener(type,()=>{lastUserAction=Date.now();},{passive:true,capture:true}));
   const idleYield=()=>new Promise(resolve=>{try{if(typeof requestIdleCallback==='function')requestIdleCallback(()=>resolve(),{timeout:220});else setTimeout(resolve,0)}catch(_e){setTimeout(resolve,0)}});
   function branch(){try{return String(window.mxGetSucursalFromLicense?.()||'HGAM').trim().toUpperCase()||'HGAM'}catch(_e){return'HGAM'}}
@@ -24151,10 +24151,24 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
         i++;
       }
       items.sort((a,b)=>b.existencia-a.existencia||a.clave.localeCompare(b.clave,'es'));
-      const sig=signatureOf(items);if(!force&&sig===lastSignature&&Date.now()-lastPublishedAt<8*60*1000)return false;
-      const now=new Date(),inventorySeq=NUM(localStorage.getItem('mx_cpm_inventory_seq_v1010::'+branch())),
-      payload={schemaVersion:278,inventorySeq,inventoryRevision:capacityInventoryRevision(),source:'SISTEMA_PRINCIPAL_ANALISIS',sucursal:branch(),updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX'),regla:'MISMA_LOGICA_ANALISIS_PRINCIPAL',items};
-      await window.mxPublishJson(`/antibiotic_capacity/${encodeURIComponent(branch())}`,payload);await window.mxPublishJson(`/sync_versions/${encodeURIComponent(branch())}/antibiotic_capacity`,{v:Date.now(),updatedAt:payload.updatedAt,source:'SISTEMA_PRINCIPAL_V146'}).catch(()=>{});lastSignature=sig;lastPublishedAt=Date.now();return true;
+      // mxAbxCapacityHandShakeV285: confirmar la misma revision de Inventario Principal.
+      const actualRev=capacityInventoryRevision(),suc=branch();
+      let confirmedMeta=null;
+      try{if(typeof window.mxGetJson==='function')confirmedMeta=await window.mxGetJson('/inventory_cpm_totals/'+encodeURIComponent(suc)+'/meta')}catch(e){console.warn('[ABX V285] Lectura:',e?.message||e)}
+      const same=confirmedMeta?.sourceAuthority==='INVENTARIO_PRINCIPAL'&&NUM(confirmedMeta?.seq)>0&&TXT(confirmedMeta?.revision)===actualRev;
+      if(!same){
+        console.warn('[ABX V285] Esperando revision de inventario antes de confirmar capacidad.');
+        if(Date.now()-lastInventoryRepairAt>240000&&typeof window.mxPublicarInventarioFirebase==='function'){
+          lastInventoryRepairAt=Date.now();
+          Promise.resolve().then(()=>window.mxPublicarInventarioFirebase(true)).then(()=>schedule(true,3500)).catch(e=>console.warn('[ABX V285]',e?.message||e));
+        }
+        return false;
+      }
+      const sig=actualRev+'|'+confirmedMeta.seq+'|'+signatureOf(items);
+      if(!force&&sig===lastSignature&&Date.now()-lastPublishedAt<6*60*1000)return false;
+      const now=new Date(),inventorySeq=NUM(confirmedMeta.seq),
+      payload={schemaVersion:285,inventorySeq,inventoryRevision:actualRev,source:'SISTEMA_PRINCIPAL_ANALISIS',sucursal:branch(),updatedAt:now.toISOString(),updatedAtText:now.toLocaleString('es-MX'),regla:'MISMA_LOGICA_ANALISIS_PRINCIPAL',items};
+      const published=await window.mxPublishJson(`/antibiotic_capacity/${encodeURIComponent(branch())}`,payload);if(published!==true)throw new Error('Firebase no confirmo capacidad');await window.mxPublishJson(`/sync_versions/${encodeURIComponent(branch())}/antibiotic_capacity`,{v:Date.now(),updatedAt:payload.updatedAt,source:'SISTEMA_PRINCIPAL_V146'}).catch(()=>{});lastSignature=sig;lastPublishedAt=Date.now();return true;
     })().catch(e=>{console.warn('[ABX CAP V150] No se pudo publicar:',e?.message||e);return false}).finally(()=>{busy=null;if(pendingForce){const f=pendingForce;pendingForce=false;schedule(f,6000);}});return busy;
   }
   function schedule(force=false,delay=8000){pendingForce=pendingForce||force;clearTimeout(timer);timer=setTimeout(()=>{const f=pendingForce;pendingForce=false;publish(f);},Math.max(1000,delay));}
