@@ -1,0 +1,34 @@
+name: Reactivar publicacion calculo Antibioticos v284
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/macroxel-v284-abx-publisher.yml'
+      - 'tools/v284_fix_abx_publisher.py'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Aplicar publicador sin pausas por ventana oculta
+        run: python tools/v284_fix_abx_publisher.py
+      - name: Verificar JavaScript
+        run: |
+          node --check docs/sistema-inventario.js
+          grep -q 'mxAbxBackgroundPublisherV284' docs/sistema-inventario.js
+      - name: Publicar motor web actualizado
+        shell: bash
+        run: |
+          if git diff --quiet -- docs/sistema-inventario.js; then
+            echo 'Ya estaba actualizado'; exit 0
+          fi
+          git config user.name 'Sistemas Macroxel'
+          git config user.email 'sistemasmacroxel@gmail.com'
+          git add docs/sistema-inventario.js
+          git commit -m 'Reactiva capacidad de antibioticos cuando el Principal esta minimizado v284'
+          git push origin HEAD:main
