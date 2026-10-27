@@ -1,0 +1,58 @@
+name: Restaurar Macroxel HPS web exacta v277
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/restaurar-macroxel-web-v277.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  restaurar-web-v277:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repositorio
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reconstruir los archivos exactos aprobados de v277
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),crypto=require('crypto'),zlib=require('zlib');
+          const files=[
+            {name:'index.html',prefix:'v277_index_html_',count:6,bytes:2335068,sha256:'1e0545b37df1eebd46089c8012158d606ab48e33b420c62b33de034e87d1aef4'},
+            {name:'sistema-inventario.js',prefix:'v277_sistema-inventario_js_',count:9,bytes:2795648,sha256:'b3964f3467f96bf61bfddf55a29f9a5155075466c8e5ed013ae2c914919fb9ec'},
+            {name:'resurtido-inteligente.css',prefix:'v277_resurtido-inteligente_css_',count:1,bytes:3334,sha256:'c60d95c8a80ead9cfbdf1d3ca132025170dae951e1e5b3e07e4a490b889aa928'}
+          ];
+          for(const f of files){
+            let b64='';
+            for(let i=0;i<f.count;i++){
+              const file='tools/restore_v277/'+f.prefix+String(i).padStart(3,'0')+'.txt';
+              b64+=fs.readFileSync(file,'utf8').replace(/\s+/g,'');
+            }
+            const data=zlib.brotliDecompressSync(Buffer.from(b64,'base64'));
+            const hash=crypto.createHash('sha256').update(data).digest('hex');
+            if(hash!==f.sha256 || data.length!==f.bytes)throw Error('Datos no íntegros '+f.name+' '+hash);
+            fs.mkdirSync('docs',{recursive:true});
+            fs.writeFileSync('docs/'+f.name,data);
+            console.log('Exacto v277: '+f.name+' bytes='+data.length+' sha256='+hash);
+          }
+          const html=fs.readFileSync('docs/index.html','utf8');
+          const js=fs.readFileSync('docs/sistema-inventario.js','utf8');
+          for(const m of ['Ubicación: Todas','Resurtido inteligente'])if(!html.includes(m)&&!js.includes(m))throw Error('Marcador ausente: '+m);
+          NODE
+      - name: Verificar sintaxis de sistema web
+        run: node --check docs/sistema-inventario.js
+      - name: Publicar la restauración v277
+        shell: bash
+        run: |
+          git config user.name "Sistemas Macroxel"
+          git config user.email "sistemasmacroxel@gmail.com"
+          git add docs/index.html docs/sistema-inventario.js docs/resurtido-inteligente.css
+          if git diff --cached --quiet; then
+            echo "Archivos web ya son idénticos a v277."
+            exit 0
+          fi
+          git commit -m "Restaurar web exacta Macroxel HPS v277 desde ZIP aprobado"
+          git push origin HEAD:main
