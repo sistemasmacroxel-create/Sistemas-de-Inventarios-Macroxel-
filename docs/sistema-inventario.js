@@ -24132,7 +24132,8 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   }
   async function publish(force=false){
     if(busy){pendingForce=pendingForce||force;return busy;}
-    if(document.hidden)return false;
+    // mxAbxBackgroundPublisherV284
+    if(document.hidden&&!force&&Date.now()-lastPublishedAt<10*60*1000)return false;
     busy=(async()=>{
       if(typeof window.mxPublishJson!=='function'||typeof window.mxBuildAntibioticCapacityPlanV146!=='function')return false;
       try{if(typeof window.ensureDBReady==='function')await window.ensureDBReady()}catch(_e){}
@@ -24164,7 +24165,7 @@ try{ mxRenderFirebaseHeaderStatus(); }catch(e){}
   window.addEventListener('mx-inventory-changed',()=>schedule(true,3500));
   window.addEventListener('mx-operational-sync',e=>{const c=Array.isArray(e?.detail?.changed)?e.detail.changed:[];if(c.includes('orders')||c.includes('inventory')||c.includes('salidas'))schedule(true,30000)});
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>schedule(true,12000),{once:true});else schedule(true,12000);
-  setInterval(()=>{if(!document.hidden)schedule(false,15000);},8*60*1000);
+  setInterval(()=>{schedule(false,15000);},8*60*1000);
 })();
 
 
