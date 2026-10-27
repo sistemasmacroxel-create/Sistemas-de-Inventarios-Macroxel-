@@ -1,0 +1,10 @@
+MACROXEL HPS - RESTAURACION WEB v277
+Origen: MACROXEL_HPS_v277_ECOSISTEMA_COMPLETO_FILTRO_UBICACION.zip
+Cuenta: sistemasmacroxel-create
+Fecha de restauracion: 2026-10-26 (CDMX)
+Revision de archivos del repo:
+- index.html git blob cf89aa2f7ed9faee38849641ad2b4e2be024de0a
+- sistema-inventario.js git blob c86ea7324895de6074c9ffc696bdf0771b42ecfb
+- resurtido-inteligente.css git blob fd0b45b08f61da6bb77eeb565664ab4c11bb56e6
+Respaldo previo: rama respaldo-antes-restaurar-v277-20261026
+Esta marca no cambia las existencias, Firebase ni licencias.
