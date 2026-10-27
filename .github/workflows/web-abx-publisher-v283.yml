@@ -1,0 +1,42 @@
+name: Sincronizar capacidad de Antibioticos con Control Central v283
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/web-abx-publisher-v283.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-web-v283:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener web actual
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Actualizar emisor y validar
+        shell: bash
+        run: |
+          set -eu
+          SHA=$(sha256sum docs/sistema-inventario.js | awk '{print $1}')
+          if [ "$SHA" != '5ddb3cc13fe132544a98998bb310689e336bdca43197c0abda4910436df7f254' ]; then
+            echo "::error::El emisor web cambió. Evitar reemplazo accidental."
+            exit 1
+          fi
+          python3 tools/web-abx-publisher-v283.py
+          node --check docs/sistema-inventario.js
+          grep -q 'mx-primary-stock-published' docs/sistema-inventario.js
+          grep -q 'v283-abx-control-central-20261026' docs/index.html
+          git diff --check
+      - name: Publicar al sitio web principal
+        shell: bash
+        run: |
+          set -eu
+          git config user.name 'Sistemas Macroxel'
+          git config user.email 'sistemasmacroxel@gmail.com'
+          git add -- docs/sistema-inventario.js docs/index.html
+          git commit -m 'Sincroniza capacidad antibioticos v283 al publicarse inventario'
+          git push origin HEAD:main
